@@ -289,13 +289,22 @@ All scripts emit JSON to stdout; non-zero exit on error.
 
 CLI args override config-file values. The config file lives at the consumer's project root (cwd from which CLIs are invoked).
 
+The `fsms[]` array supports multiple named FSMs in one project (e.g. one per agent / logical pipeline). CLIs select via `--fsm <name>`:
+
 ```json
 {
-  "fsm_path": "fsm/<consumer>.fsm.yaml",
-  "storage_root": ".<consumer>/runs",
-  "session_id": "<optional, defaults to PID-based>"
+  "fsms": [
+    {
+      "name": "<unique-name>",
+      "fsm_path": "fsm/<name>.fsm.yaml",
+      "storage_root": ".<consumer>/runs/<name>",
+      "session_id": "<optional, defaults to PID-based>"
+    }
+  ]
 }
 ```
+
+The legacy single-FSM shape (top-level `fsm_path` / `storage_root`) is still accepted and is auto-wrapped as `fsms: [{ name: "default", ... }]`.
 
 ## What this still doesn't solve
 

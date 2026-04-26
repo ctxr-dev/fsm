@@ -36,7 +36,26 @@ After publication to npm, consumers will use the standard semver form.
 
 2. **Author worker prompt templates** for each state with a `worker:` block. See [`docs/worker-contract.md`](docs/worker-contract.md).
 
-3. **Add a `.fsmrc.json`** at your project root:
+3. **Add a `.fsmrc.json`** at your project root. The `fsms[]` array supports any number of named FSMs (one per agent / logical part):
+
+   ```json
+   {
+     "fsms": [
+       {
+         "name": "code-review",
+         "fsm_path": "fsm/code-review.fsm.yaml",
+         "storage_root": ".my-app/runs/code-review"
+       },
+       {
+         "name": "report-builder",
+         "fsm_path": "fsm/report-builder.fsm.yaml",
+         "storage_root": ".my-app/runs/reports"
+       }
+     ]
+   }
+   ```
+
+   When you have a single FSM, you can also write the legacy single-FSM shape:
 
    ```json
    {
@@ -45,26 +64,33 @@ After publication to npm, consumers will use the standard semver form.
    }
    ```
 
+   The single-FSM shape is auto-wrapped into `fsms: [{ name: "default", ... }]` internally.
+
 4. **Validate the FSM**:
 
    ```bash
    npx fsm-validate-static fsm/my-orchestrator.fsm.yaml
    ```
 
-5. **Drive a run** from your orchestrator:
+5. **Drive a run** from your orchestrator. With one FSM in the config you can omit `--fsm`; with multiple FSMs you pass `--fsm <name>` to pick:
 
    ```bash
-   # Start a new run
+   # Start a new run (single-FSM config)
    npx fsm-next --new-run --repo my-app --base-sha aaa --head-sha bbb --args '{"some":"input"}'
+
+   # Start a new run against a named FSM in a multi-FSM config
+   npx fsm-next --fsm code-review --new-run --repo my-app --base-sha aaa --head-sha bbb --args '{"some":"input"}'
 
    # ...orchestrator dispatches workers, collects JSON outputs...
 
    # Commit each state's output and advance
-   npx fsm-commit --run-id <run-id> --outputs '{"x":42}'
+   npx fsm-commit --fsm code-review --run-id <run-id> --outputs '{"x":42}'
 
    # Inspect at any time
-   npx fsm-inspect --run-id <run-id>
+   npx fsm-inspect --fsm code-review --run-id <run-id>
    ```
+
+   You can always bypass the config by passing `--fsm-path` + `--storage-root` directly.
 
 The CLIs all return JSON to stdout. Exit codes: `0` success, `1` runtime error (lock conflict, schema violation, etc.), `2` argument error.
 

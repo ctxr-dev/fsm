@@ -123,17 +123,24 @@ The walk is bounded: it ignores days older than `daysBack` and skips empty shard
 
 ## Config file
 
-`.fsmrc.json` (or `fsm.config.json`) at the consumer's project root:
+`.fsmrc.json` (or `fsm.config.json`) at the consumer's project root. The `fsms[]` array supports multiple named FSMs (e.g. one per agent or logical pipeline):
 
 ```json
 {
-  "fsm_path": "fsm/<consumer>.fsm.yaml",
-  "storage_root": ".<consumer>/runs",
-  "session_id": "<optional>"
+  "fsms": [
+    {
+      "name": "<unique-name>",
+      "fsm_path": "fsm/<name>.fsm.yaml",
+      "storage_root": ".<consumer>/runs/<name>",
+      "session_id": "<optional>"
+    }
+  ]
 }
 ```
 
-Relative paths resolve against `process.cwd()`. CLI flags override the config file.
+CLIs select with `--fsm <name>`. With a single entry, `--fsm` is optional. With multiple entries, omitting `--fsm` errors with the list of available names. The legacy single-FSM shape (top-level `fsm_path` / `storage_root`) is auto-wrapped to a one-entry `fsms[]`.
+
+Relative paths resolve against `process.cwd()`. `--fsm-path` + `--storage-root` flags bypass the config file entirely.
 
 ## Cleanup recommendations
 

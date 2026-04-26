@@ -414,7 +414,7 @@ test("fsm-inspect: returns error for unknown run", () => {
 
 // ─── config-file fallback ──────────────────────────────────────────────
 
-test("fsm-next: reads .fsmrc.json from cwd when --fsm-path / --storage-root are omitted", () => {
+test("fsm-next: reads legacy single-FSM .fsmrc.json when --fsm-path / --storage-root are omitted", () => {
   const tmp = setupFixture();
   try {
     writeFileSync(
@@ -439,6 +439,134 @@ test("fsm-next: reads .fsmrc.json from cwd when --fsm-path / --storage-root are 
     const brief = parseJsonStdout(result);
     assert.equal(brief.ok, true);
     assert.equal(brief.state, "a");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("fsm-next: reads multi-FSM .fsmrc.json with --fsm <name> selector", () => {
+  const tmp = setupFixture();
+  try {
+    // Add a second FSM definition to make the multi-FSM scenario real.
+    writeFileSync(
+      join(tmp, "other.fsm.yaml"),
+      `
+fsm:
+  id: other
+  version: 1
+  entry: only
+  states:
+    - id: only
+      purpose: "Singleton."
+      preconditions: []
+      outputs: []
+      transitions: []
+`,
+    );
+    writeFileSync(
+      join(tmp, ".fsmrc.json"),
+      JSON.stringify({
+        fsms: [
+          { name: "primary", fsm_path: "fsm.yaml", storage_root: "store" },
+          { name: "other", fsm_path: "other.fsm.yaml", storage_root: "other-store" },
+        ],
+      }),
+    );
+    const result = runScript(
+      "fsm-next.mjs",
+      [
+        "--fsm", "other",
+        "--new-run",
+        "--repo", "testrepo",
+        "--base-sha", "aaa", "--head-sha", "bbb",
+        "--session-id", "multi-config",
+        "--args", "{}",
+      ],
+      { cwd: tmp },
+    );
+    const brief = parseJsonStdout(result);
+    assert.equal(brief.ok, true);
+    assert.equal(brief.fsm_id, "other");
+    assert.equal(brief.state, "only");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("fsm-next: errors when multiple FSMs configured and --fsm not given", () => {
+  const tmp = setupFixture();
+  try {
+    writeFileSync(
+      join(tmp, "other.fsm.yaml"),
+      `
+fsm:
+  id: other
+  version: 1
+  entry: only
+  states:
+    - id: only
+      purpose: "Singleton."
+      preconditions: []
+      outputs: []
+      transitions: []
+`,
+    );
+    writeFileSync(
+      join(tmp, ".fsmrc.json"),
+      JSON.stringify({
+        fsms: [
+          { name: "primary", fsm_path: "fsm.yaml", storage_root: "store" },
+          { name: "other", fsm_path: "other.fsm.yaml", storage_root: "other-store" },
+        ],
+      }),
+    );
+    const result = runScript(
+      "fsm-next.mjs",
+      ["--new-run", "--repo", "testrepo", "--base-sha", "a", "--head-sha", "b", "--args", "{}"],
+      { cwd: tmp },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /multiple FSMs configured/);
+    assert.match(result.stderr, /primary, other/);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("fsm-next: errors when --fsm <name> not found in config", () => {
+  const tmp = setupFixture();
+  try {
+    writeFileSync(
+      join(tmp, ".fsmrc.json"),
+      JSON.stringify({
+        fsms: [
+          { name: "primary", fsm_path: "fsm.yaml", storage_root: "store" },
+        ],
+      }),
+    );
+    const result = runScript(
+      "fsm-next.mjs",
+      ["--fsm", "ghost", "--new-run", "--repo", "x", "--base-sha", "a", "--head-sha", "b", "--args", "{}"],
+      { cwd: tmp },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /not found/);
+    assert.match(result.stderr, /Available: primary/);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("fsm-next: errors with a helpful message when there is no config and no flags", () => {
+  const tmp = setupFixture();
+  try {
+    const result = runScript(
+      "fsm-next.mjs",
+      ["--new-run", "--repo", "x", "--base-sha", "a", "--head-sha", "b", "--args", "{}"],
+      { cwd: tmp },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /no FSM configured/);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }

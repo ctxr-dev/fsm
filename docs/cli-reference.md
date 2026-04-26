@@ -6,15 +6,46 @@ Required configuration is supplied via flags or via a `.fsmrc.json` (or `fsm.con
 
 ## Configuration file
 
-The CLIs auto-load `.fsmrc.json` (then `fsm.config.json`) from `process.cwd()` if present.
+The CLIs auto-load `.fsmrc.json` (then `fsm.config.json`) from `process.cwd()` if present. The `fsms[]` array supports multiple named FSMs in one project (e.g. one per agent or logical pipeline):
+
+```json
+{
+  "fsms": [
+    {
+      "name": "code-review",
+      "fsm_path": "fsm/code-review.fsm.yaml",
+      "storage_root": ".my-app/runs/code-review",
+      "session_id": "<optional>"
+    },
+    {
+      "name": "report-builder",
+      "fsm_path": "fsm/report-builder.fsm.yaml",
+      "storage_root": ".my-app/runs/reports"
+    }
+  ]
+}
+```
+
+### Selection rules
+
+- **Multiple FSMs configured.** Pass `--fsm <name>` to pick one. Omitting `--fsm` errors with the list of available names.
+- **Single FSM configured.** `--fsm` is optional; the only entry is used.
+- **No config file.** You must pass `--fsm-path` + `--storage-root` on every CLI invocation.
+- **Direct override.** Passing `--fsm-path` + `--storage-root` always bypasses the config file. Useful for ad-hoc invocations.
+
+### Legacy single-FSM shape
+
+For projects with exactly one FSM, the older flat shape is still accepted and is auto-wrapped as `fsms: [{ name: "default", ... }]`:
 
 ```json
 {
   "fsm_path": "fsm/my-orchestrator.fsm.yaml",
   "storage_root": ".my-app/runs",
-  "session_id": "<optional, defaults to PID-based>"
+  "session_id": "<optional>"
 }
 ```
+
+Map shape (`fsms` as a name → entry mapping) is also accepted as a convenience and is auto-flattened to the array form.
 
 Relative paths are resolved against `process.cwd()`.
 
@@ -36,8 +67,9 @@ fsm-next --resume <run-id>
 
 | Flag | Required | Description |
 |------|----------|-------------|
-| `--fsm-path <path>` | yes (or via config) | Path to the FSM YAML |
-| `--storage-root <dir>` | yes (or via config) | Storage directory under which run dirs live |
+| `--fsm <name>` | when multiple FSMs configured | Pick a named entry from `.fsmrc.json` `fsms[]`. Single-FSM configs don't need this. |
+| `--fsm-path <path>` | when no config + no `--fsm` | Path to the FSM YAML. Direct override; bypasses config. |
+| `--storage-root <dir>` | when no config + no `--fsm` | Storage directory under which run dirs live. Direct override. |
 | `--session-id <id>` | no | Session identifier; defaults to `session-<pid>-<timestamp>` |
 | `--repo <name>` | yes for `--new-run` | Consumer-supplied identifier (recorded in the manifest) |
 | `--base-sha <sha>` | for `--new-run` | Recorded in the manifest |
@@ -102,8 +134,9 @@ fsm-commit --run-id <id> --outputs-file <path>  ...
 | `--outputs-file <path>` | one of | JSON file with the state's outputs |
 | `--transition <state-id>` | for `kind: judgement` | Caller's pick when current state has a judgement transition |
 | `--session-id <id>` | yes | Must match the lock holder |
-| `--fsm-path <path>` | yes (or config) | |
-| `--storage-root <dir>` | yes (or config) | |
+| `--fsm <name>` | when multiple FSMs configured | Pick a named entry from `.fsmrc.json` `fsms[]` |
+| `--fsm-path <path>` | when no config + no `--fsm` | Direct override |
+| `--storage-root <dir>` | when no config + no `--fsm` | Direct override |
 
 ### Output
 

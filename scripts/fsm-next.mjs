@@ -50,6 +50,7 @@ function parseArgs(argv) {
     else if (arg === "--args") args.args = JSON.parse(argv[++i]);
     else if (arg === "--args-file") args.args = JSON.parse(readFileSync(argv[++i], "utf8"));
     else if (arg === "--session-id") args.sessionId = argv[++i];
+    else if (arg === "--fsm" || arg === "--fsm-name") args.fsmName = argv[++i];
     else if (arg === "--fsm-path") args.fsmPath = argv[++i];
     else if (arg === "--storage-root") args.storageRoot = argv[++i];
     else throw new Error(`fsm-next: unknown argument "${arg}"`);
