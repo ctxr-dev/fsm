@@ -1,0 +1,59 @@
+{
+  "name": "@ctxr/fsm",
+  "version": "0.1.0",
+  "description": "Generic finite-state-machine substrate for deterministic LLM-orchestrated workflows. Hub-and-spoke architecture, file-only state storage, structured-emit protocol, JSON-Schema-validated worker contracts.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ctxr-dev/fsm.git"
+  },
+  "homepage": "https://github.com/ctxr-dev/fsm#readme",
+  "bugs": {
+    "url": "https://github.com/ctxr-dev/fsm/issues"
+  },
+  "keywords": [
+    "fsm",
+    "state-machine",
+    "orchestration",
+    "agentic",
+    "workflow",
+    "llm",
+    "claude-code"
+  ],
+  "exports": {
+    ".": "./scripts/lib/index.mjs",
+    "./storage": "./scripts/lib/fsm-storage.mjs",
+    "./schema": "./scripts/lib/fsm-schema.mjs",
+    "./predicates": "./scripts/lib/fsm-predicates.mjs",
+    "./engine": "./scripts/lib/fsm-engine.mjs"
+  },
+  "bin": {
+    "fsm-next": "scripts/fsm-next.mjs",
+    "fsm-commit": "scripts/fsm-commit.mjs",
+    "fsm-inspect": "scripts/fsm-inspect.mjs",
+    "fsm-validate-static": "scripts/fsm-validate-static.mjs"
+  },
+  "files": [
+    "scripts/",
+    "docs/",
+    "examples/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test tests/unit/*.test.js",
+    "lint": "markdownlint-cli2 '**/*.md' '#node_modules'",
+    "lint:fix": "markdownlint-cli2 --fix '**/*.md' '#node_modules'"
+  },
+  "dependencies": {
+    "yaml": "^2.8.3",
+    "ajv": "^8.20.0"
+  },
+  "devDependencies": {
+    "markdownlint-cli2": "^0.14.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
