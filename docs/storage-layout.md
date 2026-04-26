@@ -131,14 +131,15 @@ The walk is bounded: it ignores days older than `daysBack` and skips empty shard
     {
       "name": "<unique-name>",
       "fsm_path": "fsm/<name>.fsm.yaml",
-      "storage_root": ".<consumer>/runs/<name>",
-      "session_id": "<optional>"
+      "storage_root": ".<consumer>/runs/<name>"
     }
   ]
 }
 ```
 
-CLIs select with `--fsm <name>`. With a single entry, `--fsm` is optional. With multiple entries, omitting `--fsm` errors with the list of available names. The legacy single-FSM shape (top-level `fsm_path` / `storage_root`) is auto-wrapped to a one-entry `fsms[]`.
+Each entry accepts exactly three keys: `name`, `fsm_path`, `storage_root`. Unknown keys are rejected. The config is purely static — runtime concerns like `session_id` are passed via CLI flags or auto-generated.
+
+CLIs select with `--fsm <name>`. With a single entry, `--fsm` is optional. With multiple entries, omitting `--fsm` errors with the list of available names.
 
 Relative paths resolve against `process.cwd()`. `--fsm-path` + `--storage-root` flags bypass the config file entirely.
 

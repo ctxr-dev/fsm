@@ -297,14 +297,13 @@ The `fsms[]` array supports multiple named FSMs in one project (e.g. one per age
     {
       "name": "<unique-name>",
       "fsm_path": "fsm/<name>.fsm.yaml",
-      "storage_root": ".<consumer>/runs/<name>",
-      "session_id": "<optional, defaults to PID-based>"
+      "storage_root": ".<consumer>/runs/<name>"
     }
   ]
 }
 ```
 
-The legacy single-FSM shape (top-level `fsm_path` / `storage_root`) is still accepted and is auto-wrapped as `fsms: [{ name: "default", ... }]`.
+Each entry accepts exactly three keys: `name`, `fsm_path`, `storage_root`. The config is static; runtime concerns (`session_id`, run-id, process state) are never persisted here. `session_id` is set via the `--session-id` CLI flag or defaults to `session-<pid>-<timestamp>`.
 
 ## What this still doesn't solve
 

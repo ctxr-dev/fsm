@@ -36,7 +36,7 @@ After publication to npm, consumers will use the standard semver form.
 
 2. **Author worker prompt templates** for each state with a `worker:` block. See [`docs/worker-contract.md`](docs/worker-contract.md).
 
-3. **Add a `.fsmrc.json`** at your project root. The `fsms[]` array supports any number of named FSMs (one per agent / logical part):
+3. **Add a `.fsmrc.json`** at your project root. The `fsms[]` array supports any number of named FSMs (one per agent / logical pipeline):
 
    ```json
    {
@@ -55,16 +55,7 @@ After publication to npm, consumers will use the standard semver form.
    }
    ```
 
-   When you have a single FSM, you can also write the legacy single-FSM shape:
-
-   ```json
-   {
-     "fsm_path": "fsm/my-orchestrator.fsm.yaml",
-     "storage_root": ".my-app/runs"
-   }
-   ```
-
-   The single-FSM shape is auto-wrapped into `fsms: [{ name: "default", ... }]` internally.
+   The config file is static — only project-level setup. Runtime concerns like `session_id` are passed via CLI flags (`--session-id`) or auto-generated, never persisted in the config.
 
 4. **Validate the FSM**:
 

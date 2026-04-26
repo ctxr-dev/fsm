@@ -1,34 +1,35 @@
 // fsm-config.mjs — load consumer config (.fsmrc.json or fsm.config.json)
 // from the current working directory. CLI args override config file values.
 //
-// Schema (multi-FSM, the going-forward shape):
+// The config file is STATIC. It only describes project-level setup:
+// where each FSM YAML lives and where its run dirs go. Runtime concerns
+// (session_id, run-id, process state) are never persisted in the config.
+//
+// Canonical schema:
 //
 //   {
 //     "fsms": [
 //       {
 //         "name": "<unique-name>",
 //         "fsm_path": "<path>",
-//         "storage_root": "<path>",
-//         "session_id": "<optional>"
+//         "storage_root": "<path>"
 //       },
 //       ...
 //     ]
 //   }
 //
-// Legacy single-FSM shape (still accepted; auto-wrapped as fsms[0] with
-// name "default"):
-//
-//   {
-//     "fsm_path": "<path>",
-//     "storage_root": "<path>",
-//     "session_id": "<optional>"
-//   }
+// `fsms[]` is the only accepted shape. There is no top-level
+// `fsm_path` / `storage_root` form. There is no map shape. One canonical
+// schema, no migration paths.
 //
 // CLI selection:
 //   - --fsm <name>            pick a named entry from fsms[]
 //   - (no --fsm; one entry)   use that single entry
 //   - (no --fsm; multiple)    error: must pass --fsm <name>
 //   - --fsm-path + --storage-root  bypass the config file entirely
+//
+// session_id is always runtime: pass --session-id <id> on the CLI, or
+// the engine generates a default of "session-<pid>-<timestamp>".
 
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -60,39 +61,13 @@ export function loadConfig(cwd = process.cwd()) {
 }
 
 function normaliseConfig(raw, path) {
-  if (raw === null || typeof raw !== "object") {
-    throw new Error(`fsm config at ${path} must be a JSON object`);
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`fsm config at ${path} must be a JSON object with an "fsms" array`);
   }
-  // Multi-FSM shape: fsms[] is an array of entries.
-  if (Array.isArray(raw.fsms)) {
-    return validateFsmArray(raw.fsms, path);
+  if (!Array.isArray(raw.fsms)) {
+    throw new Error(`fsm config at ${path} must declare "fsms" as an array of FSM entries`);
   }
-  // Map shape: fsms is a map of name → { fsm_path, storage_root, session_id }.
-  // Accepted as a convenience; auto-flattened to the array form.
-  if (raw.fsms && typeof raw.fsms === "object") {
-    const entries = Object.entries(raw.fsms).map(([name, body]) => ({
-      name,
-      ...body,
-    }));
-    return validateFsmArray(entries, path);
-  }
-  // Legacy single-FSM shape: top-level fsm_path / storage_root.
-  if (raw.fsm_path || raw.storage_root) {
-    return validateFsmArray(
-      [
-        {
-          name: "default",
-          fsm_path: raw.fsm_path,
-          storage_root: raw.storage_root,
-          session_id: raw.session_id,
-        },
-      ],
-      path,
-    );
-  }
-  throw new Error(
-    `fsm config at ${path} must declare either fsms[] (array), fsms{} (map), or top-level fsm_path + storage_root (single-FSM legacy)`,
-  );
+  return validateFsmArray(raw.fsms, path);
 }
 
 function validateFsmArray(entries, path) {
@@ -100,9 +75,10 @@ function validateFsmArray(entries, path) {
     throw new Error(`fsm config at ${path} declares an empty fsms list`);
   }
   const names = new Set();
+  const allowedKeys = new Set(["name", "fsm_path", "storage_root"]);
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
-    if (!entry || typeof entry !== "object") {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
       throw new Error(`fsm config at ${path}: fsms[${i}] must be an object`);
     }
     if (typeof entry.name !== "string" || !entry.name) {
@@ -117,6 +93,13 @@ function validateFsmArray(entries, path) {
     }
     if (typeof entry.storage_root !== "string" || !entry.storage_root) {
       throw new Error(`fsm config at ${path}: fsms[${i} = "${entry.name}"].storage_root must be a non-empty string`);
+    }
+    for (const key of Object.keys(entry)) {
+      if (!allowedKeys.has(key)) {
+        throw new Error(
+          `fsm config at ${path}: fsms[${i} = "${entry.name}"] has unknown key "${key}". Allowed keys: name, fsm_path, storage_root.`,
+        );
+      }
     }
   }
   return entries;
@@ -184,7 +167,7 @@ export function resolveSettings(cliArgs = {}, cwd = process.cwd()) {
 
   const fsmPath = cliArgs.fsmPath ?? entry.fsm_path;
   const storageRoot = cliArgs.storageRoot ?? entry.storage_root;
-  const sessionId = cliArgs.sessionId ?? entry.session_id ?? defaultSessionId();
+  const sessionId = cliArgs.sessionId ?? defaultSessionId();
 
   return {
     fsmPath: resolve(cwd, fsmPath),

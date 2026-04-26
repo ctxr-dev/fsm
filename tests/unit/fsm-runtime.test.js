@@ -414,14 +414,15 @@ test("fsm-inspect: returns error for unknown run", () => {
 
 // ─── config-file fallback ──────────────────────────────────────────────
 
-test("fsm-next: reads legacy single-FSM .fsmrc.json when --fsm-path / --storage-root are omitted", () => {
+test("fsm-next: single-entry .fsmrc.json — --fsm omitted, the only entry is used", () => {
   const tmp = setupFixture();
   try {
     writeFileSync(
       join(tmp, ".fsmrc.json"),
       JSON.stringify({
-        fsm_path: "fsm.yaml",
-        storage_root: "store",
+        fsms: [
+          { name: "primary", fsm_path: "fsm.yaml", storage_root: "store" },
+        ],
       }),
     );
     const result = runScript(
@@ -439,6 +440,56 @@ test("fsm-next: reads legacy single-FSM .fsmrc.json when --fsm-path / --storage-
     const brief = parseJsonStdout(result);
     assert.equal(brief.ok, true);
     assert.equal(brief.state, "a");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("fsm-next: rejects config with top-level fsm_path (no legacy shape)", () => {
+  const tmp = setupFixture();
+  try {
+    writeFileSync(
+      join(tmp, ".fsmrc.json"),
+      JSON.stringify({
+        fsm_path: "fsm.yaml",
+        storage_root: "store",
+      }),
+    );
+    const result = runScript(
+      "fsm-next.mjs",
+      ["--new-run", "--repo", "x", "--base-sha", "a", "--head-sha", "b", "--args", "{}"],
+      { cwd: tmp },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /must declare "fsms" as an array/);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("fsm-next: rejects config entries with unknown keys (e.g. session_id)", () => {
+  const tmp = setupFixture();
+  try {
+    writeFileSync(
+      join(tmp, ".fsmrc.json"),
+      JSON.stringify({
+        fsms: [
+          {
+            name: "primary",
+            fsm_path: "fsm.yaml",
+            storage_root: "store",
+            session_id: "no-runtime-stuff-here",
+          },
+        ],
+      }),
+    );
+    const result = runScript(
+      "fsm-next.mjs",
+      ["--new-run", "--repo", "x", "--base-sha", "a", "--head-sha", "b", "--args", "{}"],
+      { cwd: tmp },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /unknown key "session_id"/);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }

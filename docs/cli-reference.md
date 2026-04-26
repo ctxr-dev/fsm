@@ -14,8 +14,7 @@ The CLIs auto-load `.fsmrc.json` (then `fsm.config.json`) from `process.cwd()` i
     {
       "name": "code-review",
       "fsm_path": "fsm/code-review.fsm.yaml",
-      "storage_root": ".my-app/runs/code-review",
-      "session_id": "<optional>"
+      "storage_root": ".my-app/runs/code-review"
     },
     {
       "name": "report-builder",
@@ -26,26 +25,16 @@ The CLIs auto-load `.fsmrc.json` (then `fsm.config.json`) from `process.cwd()` i
 }
 ```
 
+### Allowed entry keys
+
+Each entry in `fsms[]` accepts exactly three keys: `name`, `fsm_path`, `storage_root`. Unknown keys are rejected at load time. The config is purely static project setup — runtime concerns (`session_id`, run-id, process state) are never persisted here.
+
 ### Selection rules
 
 - **Multiple FSMs configured.** Pass `--fsm <name>` to pick one. Omitting `--fsm` errors with the list of available names.
 - **Single FSM configured.** `--fsm` is optional; the only entry is used.
 - **No config file.** You must pass `--fsm-path` + `--storage-root` on every CLI invocation.
 - **Direct override.** Passing `--fsm-path` + `--storage-root` always bypasses the config file. Useful for ad-hoc invocations.
-
-### Legacy single-FSM shape
-
-For projects with exactly one FSM, the older flat shape is still accepted and is auto-wrapped as `fsms: [{ name: "default", ... }]`:
-
-```json
-{
-  "fsm_path": "fsm/my-orchestrator.fsm.yaml",
-  "storage_root": ".my-app/runs",
-  "session_id": "<optional>"
-}
-```
-
-Map shape (`fsms` as a name → entry mapping) is also accepted as a convenience and is auto-flattened to the array form.
 
 Relative paths are resolved against `process.cwd()`.
 
