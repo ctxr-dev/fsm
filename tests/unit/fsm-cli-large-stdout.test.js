@@ -1,16 +1,18 @@
-// fsm-cli-large-stdout.test.js — regression for issue #12.
+// fsm-cli-large-stdout.test.js — regressions for issue #12.
 //
-// The three FSM CLIs (fsm-next, fsm-commit, fsm-inspect) used to emit JSON
-// via `process.stdout.write(...)` followed immediately by `process.exit(...)`.
-// On macOS the kernel pipe buffer caps at ~64KB; payloads larger than that
-// were queued in Node's userspace stream buffer and dropped at exit before
-// they could drain. spawnSync parents observed truncation at exactly 65536
-// bytes and JSON.parse(stdout) threw "Unterminated string in JSON".
+// All four FSM CLIs (fsm-next, fsm-commit, fsm-inspect, fsm-validate-static)
+// used to emit JSON via `process.stdout.write(...)` followed immediately by
+// `process.exit(...)`. On macOS the kernel pipe buffer caps at ~64KB;
+// payloads larger than that were queued in Node's userspace stream buffer
+// and dropped at exit before they could drain. spawnSync parents observed
+// truncation at exactly 65536 bytes and JSON.parse(stdout) threw
+// "Unterminated string in JSON".
 //
-// emit() now uses fs.writeSync(1, ...) which is a blocking POSIX write to
-// fd 1 — no userspace queue, no truncation under process.exit. This test
-// drives a payload >> 64KB through fsm-commit and asserts the parent
-// receives the full JSON byte-complete.
+// emit() now delegates to scripts/lib/emit.mjs::emitJson which loops
+// fs.writeSync(1, ...) until the full buffer is delivered. Three tests
+// drive byte-complete-stdout assertions through the three end-user CLIs
+// (fsm-commit, fsm-next, fsm-validate-static); fsm-inspect uses the same
+// shared helper and therefore inherits the fix.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";

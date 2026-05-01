@@ -33,9 +33,20 @@ export function emitJson(payload) {
       throw err;
     }
     if (typeof n !== "number" || n <= 0) {
-      // Defensive: writeSync should always advance or throw; treat a
-      // zero-byte advance as a fatal pipe state to avoid an infinite loop.
-      return;
+      // Defensive: writeSync should always advance or throw. A zero-byte
+      // advance would otherwise spin forever; we exit the loop loudly
+      // instead of silently truncating. The error reaches stderr (so it
+      // appears in spawnSync's `result.stderr` rather than in the stdout
+      // JSON the parent is trying to parse) and exits non-zero so the
+      // caller's status check fires.
+      try {
+        process.stderr.write(
+          `emitJson: writeSync did not advance (returned ${n}); aborting to avoid infinite loop\n`,
+        );
+      } catch {
+        // stderr unwritable too; nothing useful we can do.
+      }
+      process.exit(2);
     }
     written += n;
   }
