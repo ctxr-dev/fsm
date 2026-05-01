@@ -108,10 +108,14 @@ test("fsm-commit: large brief (>64KB) is byte-complete on stdout (issue #12)", (
     // emit the next state's brief (which threads the blob into env.blob)
     // without truncation. 200KB chosen so the brief reliably exceeds the
     // 64KB pipe buffer cap that the previous emit() shape clipped at.
+    // Pass via --outputs-file rather than --outputs to keep the test
+    // portable (some platforms cap argv length below 200KB).
     const blob = "x".repeat(200_000);
+    const outputsPath = join(tmp, "outputs.json");
+    writeFileSync(outputsPath, JSON.stringify({ blob }));
     const commitResult = runScript("fsm-commit.mjs", [
       "--run-id", newRun.run_id,
-      "--outputs", JSON.stringify({ blob }),
+      "--outputs-file", outputsPath,
       "--session-id", session,
       ...commonArgs(tmp),
     ]);
