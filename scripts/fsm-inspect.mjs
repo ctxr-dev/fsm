@@ -6,6 +6,7 @@
 //
 // Output: JSON with manifest + lock state + ordered list of trace records.
 
+import { writeSync } from "node:fs";
 import { resolve } from "node:path";
 
 import {
@@ -34,7 +35,13 @@ function parseArgs(argv) {
 }
 
 function emit(payload) {
-  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+  // writeSync to fd 1 (stdout) — a blocking POSIX write that does NOT
+  // queue in Node's userspace stream buffer. The previous shape
+  // (`process.stdout.write(...)` followed by `process.exit(...)`)
+  // truncated payloads larger than the kernel pipe buffer (~64KB on
+  // macOS) because the userspace queue was dropped at exit before it
+  // could drain. Issue #12.
+  writeSync(1, `${JSON.stringify(payload, null, 2)}\n`);
 }
 
 let parsed;

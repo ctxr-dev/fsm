@@ -7,7 +7,7 @@
 // Exits 0 on clean, 1 on any validation failure.
 // Prints a structured JSON report to stdout.
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, writeSync } from "node:fs";
 import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
@@ -80,5 +80,9 @@ const summary = {
   total_errors: totalErrors,
   files: reports,
 };
-process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+// writeSync to fd 1 — see fsm-commit.mjs's emit() comment. process.exit
+// after process.stdout.write truncates large payloads at the kernel pipe
+// buffer (~64KB on macOS); writeSync is a blocking POSIX write that
+// drains synchronously. Issue #12.
+writeSync(1, `${JSON.stringify(summary, null, 2)}\n`);
 process.exit(totalErrors === 0 ? 0 : 1);
