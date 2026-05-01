@@ -7,10 +7,11 @@
 // Exits 0 on clean, 1 on any validation failure.
 // Prints a structured JSON report to stdout.
 
-import { readFileSync, existsSync, writeSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
+import { emitJson } from "./lib/emit.mjs";
 import {
   validateFsmSchema,
   validateFsmStatic,
@@ -80,9 +81,8 @@ const summary = {
   total_errors: totalErrors,
   files: reports,
 };
-// writeSync to fd 1 — see fsm-commit.mjs's emit() comment. process.exit
-// after process.stdout.write truncates large payloads at the kernel pipe
-// buffer (~64KB on macOS); writeSync is a blocking POSIX write that
-// drains synchronously. Issue #12.
-writeSync(1, `${JSON.stringify(summary, null, 2)}\n`);
+// Delegates to ./lib/emit.mjs — loops fs.writeSync until the full
+// payload is written (single writeSync may partial-write) and swallows
+// EPIPE when the reader closes early. Issue #12.
+emitJson(summary);
 process.exit(totalErrors === 0 ? 0 : 1);

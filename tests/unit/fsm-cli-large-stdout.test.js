@@ -91,13 +91,16 @@ test("fsm-commit: large brief (>64KB) is byte-complete on stdout (issue #12)", (
   const tmp = setupFixture(makeBigPayloadFsm());
   try {
     const session = "test-bigpayload";
-    const newRun = JSON.parse(
-      runScript("fsm-next.mjs", [
-        "--new-run", "--repo", "bigtest", "--base-sha", "aaa", "--head-sha", "bbb",
-        "--session-id", session, "--args", "{}",
-        ...commonArgs(tmp),
-      ]).stdout,
+    const newRunResult = runScript("fsm-next.mjs", [
+      "--new-run", "--repo", "bigtest", "--base-sha", "aaa", "--head-sha", "bbb",
+      "--session-id", session, "--args", "{}",
+      ...commonArgs(tmp),
+    ]);
+    assert.equal(
+      newRunResult.status, 0,
+      `fsm-next --new-run failed; stderr: ${newRunResult.stderr}`,
     );
+    const newRun = JSON.parse(newRunResult.stdout);
 
     // Commit the entry state with a multi-hundred-KB blob. fsm-commit must
     // emit the next state's brief (which threads the blob into env.blob)
@@ -126,6 +129,81 @@ test("fsm-commit: large brief (>64KB) is byte-complete on stdout (issue #12)", (
     // The blob round-tripped through fsm-commit's brief output for state b.
     assert.equal(brief.inputs.blob.length, blob.length);
     assert.equal(brief.inputs.blob, blob);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("fsm-next --new-run: large args echoed in brief (>64KB) is byte-complete (issue #12)", () => {
+  // Sibling of the fsm-commit test above. fsm-next --new-run emits the
+  // entry-state brief which carries `inputs: { args: <args> }`. Pass a
+  // 200KB args bag so the brief reliably exceeds the 64KB pipe-buffer
+  // cap. Asserts the parent receives the full JSON byte-complete.
+  const tmp = setupFixture(makeBigPayloadFsm());
+  try {
+    const session = "test-bignewrun";
+    const blob = "x".repeat(200_000);
+    const argsJson = JSON.stringify({ huge: blob });
+    // 200KB JSON arg passed via --args-file (some shells choke on long
+    // --args strings on the command line).
+    writeFileSync(join(tmp, "args.json"), argsJson);
+
+    const newRunResult = runScript("fsm-next.mjs", [
+      "--new-run", "--repo", "bigtest", "--base-sha", "aaa", "--head-sha", "bbb",
+      "--session-id", session, "--args-file", join(tmp, "args.json"),
+      ...commonArgs(tmp),
+    ]);
+    assert.equal(
+      newRunResult.status, 0,
+      `fsm-next --new-run failed; stderr: ${newRunResult.stderr}`,
+    );
+    assert.ok(
+      newRunResult.stdout.length > 200_000,
+      `expected new-run stdout > 200KB, got ${newRunResult.stdout.length}`,
+    );
+    const brief = JSON.parse(newRunResult.stdout); // would throw under the bug
+    assert.equal(brief.ok, true);
+    assert.equal(brief.state, "a");
+    assert.equal(brief.inputs.args.huge.length, blob.length);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("fsm-validate-static: large summary is byte-complete on stdout (issue #12)", () => {
+  // fsm-validate-static reports per-file results. To exercise the
+  // large-stdout path, write enough invalid FSM files that the cumulative
+  // JSON summary exceeds the 64KB pipe-buffer cap.
+  const tmp = mkdtempSync(join(tmpdir(), "fsm-static-large-"));
+  try {
+    // Each invalid FSM contributes ~150 bytes to the JSON report. 600
+    // files cross the 64KB cap with margin (~90KB).
+    const filenames = [];
+    for (let i = 0; i < 600; i++) {
+      const name = `bad-${String(i).padStart(4, "0")}.yaml`;
+      writeFileSync(
+        join(tmp, name),
+        `fsm:\n  id: x\n  version: 1\n  entry: missing_state_${i}\n  states:\n    - id: a\n      purpose: "."\n      preconditions: []\n      outputs: []\n      transitions: []\n`,
+      );
+      filenames.push(name);
+    }
+
+    const result = spawnSync(
+      "node",
+      [join(SCRIPT_DIR, "fsm-validate-static.mjs"), ...filenames],
+      { encoding: "utf8", cwd: tmp },
+    );
+
+    // Exit 1 expected (every file is invalid). Stdout must still be
+    // a complete JSON document.
+    assert.equal(result.status, 1, `expected exit 1; stderr: ${result.stderr}`);
+    assert.ok(
+      result.stdout.length > 64 * 1024,
+      `expected stdout > 64KB to exercise the truncation path; got ${result.stdout.length}`,
+    );
+    const summary = JSON.parse(result.stdout); // would throw under the bug
+    assert.equal(summary.ok, false);
+    assert.equal(summary.files.length, 600);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }

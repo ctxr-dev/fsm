@@ -6,9 +6,9 @@
 //
 // Output: JSON with manifest + lock state + ordered list of trace records.
 
-import { writeSync } from "node:fs";
 import { resolve } from "node:path";
 
+import { emitJson } from "./lib/emit.mjs";
 import {
   readLock,
   readManifest,
@@ -34,15 +34,10 @@ function parseArgs(argv) {
   return args;
 }
 
-function emit(payload) {
-  // writeSync to fd 1 (stdout) — a blocking POSIX write that does NOT
-  // queue in Node's userspace stream buffer. The previous shape
-  // (`process.stdout.write(...)` followed by `process.exit(...)`)
-  // truncated payloads larger than the kernel pipe buffer (~64KB on
-  // macOS) because the userspace queue was dropped at exit before it
-  // could drain. Issue #12.
-  writeSync(1, `${JSON.stringify(payload, null, 2)}\n`);
-}
+// Delegates to ./lib/emit.mjs which loops fs.writeSync until the full
+// payload is written (single writeSync may partial-write) and swallows
+// EPIPE when the reader closes early. Issue #12.
+const emit = emitJson;
 
 let parsed;
 try {
