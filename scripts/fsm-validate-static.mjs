@@ -11,6 +11,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
+import { emitJson } from "./lib/emit.mjs";
 import {
   validateFsmSchema,
   validateFsmStatic,
@@ -80,5 +81,8 @@ const summary = {
   total_errors: totalErrors,
   files: reports,
 };
-process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+// Delegates to ./lib/emit.mjs — loops fs.writeSync until the full
+// payload is written (single writeSync may partial-write) and swallows
+// EPIPE when the reader closes early. Issue #12.
+emitJson(summary);
 process.exit(totalErrors === 0 ? 0 : 1);

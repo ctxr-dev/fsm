@@ -8,6 +8,7 @@
 
 import { resolve } from "node:path";
 
+import { emitJson } from "./lib/emit.mjs";
 import {
   readLock,
   readManifest,
@@ -33,9 +34,10 @@ function parseArgs(argv) {
   return args;
 }
 
-function emit(payload) {
-  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
-}
+// Delegates to ./lib/emit.mjs which loops fs.writeSync until the full
+// payload is written (single writeSync may partial-write) and swallows
+// EPIPE when the reader closes early. Issue #12.
+const emit = emitJson;
 
 let parsed;
 try {

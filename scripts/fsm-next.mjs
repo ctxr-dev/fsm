@@ -21,6 +21,8 @@
 
 import { readFileSync } from "node:fs";
 
+import { emitJson } from "./lib/emit.mjs";
+
 import {
   acquireLock,
   buildRunId,
@@ -58,9 +60,10 @@ function parseArgs(argv) {
   return args;
 }
 
-function emit(payload) {
-  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
-}
+// Delegates to ./lib/emit.mjs which loops fs.writeSync until the full
+// payload is written (single writeSync may partial-write) and swallows
+// EPIPE when the reader closes early. Issue #12.
+const emit = emitJson;
 
 function fail(error, code = 1) {
   process.stderr.write(`fsm-next: ${error}\n`);
