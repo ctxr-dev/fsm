@@ -419,6 +419,132 @@ test("withJournal: rejects fn returning a manual Promise", () => {
   }
 });
 
+test("transaction.staged: returned snapshot is frozen and decoupled from internal state", () => {
+  const store = tmpStore();
+  try {
+    const { runId, runDir, opts } = makeRun(store);
+    let snapshotBefore;
+    let snapshotAfter;
+    withJournal(runDir, (txn) => {
+      writeManifest(
+        runId,
+        { run_id: runId, status: "in_progress", current_state: "b" },
+        { ...opts, transaction: txn },
+      );
+      snapshotBefore = txn.staged;
+      // Snapshot is frozen — push throws.
+      assert.throws(() => snapshotBefore.push({ relPath: "../../escape" }));
+      // Adding another staged entry via the proper API doesn't
+      // mutate the previously-returned snapshot (it was a copy).
+      appendTraceFile(
+        runId,
+        { phase: "exit", state: "a", data: {} },
+        { ...opts, transaction: txn },
+      );
+      snapshotAfter = txn.staged;
+      assert.equal(snapshotBefore.length, 1);
+      assert.equal(snapshotAfter.length, 2);
+    });
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("transaction.addStaged: rejects duplicate relPath", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    assert.throws(
+      () =>
+        withJournal(runDir, (txn) => {
+          const stagedPath = txn.stage("foo.json");
+          writeFileSync(stagedPath, "{}");
+          txn.addStaged("foo.json", stagedPath);
+          // Second registration of the same relPath must throw.
+          txn.addStaged("foo.json", stagedPath);
+        }),
+      /already staged/,
+    );
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("transaction.hasStaged: returns true iff relPath has been added", () => {
+  const store = tmpStore();
+  try {
+    const { runId, runDir, opts } = makeRun(store);
+    withJournal(runDir, (txn) => {
+      assert.equal(txn.hasStaged("manifest.json"), false);
+      writeManifest(
+        runId,
+        { run_id: runId, status: "in_progress", current_state: "b" },
+        { ...opts, transaction: txn },
+      );
+      assert.equal(txn.hasStaged("manifest.json"), true);
+      assert.equal(txn.hasStaged("nope.json"), false);
+    });
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("replayJournal: throws when staged source is missing AND destination is missing", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    const txnId = "partial-cleanup-001";
+    const txnDir = join(runDir, ".journal", txnId);
+    mkdirSync(txnDir, { recursive: true });
+    // Use a relPath that is NOT created by makeRun's setup. Neither
+    // the staged source under <txnDir>/fsm-trace/0042-... nor the
+    // final destination under <runDir>/fsm-trace/0042-... exists.
+    writeFileSync(
+      join(txnDir, "journal.json"),
+      JSON.stringify({
+        txn_id: txnId,
+        status: "ready_to_finalise",
+        staged_files: [{ relPath: "fsm-trace/0042-exit-zzz.yaml" }],
+      }),
+    );
+    assert.throws(
+      () => replayJournal(runDir, txnId),
+      /staged source for .* is missing AND the destination does not exist/,
+    );
+    // Journal still on disk — operator can inspect.
+    assert.equal(journalState(runDir).hasJournal, true);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("replayJournal: tolerates already-finalised entries when destination exists (idempotent re-run)", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    const txnId = "already-finalised-001";
+    const txnDir = join(runDir, ".journal", txnId);
+    mkdirSync(txnDir, { recursive: true });
+    // manifest.json already exists at the final path (makeRun wrote
+    // it). The journal lists manifest.json but the staged copy is
+    // missing — this is the legitimate "already finalised" case.
+    writeFileSync(
+      join(txnDir, "journal.json"),
+      JSON.stringify({
+        txn_id: txnId,
+        status: "ready_to_finalise",
+        staged_files: [{ relPath: "manifest.json" }],
+      }),
+    );
+    const result = replayJournal(runDir, txnId);
+    assert.equal(result.replayed, true);
+    assert.equal(result.finalised.length, 1);
+    assert.equal(result.finalised[0].already, true);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
 test("transaction.addStaged: rejects a stagedPath that diverges from canonical", () => {
   const store = tmpStore();
   try {

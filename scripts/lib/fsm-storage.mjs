@@ -181,7 +181,13 @@ export function writeManifest(runId, data, opts = {}) {
     const relPath = "manifest.json";
     const stagedPath = txn.stage(relPath);
     atomicWriteJson(stagedPath, data);
-    if (!txn.staged.some((s) => s.relPath === relPath)) {
+    // Skip the duplicate registration when manifest.json is rewritten
+    // multiple times in one transaction (e.g. an inline state that
+    // patches the manifest after the engine has already staged its
+    // own update). atomicWriteJson over the same stagedPath gives
+    // last-write-wins, which is the correct semantics for a single
+    // commit.
+    if (!txn.hasStaged(relPath)) {
       txn.addStaged(relPath, stagedPath);
     }
     return;
@@ -627,6 +633,20 @@ export function replayJournal(runDir, txnId) {
     const stagedPath = join(txnDir, entry.relPath);
     const finalPath = join(runDir, entry.relPath);
     if (!existsSync(stagedPath)) {
+      // Idempotency only holds when the destination already carries
+      // the bytes. If neither the staged source NOR the final
+      // destination exists, the journal has been partially cleaned
+      // up (manual intervention, disk corruption, restored from a
+      // partial backup) and silently completing would let us delete
+      // the journal directory, losing the last recoverable
+      // artifact. Refuse loudly so the operator can inspect what
+      // happened.
+      if (!existsSync(finalPath)) {
+        throw new Error(
+          `replayJournal: staged source for "${entry.relPath}" is missing AND the destination does not exist; ` +
+            "the journal was partially cleaned up. Inspect the run directory manually before retrying.",
+        );
+      }
       finalised.push({ relPath: entry.relPath, already: true });
       continue;
     }
@@ -717,7 +737,18 @@ export function withJournal(runDir, fn) {
     txnId,
     runDir,
     txnDir,
-    staged: stagedFiles,
+    // `staged` is a snapshot, not a live reference. Returning the
+    // internal array would let a caller bypass stage()/addStaged()
+    // validation by pushing arbitrary entries straight in, which the
+    // finalisation rename loop would then move into runDir without
+    // any checks. The getter returns a fresh frozen copy each access
+    // — read-only by contract, immune to in-place mutation.
+    get staged() {
+      return Object.freeze(stagedFiles.map((s) => ({ ...s })));
+    },
+    hasStaged(relPath) {
+      return stagedFiles.some((s) => s.relPath === relPath);
+    },
     stage(relPath) {
       // stage() is the public surface for staging a write inside a
       // transaction. String-side relPath validation rejects "..",
@@ -757,6 +788,20 @@ export function withJournal(runDir, fn) {
       if (stagedPath !== canonical) {
         throw new Error(
           `transaction.addStaged: stagedPath "${stagedPath}" must equal canonical "${canonical}" (use the value returned by stage(relPath))`,
+        );
+      }
+      // Duplicate-relPath guard. If the same relPath is registered
+      // twice, the finalisation rename loop would call renameSync on
+      // the (now non-existent) staged source the second time and
+      // throw mid-finalise, leaving the run with some files moved
+      // and others not. Callers that legitimately re-stage a path
+      // (e.g. writeManifest writing manifest.json multiple times in
+      // one tx) must use hasStaged() to skip the duplicate
+      // registration; atomicWrite over the same stagedPath is the
+      // expected idiom.
+      if (stagedFiles.some((s) => s.relPath === relPath)) {
+        throw new Error(
+          `transaction.addStaged: relPath "${relPath}" is already staged; use hasStaged() to skip the duplicate registration`,
         );
       }
       stagedFiles.push({ relPath, stagedPath: canonical });

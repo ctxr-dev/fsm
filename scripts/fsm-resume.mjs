@@ -142,7 +142,18 @@ if (parsed.journalAction) {
     process.exit(0);
   }
   if (parsed.journalAction === "discard") {
-    const out = discardJournal(recoveryRunDir, jstate.txnId);
+    let out;
+    try {
+      out = discardJournal(recoveryRunDir, jstate.txnId);
+    } catch (err) {
+      emit({
+        error: "discard_failed",
+        run_id: parsed.runId,
+        txn_id: jstate.txnId,
+        detail: err.message,
+      });
+      process.exit(1);
+    }
     emit({
       ok: true,
       run_id: parsed.runId,
@@ -165,7 +176,22 @@ if (parsed.journalAction) {
     });
     process.exit(1);
   }
-  const out = replayJournal(recoveryRunDir, jstate.txnId);
+  let out;
+  try {
+    out = replayJournal(recoveryRunDir, jstate.txnId);
+  } catch (err) {
+    // replayJournal's tightened checks (symlink containment,
+    // missing-source-AND-missing-dest, etc.) all throw. Surface as
+    // a structured CLI error so operators and automation can react
+    // instead of getting a stack trace.
+    emit({
+      error: "replay_failed",
+      run_id: parsed.runId,
+      txn_id: jstate.txnId,
+      detail: err.message,
+    });
+    process.exit(1);
+  }
   emit({
     ok: true,
     run_id: parsed.runId,
