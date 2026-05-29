@@ -33,6 +33,7 @@ import { emitJson } from "./lib/emit.mjs";
 import {
   acquireLock,
   discardJournal,
+  discardOrphanedLock,
   journalState,
   pruneTraceAfter,
   readLock,
@@ -192,7 +193,16 @@ function doJournalRecovery(storageRoot) {
   if (parsed.journalAction === "discard") {
     let out;
     try {
-      out = discardJournal(recoveryRunDir, jstate.txnId);
+      // Orphaned-lock branch: if journalState surfaced lock_only AND
+      // could not parse the lock payload's txn_id, calling
+      // discardJournal(null) would throw "txnId must be a non-empty
+      // string". Route to discardOrphanedLock instead, which clears
+      // the lock without requiring a txnId match.
+      if (jstate.lock_only && !jstate.txnId) {
+        out = discardOrphanedLock(recoveryRunDir);
+      } else {
+        out = discardJournal(recoveryRunDir, jstate.txnId);
+      }
     } catch (err) {
       emit({
         error: "discard_failed",

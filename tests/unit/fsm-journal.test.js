@@ -22,6 +22,7 @@ import {
   appendTraceFile,
   buildRunId,
   discardJournal,
+  discardOrphanedLock,
   ensureRunDir,
   journalRoot,
   journalState,
@@ -232,6 +233,59 @@ test("discardJournal: refuses to clear an orphaned tx.lock with a different txnI
     assert.equal(result.reason, "lock_txn_id_mismatch");
     assert.equal(result.active_lock_txn_id, "real-txn-001");
     // Lock still on disk.
+    assert.equal(existsSync(join(journalRoot(runDir), "tx.lock")), true);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("journalState: orphaned tx.lock with unparseable JSON returns lock_only with txnId=null", () => {
+  // The lock payload is written then fsynced after open. If the
+  // process dies mid-write, the lock file can be present but
+  // truncated or malformed. journalState must still surface it.
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    mkdirSync(journalRoot(runDir), { recursive: true });
+    writeFileSync(join(journalRoot(runDir), "tx.lock"), "{ truncated_json"); // malformed
+    const j = journalState(runDir);
+    assert.equal(j.hasJournal, true);
+    assert.equal(j.status, "lock_only");
+    assert.equal(j.txnId, null);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("discardOrphanedLock: clears tx.lock when no txn dirs exist", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    mkdirSync(journalRoot(runDir), { recursive: true });
+    writeFileSync(join(journalRoot(runDir), "tx.lock"), "{malformed");
+    const result = discardOrphanedLock(runDir);
+    assert.equal(result.discarded, true);
+    assert.equal(result.lock_only, true);
+    assert.equal(existsSync(journalRoot(runDir)), false);
+    // Fresh withJournal works after the orphaned-lock clear.
+    withJournal(runDir, () => {});
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("discardOrphanedLock: refuses when txn dirs are present", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    // Plant both a txn dir AND a tx.lock — this is a real (not
+    // orphaned) state and discardOrphanedLock must refuse.
+    mkdirSync(join(journalRoot(runDir), "real-txn-001"), { recursive: true });
+    writeFileSync(join(journalRoot(runDir), "tx.lock"), "{}");
+    const result = discardOrphanedLock(runDir);
+    assert.equal(result.discarded, false);
+    assert.equal(result.reason, "txn_dirs_present");
+    assert.deepEqual(result.txn_dirs, ["real-txn-001"]);
     assert.equal(existsSync(join(journalRoot(runDir), "tx.lock")), true);
   } finally {
     rmSync(store, { recursive: true, force: true });

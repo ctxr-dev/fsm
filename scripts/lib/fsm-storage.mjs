@@ -630,6 +630,44 @@ export function journalState(runDir) {
   };
 }
 
+// discardOrphanedLock clears a `.journal/tx.lock` file when no txn dir
+// exists alongside it. The recovery path for a crash so severe that
+// the lock's own JSON payload never got finished writing — journalState
+// surfaces this as `{lock_only:true, txnId:null}`, and discardJournal
+// would reject the null txnId. Callers must verify there are no txn
+// dirs (e.g. by calling journalState first) so this cannot clobber a
+// legitimate in-progress transaction.
+export function discardOrphanedLock(runDir) {
+  const root = journalRoot(runDir);
+  if (!existsSync(root)) {
+    return { discarded: false, reason: "not_found" };
+  }
+  assertWithin(root, runDir, "discardOrphanedLock");
+  const txnDirs = readdirSync(root, { withFileTypes: true })
+    .filter((d) => d.isDirectory());
+  if (txnDirs.length > 0) {
+    // Refuse: there's a real txn here. Use discardJournal(runDir, txnId).
+    return {
+      discarded: false,
+      reason: "txn_dirs_present",
+      txn_dirs: txnDirs.map((d) => d.name),
+    };
+  }
+  const lockPath = join(root, "tx.lock");
+  if (!existsSync(lockPath)) {
+    return { discarded: false, reason: "not_found" };
+  }
+  rmSync(lockPath, { force: true });
+  if (existsSync(root) && readdirSync(root).length === 0) {
+    try {
+      rmdirSync(root);
+    } catch {
+      // Empty-dir cleanup race is harmless.
+    }
+  }
+  return { discarded: true, lock_only: true };
+}
+
 // discardJournal removes a specific journal transaction directory. If the
 // transaction is "ready_to_finalise", callers should usually replay instead
 // — discarding loses the work — but the explicit choice is the user's.
