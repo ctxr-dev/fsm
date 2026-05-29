@@ -911,11 +911,44 @@ export function withJournal(runDir, fn) {
       } catch {
         // Lock file unreadable; report what we can.
       }
-      let observedState = { hasJournal: false };
+      let observedState;
       try {
         observedState = journalState(runDir);
       } catch {
-        // Don't let an inspection failure mask the real lock-held cause.
+        // Don't let an inspection failure mask the real lock-held
+        // cause. Synthesise a lock_only stub so downstream error
+        // payloads still report hasJournal:true (the tx.lock file IS
+        // the blocking artifact).
+        observedState = {
+          hasJournal: true,
+          lock_only: true,
+          txnId: activeLock?.txn_id ?? null,
+          txnDir: null,
+          status: "lock_only",
+          staged: [],
+          active_lock: activeLock,
+          runDir,
+          all: [],
+        };
+      }
+      // If journalState succeeded but reported hasJournal:false (e.g.
+      // a race where the lock was written but the synthetic
+      // lock_only branch was missed), the lock file we just caught
+      // EEXIST on IS a journal artifact. Force-upgrade the shape so
+      // downstream callers don't emit the contradictory
+      // "present:false" payload.
+      if (!observedState.hasJournal) {
+        observedState = {
+          hasJournal: true,
+          lock_only: true,
+          txnId: activeLock?.txn_id ?? null,
+          txnDir: null,
+          status: "lock_only",
+          staged: [],
+          active_lock: activeLock,
+          runDir,
+          all: [],
+        };
       }
       const lockErr = new Error(
         `withJournal: another transaction holds the lock (active=${activeLock ? activeLock.txn_id : "unknown"}); recover via fsm-resume --journal {discard|replay}`,

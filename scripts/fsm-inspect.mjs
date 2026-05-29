@@ -6,7 +6,7 @@
 //
 // Output: JSON with manifest + lock state + ordered list of trace records.
 
-import { emitJson } from "./lib/emit.mjs";
+import { emitJson, shellQuote } from "./lib/emit.mjs";
 import {
   journalState,
   publicJournalProjection,
@@ -86,8 +86,8 @@ const journal = journalInspectError
       present: true,
       ...publicJournalProjection(jstate),
       recovery: {
-        discard: `fsm-resume --run-id ${parsed.runId} --journal discard --storage-root ${storageRoot}`,
-        replay: `fsm-resume --run-id ${parsed.runId} --journal replay --storage-root ${storageRoot}`,
+        discard: `fsm-resume --run-id ${shellQuote(parsed.runId)} --journal discard --storage-root ${shellQuote(storageRoot)}`,
+        replay: `fsm-resume --run-id ${shellQuote(parsed.runId)} --journal replay --storage-root ${shellQuote(storageRoot)}`,
       },
     }
   : { present: false };

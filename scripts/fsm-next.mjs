@@ -21,7 +21,7 @@
 
 import { readFileSync } from "node:fs";
 
-import { emitJson } from "./lib/emit.mjs";
+import { emitJson, shellQuote } from "./lib/emit.mjs";
 
 import {
   acquireLock,
@@ -211,8 +211,8 @@ if (resumeJournal.hasJournal) {
     run_id: runId,
     journal: publicJournalProjection(resumeJournal),
     recovery: {
-      discard: `fsm-resume --run-id ${runId} --journal discard --storage-root ${settings.storageRoot}`,
-      replay: `fsm-resume --run-id ${runId} --journal replay --storage-root ${settings.storageRoot}`,
+      discard: `fsm-resume --run-id ${shellQuote(runId)} --journal discard --storage-root ${shellQuote(settings.storageRoot)}`,
+      replay: `fsm-resume --run-id ${shellQuote(runId)} --journal replay --storage-root ${shellQuote(settings.storageRoot)}`,
     },
   });
   process.exit(1);

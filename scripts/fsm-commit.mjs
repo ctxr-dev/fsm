@@ -20,7 +20,7 @@
 
 import { readFileSync } from "node:fs";
 
-import { emitJson } from "./lib/emit.mjs";
+import { emitJson, shellQuote } from "./lib/emit.mjs";
 import {
   appendTraceFile,
   journalState,
@@ -162,8 +162,8 @@ if (existingJournal.hasJournal) {
     run_id: parsed.runId,
     journal: publicJournalProjection(existingJournal),
     recovery: {
-      discard: `fsm-resume --run-id ${parsed.runId} --journal discard --storage-root ${settings.storageRoot}`,
-      replay: `fsm-resume --run-id ${parsed.runId} --journal replay --storage-root ${settings.storageRoot}`,
+      discard: `fsm-resume --run-id ${shellQuote(parsed.runId)} --journal discard --storage-root ${shellQuote(settings.storageRoot)}`,
+      replay: `fsm-resume --run-id ${shellQuote(parsed.runId)} --journal replay --storage-root ${shellQuote(settings.storageRoot)}`,
     },
   });
   process.exit(1);
@@ -417,8 +417,8 @@ try {
       run_id: parsed.runId,
       journal: publicJournalProjection(err.journal),
       recovery: {
-        discard: `fsm-resume --run-id ${parsed.runId} --journal discard --storage-root ${settings.storageRoot}`,
-        replay: `fsm-resume --run-id ${parsed.runId} --journal replay --storage-root ${settings.storageRoot}`,
+        discard: `fsm-resume --run-id ${shellQuote(parsed.runId)} --journal discard --storage-root ${shellQuote(settings.storageRoot)}`,
+        replay: `fsm-resume --run-id ${shellQuote(parsed.runId)} --journal replay --storage-root ${shellQuote(settings.storageRoot)}`,
       },
     });
     process.exit(1);
