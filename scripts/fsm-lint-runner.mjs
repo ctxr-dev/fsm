@@ -56,8 +56,12 @@
 //           "## Role", "## Brief", "Specialist:", "Output Contract".
 //       (b) a JSON-schema-like marker -- one of "$schema",
 //           '"type": "object"', '"required":', 'response_schema'.
-//     Why: prompts should live in fsm/prompt-templates/*.md and be
-//     composed via @ctxr/fsm/prompt-fragments. Inline composition
+//     Why: prompts should live in the file referenced by the FSM
+//     state's `worker.prompt_template` field (typically a separate
+//     markdown file the runner stages on disk), not embedded in the
+//     runner source. Where exactly that file lives is the consumer's
+//     choice; the rule fires on inline composition regardless of
+//     project layout. Inline composition
 //     puts the contract in the runner where it cannot be reviewed
 //     or reused.
 //
@@ -257,7 +261,7 @@ export function lintFile(filePath, source) {
   // `.fsm.yaml` literal that lives only inside a `/* ... */` segment
   // is not matched.
   const readApiRegex = new RegExp(
-    `\\b(?:${readApiAlternation})\\s*\\([^)\\n]*?(['"\`])[^'"\`\\n]*\\.fsm\\.yaml[^'"\`\\n]*\\1`,
+    `\\b(?:${readApiAlternation})\\s*\\([^\\n]*?(['"\`])[^'"\`\\n]*\\.fsm\\.yaml[^'"\`\\n]*\\1`,
   );
   // Strip inline `/* ... */` segments from a single line for the
   // per-line regexes. Stops at the first newline (block comments that
@@ -439,7 +443,7 @@ export function lintFile(filePath, source) {
       line: startLine,
       rule: RULES.NO_INLINE_PROMPT_COMPOSITION,
       message:
-        "inline multi-line prompt with role + schema markers; move to fsm/prompt-templates/*.md and compose via @ctxr/fsm/prompt-fragments",
+        "inline multi-line prompt with role + schema markers; move the body to the file referenced by the FSM state's worker.prompt_template (so the prompt is reviewed and versioned next to the FSM YAML, not embedded in the runner)",
     });
   }
 

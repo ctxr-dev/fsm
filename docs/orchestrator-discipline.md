@@ -3,7 +3,7 @@
 `@ctxr/fsm` is designed around a strict separation of responsibilities:
 
 - The **FSM engine** parses the FSM YAML, validates worker outputs against the per-state JSON Schemas, applies transition predicates, and writes manifest + trace files.
-- The **worker** receives a staged prompt (assembled from `fsm/prompt-templates/*.md` + reusable fragments from `@ctxr/fsm/prompt-fragments`) and emits a single JSON document that conforms to the state's `response_schema`.
+- The **worker** receives a staged prompt (assembled by the runner from the file referenced by the FSM state's `worker.prompt_template`, possibly composed with project-local prompt fragments) and emits a single JSON document that conforms to the state's `response_schema`.
 - The **orchestrator (the skill runner)** is a thin shell around the FSM CLIs. It calls `fsm-next` to get the next dispatch brief, asks the harness to spawn a worker with the staged prompt, hands the worker's JSON output to `fsm-commit`, and loops until the FSM reaches a terminal state.
 
 When the runner stays a shell, the FSM is the single source of truth for control flow. When the runner starts reading YAML, calling LLM tools directly, or assembling prompts inline, control flow leaks back into the runner and the FSM's determinism guarantees erode.
@@ -37,7 +37,7 @@ This rule has the most false-positive risk (see below).
 
 > The orchestrator must not compose worker prompts inline.
 
-Prompts belong in `fsm/prompt-templates/*.md`, with reusable fragments imported from `@ctxr/fsm/prompt-fragments` (specialist header, output-contract block, forbidden-paths notice, brief block). Composing prompts inline puts the worker contract in the runner where it cannot be reviewed, reused, or diffed independently.
+Prompts belong in the file referenced by the FSM state's `worker.prompt_template`, optionally composed with project-local fragments (specialist header, output-contract block, forbidden-paths notice, brief block). Where exactly those files live is the consumer's choice; the lint rule only fires on inline composition inside the runner. Composing prompts inline puts the worker contract in the runner where it cannot be reviewed, reused, or diffed independently.
 
 The linter flags multi-line template literals (backtick strings spanning two or more source lines) that contain BOTH:
 
