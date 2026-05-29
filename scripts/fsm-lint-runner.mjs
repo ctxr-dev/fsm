@@ -148,15 +148,26 @@ export function lintFile(filePath, source) {
   const lines = source.split(/\r?\n/);
 
   const readApiAlternation = READ_APIS.join("|");
+  // Require the .fsm.yaml occurrence to be inside a quoted string
+  // literal so block comments or commented-out args (e.g.
+  // `readFileSync(/* ".fsm.yaml" */ x)`) do not fire. The argument
+  // expression up to the `.fsm.yaml` occurrence is matched lazily,
+  // then the suffix must end inside the SAME quote that opened it.
   const readApiRegex = new RegExp(
-    `\\b(?:${readApiAlternation})\\s*\\([^)\\n]*\\.fsm\\.yaml`,
+    `\\b(?:${readApiAlternation})\\s*\\([^)\\n]*?(['"\`])[^'"\`\\n]*\\.fsm\\.yaml[^'"\`\\n]*\\1`,
   );
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const lineNumber = i + 1;
-    const previous = i > 0 ? lines[i - 1] : "";
-    if (line.includes(IGNORE_MARKER) || previous.includes(IGNORE_MARKER)) {
+    // The fsm-lint:ignore marker is intentionally per-line for the
+    // single-line rules (no-direct-fsm-yaml-read and
+    // no-orchestrator-llm-call); previous-line suppression is
+    // reserved for the multi-line template-literal rule, where the
+    // marker can legitimately precede the literal it suppresses.
+    // Applying previous-line suppression to per-line rules silently
+    // hid the diagnostic immediately after any other ignored line.
+    if (line.includes(IGNORE_MARKER)) {
       continue;
     }
 

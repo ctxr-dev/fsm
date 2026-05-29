@@ -139,7 +139,7 @@ test("Anthropic SDK call fires no-orchestrator-llm-call and exits 1", () => {
   }
 });
 
-test("harness Agent( dispatch fires no-orchestrator-llm-call and exits 1", () => {
+test("harness Agent() dispatch fires no-orchestrator-llm-call and exits 1", () => {
   const dir = tmpDir();
   try {
     const RUNNER = [
