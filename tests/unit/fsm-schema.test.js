@@ -225,3 +225,138 @@ test("validateWorkerResponse: schema compilation error returns valid=false", () 
   assert.equal(result.valid, false);
   assert.match(result.errors[0], /Schema compilation/);
 });
+
+// ─── loop state primitive ──────────────────────────────────────────────
+
+function validFsmWithLoop() {
+  return {
+    fsm: {
+      id: "loop-fsm",
+      version: 1,
+      entry: "explore",
+      states: [
+        {
+          id: "explore",
+          purpose: "Iterative exploration loop.",
+          preconditions: [],
+          loop: {
+            worker: {
+              role: "explorer",
+              prompt_template: "fsm/workers/explore-iter.md",
+              inputs: ["args"],
+              response_schema: {
+                type: "object",
+                required: ["done", "findings"],
+                properties: {
+                  done: { type: "boolean" },
+                  findings: { type: "array" },
+                },
+              },
+            },
+            max_iterations: 5,
+            done_field: "done",
+            iteration_outputs_dir: "explore-iters/",
+          },
+          outputs: ["aggregated_explore"],
+          post_validations: [],
+          transitions: [{ to: "done", when: { kind: "always" } }],
+        },
+        {
+          id: "done",
+          purpose: "Terminal.",
+          preconditions: ["aggregated_explore exists"],
+          outputs: [],
+          transitions: [],
+        },
+      ],
+    },
+  };
+}
+
+test("validateFsmSchema accepts a loop state", () => {
+  const { valid, errors } = validateFsmSchema(validFsmWithLoop());
+  assert.equal(valid, true, `expected valid; got errors: ${errors.join("; ")}`);
+});
+
+test("validateFsmSchema rejects a state with both worker and loop", () => {
+  const doc = validFsmWithLoop();
+  doc.fsm.states[0].worker = {
+    role: "x",
+    prompt_template: "x.md",
+    inputs: [],
+    response_schema: { type: "object" },
+  };
+  const { valid, errors } = validateFsmSchema(doc);
+  assert.equal(valid, false);
+  assert.match(errors.join(" "), /may not declare both `worker` and `loop`/);
+});
+
+test("validateFsmSchema rejects loop missing worker", () => {
+  const doc = validFsmWithLoop();
+  delete doc.fsm.states[0].loop.worker;
+  const { valid, errors } = validateFsmSchema(doc);
+  assert.equal(valid, false);
+  assert.match(errors.join(" "), /\.loop\.worker is required/);
+});
+
+test("validateFsmSchema rejects loop missing done_field", () => {
+  const doc = validFsmWithLoop();
+  delete doc.fsm.states[0].loop.done_field;
+  const { valid, errors } = validateFsmSchema(doc);
+  assert.equal(valid, false);
+  assert.match(errors.join(" "), /\.loop\.done_field is required/);
+});
+
+test("validateFsmSchema rejects loop with non-positive max_iterations", () => {
+  const doc = validFsmWithLoop();
+  doc.fsm.states[0].loop.max_iterations = 0;
+  const { valid, errors } = validateFsmSchema(doc);
+  assert.equal(valid, false);
+  assert.match(errors.join(" "), /max_iterations must be a positive integer/);
+});
+
+test("validateFsmSchema rejects loop with non-integer max_iterations", () => {
+  const doc = validFsmWithLoop();
+  doc.fsm.states[0].loop.max_iterations = 1.5;
+  const { valid, errors } = validateFsmSchema(doc);
+  assert.equal(valid, false);
+  assert.match(errors.join(" "), /max_iterations must be a positive integer/);
+});
+
+test("validateFsmSchema rejects loop with absolute iteration_outputs_dir", () => {
+  const doc = validFsmWithLoop();
+  doc.fsm.states[0].loop.iteration_outputs_dir = "/abs/path/";
+  const { valid, errors } = validateFsmSchema(doc);
+  assert.equal(valid, false);
+  assert.match(errors.join(" "), /iteration_outputs_dir must be a relative path/);
+});
+
+test("validateFsmSchema rejects loop iteration_outputs_dir with parent traversal", () => {
+  const doc = validFsmWithLoop();
+  doc.fsm.states[0].loop.iteration_outputs_dir = "../escape/";
+  const { valid, errors } = validateFsmSchema(doc);
+  assert.equal(valid, false);
+  assert.match(errors.join(" "), /iteration_outputs_dir must be a relative path/);
+});
+
+test("validateFsmSchema rejects loop where done_field is not in response_schema.properties", () => {
+  const doc = validFsmWithLoop();
+  doc.fsm.states[0].loop.done_field = "finished";
+  const { valid, errors } = validateFsmSchema(doc);
+  assert.equal(valid, false);
+  assert.match(errors.join(" "), /"finished" is not a property in loop\.worker\.response_schema/);
+});
+
+test("validateFsmStatic flags loop.worker.inputs not produced upstream", () => {
+  const doc = validFsmWithLoop();
+  doc.fsm.states[0].loop.worker.inputs = ["never_produced"];
+  const { valid, errors } = validateFsmStatic(doc);
+  assert.equal(valid, false);
+  assert.match(errors.join(" "), /loop\.worker\.inputs references "never_produced"/);
+});
+
+test("validateFsmStatic accepts loop with valid input/output flow", () => {
+  const doc = validFsmWithLoop();
+  const { valid, errors } = validateFsmStatic(doc);
+  assert.equal(valid, true, `expected valid; got errors: ${errors.join("; ")}`);
+});

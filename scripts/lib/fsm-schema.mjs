@@ -81,6 +81,12 @@ function validateState(state, prefix, errors) {
   if (state.worker !== undefined) {
     validateWorker(state.worker, `${prefix}.worker`, errors);
   }
+  if (state.loop !== undefined) {
+    if (state.worker !== undefined) {
+      errors.push(`${prefix} may not declare both \`worker\` and \`loop\``);
+    }
+    validateLoop(state.loop, `${prefix}.loop`, errors);
+  }
   if (!Array.isArray(state.outputs)) {
     errors.push(`${prefix}.outputs must be an array (use [] for terminal states)`);
   } else {
@@ -127,6 +133,58 @@ function validateWorker(worker, prefix, errors) {
     } catch (err) {
       errors.push(`${prefix}.response_schema is not a valid JSON Schema: ${err.message}`);
     }
+  }
+}
+
+function validateLoop(loop, prefix, errors) {
+  if (!loop || typeof loop !== "object") {
+    errors.push(`${prefix} must be a mapping`);
+    return;
+  }
+  for (const field of ["worker", "done_field"]) {
+    if (!Object.prototype.hasOwnProperty.call(loop, field)) {
+      errors.push(`${prefix}.${field} is required`);
+    }
+  }
+  if (loop.worker !== undefined) {
+    validateWorker(loop.worker, `${prefix}.worker`, errors);
+  }
+  if (loop.done_field !== undefined && (typeof loop.done_field !== "string" || !loop.done_field)) {
+    errors.push(`${prefix}.done_field must be a non-empty string`);
+  }
+  if (loop.max_iterations !== undefined) {
+    if (!Number.isInteger(loop.max_iterations) || loop.max_iterations < 1) {
+      errors.push(`${prefix}.max_iterations must be a positive integer (default 30 if omitted)`);
+    }
+  }
+  if (loop.iteration_outputs_dir !== undefined) {
+    if (typeof loop.iteration_outputs_dir !== "string" || !loop.iteration_outputs_dir) {
+      errors.push(`${prefix}.iteration_outputs_dir must be a non-empty string`);
+    } else if (
+      loop.iteration_outputs_dir.startsWith("/") ||
+      loop.iteration_outputs_dir.split("/").includes("..")
+    ) {
+      errors.push(
+        `${prefix}.iteration_outputs_dir must be a relative path under workers/ (no leading "/" and no ".." segments)`,
+      );
+    }
+  }
+  // Best-effort: done_field must appear as a property in the worker's
+  // response_schema. We only check object schemas with a properties map;
+  // anything more exotic is the FSM author's problem.
+  const schema = loop.worker?.response_schema;
+  if (
+    schema &&
+    typeof schema === "object" &&
+    schema.properties &&
+    typeof schema.properties === "object" &&
+    typeof loop.done_field === "string" &&
+    loop.done_field.length > 0 &&
+    !Object.prototype.hasOwnProperty.call(schema.properties, loop.done_field)
+  ) {
+    errors.push(
+      `${prefix}.done_field "${loop.done_field}" is not a property in loop.worker.response_schema.properties`,
+    );
   }
 }
 
@@ -231,24 +289,27 @@ export function validateFsmStatic(doc, { fsmFilePath } = {}) {
   // Worker prompt template files must exist on disk. Relative paths
   // resolve against the FSM YAML's directory; absolute paths are taken
   // verbatim. Convention: paths in the YAML are local to the YAML.
+  // Covers both regular worker states and loop states (loop.worker has the
+  // same shape; the prompt is staged per-iteration but the template is one).
   if (fsmFilePath) {
     const fsmDir = dirname(fsmFilePath);
     for (const state of fsm.states) {
-      if (!state?.worker?.prompt_template) continue;
-      const tpl = state.worker.prompt_template;
+      const workerSpec = state?.worker ?? state?.loop?.worker;
+      if (!workerSpec?.prompt_template) continue;
+      const tpl = workerSpec.prompt_template;
       const candidate = isAbsolute(tpl) ? tpl : resolve(fsmDir, tpl);
       if (!existsSync(candidate)) {
+        const kind = state.loop ? "loop.worker" : "worker";
         errors.push(
-          `State "${state.id}" worker prompt_template "${tpl}" not found at ${candidate}`,
+          `State "${state.id}" ${kind} prompt_template "${tpl}" not found at ${candidate}`,
         );
       }
     }
   }
-  // Best-effort input/output flow check: each state's preconditions reference
-  // a name that is produced by some upstream state's outputs. We do this as
-  // a substring check rather than a full dataflow analysis — preconditions
-  // are free-form English sentences that often contain the variable name
-  // (e.g. "project_profile exists in run state").
+  // Best-effort input/output flow check: each state's worker (or loop.worker)
+  // declares inputs[] that must be produced by some upstream state's outputs[].
+  // We do this as a name match — preconditions are free-form English so
+  // not analysed here; inputs are precise names.
   const allOutputs = new Set();
   for (const state of fsm.states) {
     for (const o of state?.outputs ?? []) {
@@ -256,13 +317,15 @@ export function validateFsmStatic(doc, { fsmFilePath } = {}) {
     }
   }
   for (const state of fsm.states) {
-    if (!state?.worker?.inputs) continue;
-    for (const inputName of state.worker.inputs) {
+    const workerSpec = state?.worker ?? state?.loop?.worker;
+    if (!workerSpec?.inputs) continue;
+    for (const inputName of workerSpec.inputs) {
       if (inputName === "args") continue; // entry-state argument bag
       if (typeof inputName !== "string") continue;
       if (!allOutputs.has(inputName)) {
+        const kind = state.loop ? "loop.worker" : "worker";
         errors.push(
-          `State "${state.id}" worker.inputs references "${inputName}" which is not produced by any state's outputs[]`,
+          `State "${state.id}" ${kind}.inputs references "${inputName}" which is not produced by any state's outputs[]`,
         );
       }
     }
