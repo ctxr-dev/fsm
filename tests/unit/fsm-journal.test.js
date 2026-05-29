@@ -175,6 +175,69 @@ test("withJournal: O_EXCL tx.lock refuses a concurrent withJournal call", () => 
   }
 });
 
+test("journalState: surfaces orphaned tx.lock with status='lock_only'", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    // Simulate a crash that left only the tx.lock — withJournal
+    // creates the lock BEFORE the txn dir, so the small window
+    // between the two writes can produce this state.
+    mkdirSync(journalRoot(runDir), { recursive: true });
+    writeFileSync(
+      join(journalRoot(runDir), "tx.lock"),
+      JSON.stringify({ txn_id: "orphan-001", pid: 42 }),
+    );
+    const j = journalState(runDir);
+    assert.equal(j.hasJournal, true);
+    assert.equal(j.status, "lock_only");
+    assert.equal(j.lock_only, true);
+    assert.equal(j.txnId, "orphan-001");
+    assert.deepEqual(j.staged, []);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("discardJournal: clears an orphaned tx.lock when txnId matches", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    mkdirSync(journalRoot(runDir), { recursive: true });
+    writeFileSync(
+      join(journalRoot(runDir), "tx.lock"),
+      JSON.stringify({ txn_id: "orphan-001", pid: 42 }),
+    );
+    const result = discardJournal(runDir, "orphan-001");
+    assert.equal(result.discarded, true);
+    assert.equal(result.lock_only, true);
+    assert.equal(existsSync(journalRoot(runDir)), false);
+    // A fresh withJournal can now run.
+    withJournal(runDir, () => {});
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("discardJournal: refuses to clear an orphaned tx.lock with a different txnId", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    mkdirSync(journalRoot(runDir), { recursive: true });
+    writeFileSync(
+      join(journalRoot(runDir), "tx.lock"),
+      JSON.stringify({ txn_id: "real-txn-001", pid: 42 }),
+    );
+    const result = discardJournal(runDir, "wrong-txn-id");
+    assert.equal(result.discarded, false);
+    assert.equal(result.reason, "lock_txn_id_mismatch");
+    assert.equal(result.active_lock_txn_id, "real-txn-001");
+    // Lock still on disk.
+    assert.equal(existsSync(join(journalRoot(runDir), "tx.lock")), true);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
 test("discardJournal: removes the tx.lock so the next withJournal succeeds", () => {
   const store = tmpStore();
   try {

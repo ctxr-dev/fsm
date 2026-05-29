@@ -572,7 +572,36 @@ export function journalState(runDir) {
   const entries = readdirSync(root, { withFileTypes: true })
     .filter((dirent) => dirent.isDirectory())
     .map((dirent) => dirent.name);
-  if (entries.length === 0) return { hasJournal: false };
+  // Orphaned-lock case: withJournal acquires tx.lock BEFORE creating
+  // its txn directory. If it crashes in that small window, the lock
+  // is left behind with no txn dir. Without surfacing it, withJournal
+  // would refuse with EEXIST forever AND `fsm-resume --journal
+  // discard` would report `not_found`, permanently blocking the run.
+  // Treat the orphaned lock as an "active journal" with
+  // status:"lock_only" so the recovery CLI can see it and discard
+  // can clear it.
+  const lockPath = join(root, "tx.lock");
+  if (entries.length === 0) {
+    if (!existsSync(lockPath)) return { hasJournal: false };
+    let activeLock = null;
+    try {
+      activeLock = JSON.parse(readFileSync(lockPath, "utf8"));
+    } catch {
+      // Lock file unreadable; still surface as lock-only so the
+      // recovery path can clear it.
+    }
+    return {
+      hasJournal: true,
+      lock_only: true,
+      txnId: activeLock?.txn_id ?? null,
+      txnDir: null,
+      status: "lock_only",
+      staged: [],
+      active_lock: activeLock,
+      runDir,
+      all: [],
+    };
+  }
   // Most recent by name (txnId is timestamp-prefixed) is the active one.
   const txnIds = entries.sort();
   const all = txnIds.map((id) => {
@@ -581,6 +610,14 @@ export function journalState(runDir) {
     return { txnId: id, txnDir, manifest };
   });
   const active = all[all.length - 1];
+  let activeLock = null;
+  if (existsSync(lockPath)) {
+    try {
+      activeLock = JSON.parse(readFileSync(lockPath, "utf8"));
+    } catch {
+      // ignore
+    }
+  }
   return {
     hasJournal: true,
     txnId: active.txnId,
@@ -588,6 +625,7 @@ export function journalState(runDir) {
     status: active.manifest ? active.manifest.status : "unknown",
     staged: active.manifest ? active.manifest.staged_files || [] : [],
     runDir: active.manifest ? active.manifest.run_dir : runDir,
+    active_lock: activeLock,
     all,
   };
 }
@@ -607,15 +645,47 @@ export function discardJournal(runDir, txnId) {
     assertWithin(root, runDir, "discardJournal");
   }
   const txnDir = join(root, txnId);
-  if (!existsSync(txnDir)) {
-    return { discarded: false, reason: "not_found" };
+  const lockPath = join(root, "tx.lock");
+  const txnDirExists = existsSync(txnDir);
+  // Orphaned-lock case: withJournal acquires tx.lock BEFORE creating
+  // the txn dir. A crash in that small window leaves tx.lock with no
+  // matching txn dir. Allow discard to clear the orphaned lock when
+  // its recorded txn_id matches the one the caller passed (so a
+  // typo can't accidentally clear someone else's lock).
+  if (!txnDirExists) {
+    if (!existsSync(lockPath)) {
+      return { discarded: false, reason: "not_found" };
+    }
+    let activeLock = null;
+    try {
+      activeLock = JSON.parse(readFileSync(lockPath, "utf8"));
+    } catch {
+      // Unreadable lock file: still safe to clear since the only
+      // recovery option for an unreadable lock IS to remove it.
+    }
+    if (activeLock && activeLock.txn_id && activeLock.txn_id !== txnId) {
+      return {
+        discarded: false,
+        reason: "lock_txn_id_mismatch",
+        active_lock_txn_id: activeLock.txn_id,
+      };
+    }
+    rmSync(lockPath, { force: true });
+    if (existsSync(root) && readdirSync(root).length === 0) {
+      try {
+        rmdirSync(root);
+      } catch {
+        // Race on cleanup is harmless.
+      }
+    }
+    return { discarded: true, txnId, lock_only: true };
   }
   rmSync(txnDir, { recursive: true, force: true });
   // Recovery also clears the single-writer lock that withJournal
   // would have left in place if the crash happened mid-transaction;
   // without this the next fsm-commit would refuse with JOURNAL_PRESENT
   // forever.
-  rmSync(join(root, "tx.lock"), { force: true });
+  rmSync(lockPath, { force: true });
   // Clean up empty journal root (root is the containment-checked
   // journalRoot computed at the top of this function).
   if (existsSync(root) && readdirSync(root).length === 0) {

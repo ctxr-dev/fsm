@@ -224,7 +224,10 @@ function doJournalRecovery(storageRoot) {
       txn_id: jstate.txnId,
       status: jstate.status,
       hint:
-        "journal status must be ready_to_finalise to replay; a pending journal means the producing fn never returned. Use --journal discard.",
+        "journal status must be ready_to_finalise to replay. " +
+        "`pending` means the producing fn never returned; " +
+        "`lock_only` means a crash left only the single-writer lock " +
+        "(no staged work to replay). In both cases use --journal discard.",
     });
     process.exit(1);
   }
