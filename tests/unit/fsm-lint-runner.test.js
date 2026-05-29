@@ -115,6 +115,52 @@ test("readFileSync(\".fsm.yaml\") fires no-direct-fsm-yaml-read and exits 1", ()
   }
 });
 
+test("Anthropic SDK call fires no-orchestrator-llm-call and exits 1", () => {
+  const dir = tmpDir();
+  try {
+    const RUNNER = [
+      "#!/usr/bin/env node",
+      "// Bad: makes a direct LLM call instead of dispatching a worker.",
+      "import Anthropic from \"@anthropic-ai/sdk\";",
+      "const client = new Anthropic();",
+      "const r = await client.messages.create({ model: \"x\", messages: [] });",
+      "console.log(r.content);",
+      "",
+    ].join("\n");
+    write(dir, "bad-llm-call.mjs", RUNNER);
+    const r = runCli(["bad-llm-call.mjs"], { cwd: dir });
+    assert.equal(r.status, 1, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /bad-llm-call\.mjs:\d+: no-orchestrator-llm-call: /,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("harness Agent( dispatch fires no-orchestrator-llm-call and exits 1", () => {
+  const dir = tmpDir();
+  try {
+    const RUNNER = [
+      "#!/usr/bin/env node",
+      "// Bad: invokes harness Agent dispatch at orchestrator level.",
+      "const out = Agent({ description: \"x\", prompt: \"y\" });",
+      "console.log(out);",
+      "",
+    ].join("\n");
+    write(dir, "bad-agent-call.mjs", RUNNER);
+    const r = runCli(["bad-agent-call.mjs"], { cwd: dir });
+    assert.equal(r.status, 1, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /bad-agent-call\.mjs:\d+: no-orchestrator-llm-call: /,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("inline multi-line prompt with role+schema markers fires no-inline-prompt-composition and exits 1", () => {
   const dir = tmpDir();
   try {

@@ -65,7 +65,7 @@
 //     prompt that omits all markers will evade it. Authors who want
 //     to suppress a known-false positive use `// fsm-lint:ignore`.
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -322,17 +322,29 @@ export function formatDiagnostic(d) {
 export function lintPaths(paths) {
   const allDiagnostics = [];
   const missing = [];
+  const unreadable = [];
   for (const rawPath of paths) {
     const abs = resolve(process.cwd(), rawPath);
     if (!existsSync(abs)) {
       missing.push(rawPath);
       continue;
     }
-    const source = readFileSync(abs, "utf8");
+    let source;
+    try {
+      source = readFileSync(abs, "utf8");
+    } catch (err) {
+      // `existsSync` only checks `stat`; a directory, an unreadable
+      // file (EISDIR / EPERM / etc.) or a broken symlink will still
+      // throw here. Surface it as a structured "unreadable" entry
+      // rather than crashing the CLI with a stack trace; the lint
+      // pass is advisory and should continue scanning siblings.
+      unreadable.push({ path: rawPath, error: err.code ?? err.message });
+      continue;
+    }
     const diags = lintFile(rawPath, source);
     allDiagnostics.push(...diags);
   }
-  return { diagnostics: allDiagnostics, missing };
+  return { diagnostics: allDiagnostics, missing, unreadable };
 }
 
 function isDirectInvocation() {
@@ -345,7 +357,18 @@ function isDirectInvocation() {
     // gives a leading-slash POSIX-style string that does not match
     // `resolve(process.argv[1])`. Decode first; compare second.
     const self = fileURLToPath(import.meta.url);
-    return entry === self;
+    if (entry === self) return true;
+    // npm installs a bin entry by symlinking node_modules/.bin/<name> to
+    // the actual script. When the CLI is launched via the symlink,
+    // process.argv[1] is the symlink path while import.meta.url is the
+    // resolved script path, so a literal string compare misses. Resolve
+    // both sides through realpath to handle this case (silently fall
+    // back to the literal compare if realpath fails for either side).
+    let entryReal = entry;
+    let selfReal = self;
+    try { entryReal = realpathSync(entry); } catch { /* keep literal */ }
+    try { selfReal = realpathSync(self); } catch { /* keep literal */ }
+    return entryReal === selfReal;
   } catch {
     return false;
   }
@@ -365,16 +388,22 @@ if (isDirectInvocation()) {
     process.exit(2);
   }
 
-  const { diagnostics, missing } = lintPaths(args);
+  const { diagnostics, missing, unreadable } = lintPaths(args);
 
   for (const m of missing) {
     process.stderr.write(`fsm-lint-runner: file not found: ${m}\n`);
+  }
+  for (const u of unreadable) {
+    process.stderr.write(
+      `fsm-lint-runner: unreadable: ${u.path} (${u.error})\n`,
+    );
   }
 
   for (const d of diagnostics) {
     process.stdout.write(`${formatDiagnostic(d)}\n`);
   }
 
-  const failed = diagnostics.length > 0 || missing.length > 0;
+  const failed =
+    diagnostics.length > 0 || missing.length > 0 || unreadable.length > 0;
   process.exit(failed ? 1 : 0);
 }
