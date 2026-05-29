@@ -32,8 +32,8 @@ fsm:
       properties: {...}
   outputs:                        # required (use [] for terminal states)
     - <name>
-  post_validations:               # optional; declarative in v0.1
-    - "<free-form check>"
+  post_validations:               # optional; evaluated at runtime via the predicate DSL
+    - "<predicate expression>"
   transitions:                    # required (use [] for terminal states)
     - to: <state-id>
       when: <when-clause>
@@ -142,7 +142,7 @@ A missing identifier resolves to `undefined`. Comparisons with `undefined` follo
 | Category | Tokens |
 |----------|--------|
 | Comparison | `==`, `!=`, `<`, `>`, `<=`, `>=` |
-| Logical | `AND`, `OR`, `NOT` (case-insensitive); aliases `&&`, double-pipe, `!` |
+| Logical | `AND`, `OR`, `NOT` (case-insensitive); aliases `&&`, `&#124;&#124;`, `!` |
 | Grouping | `(`, `)` |
 
 Operator precedence (highest to lowest): grouping, function-call, `NOT`, comparison, `AND`, `OR`.
@@ -169,6 +169,48 @@ expression: "diff_stats.lines_changed > 100 OR diff_stats.files_changed > 5"
 ## Inline states (no worker)
 
 States without a `worker:` block are computed by the orchestrator deterministically — typically aggregations, simple branching, or filesystem side effects. Their `outputs[]` are still declared so downstream states' inputs can reference them. The orchestrator passes outputs to `fsm-commit --outputs`; the package validates nothing schema-side (no `response_schema` to check) but still writes the exit trace and evaluates transitions.
+
+## Post-validations (runtime predicates)
+
+The optional `post_validations:` array runs after JSON-Schema validation of the worker output (or after `fsm-commit --outputs` for inline states) and before transition resolution. Each entry is a predicate expression in the same DSL that powers deterministic `when:` clauses (see "Predicate DSL" above). The predicates are evaluated against the just-committed outputs map, so the field names refer directly to keys of `outputs`.
+
+Multiple predicates are AND-composed: the state is considered valid only when every predicate evaluates true. If any predicate evaluates false, or fails to parse / evaluate, `fsm-commit`:
+
+1. Writes a `fault` trace with `reason: "post_validation_failed"` and details of every predicate result.
+2. Sets `manifest.status = "faulted"` and stamps `ended_at`.
+3. Releases the run's lock.
+4. Emits a structured error on stdout (`{ error: "post_validation_failed", state, post_validations: [...] }`) and exits with code `1`.
+
+The state does NOT advance; no transition is resolved when post-validations fail.
+
+A malformed expression captures the parser/runtime error in the corresponding `results[].error` field and counts as a failed validation.
+
+### Available operators
+
+The post-validation DSL is the same as the transition DSL, summarised here for convenience:
+
+| Category | Tokens |
+|----------|--------|
+| Literals | numbers, `'...'` / `"..."` strings, `true`, `false`, `null` |
+| Identifiers | dotted paths into `outputs` (e.g. `findings`, `summary.total`) |
+| Comparison | `==`, `!=`, `<`, `>`, `<=`, `>=` |
+| Logical | `AND`, `OR`, `NOT` (case-insensitive); aliases `&&`, `&#124;&#124;`, `!` |
+| Grouping | `(`, `)` |
+| Functions | `len(x)`, `empty(x)`, `in(x, list)` |
+| Literals (extras) | `always` evaluates `true` (matches the transition DSL); useful for documenting an intentionally always-pass check during development |
+
+### Examples
+
+```yaml
+post_validations:
+  - "len(findings) > 0"
+  - "verdict == 'PASS' OR verdict == 'CONDITIONAL'"
+  - "NOT empty(summary)"
+```
+
+### Limitations
+
+Predicates can express comparisons, membership, length, and boolean combinations over scalar/array fields of `outputs`. They cannot express structural JSON-Schema-grade checks beyond what the worker's `response_schema` already validates. Use the worker `response_schema` for structural shape; use `post_validations` for runtime business-rule checks (non-empty result set, expected verdict values, cross-field invariants).
 
 ## Validation
 

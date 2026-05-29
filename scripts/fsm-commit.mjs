@@ -221,7 +221,38 @@ if (state.loop) {
   };
 }
 
-const postValidations = runPostValidations(state);
+// Post-validations run against the freshly-committed outputs. For a
+// terminating loop state, outputsForFlow is the aggregated record (the
+// canonical post-loop output), so predicates that need to inspect the
+// aggregate (`total_iterations`, etc.) see them; for a non-loop state
+// outputsForFlow === parsed.outputs.
+const postValidations = runPostValidations(state, outputsForFlow);
+if (!postValidations.valid) {
+  writeFaultTrace(
+    parsed.runId,
+    {
+      state,
+      reason: "post_validation_failed",
+      details: { post_validations: postValidations.results },
+    },
+    { storageRoot: settings.storageRoot },
+  );
+  updateManifest(
+    parsed.runId,
+    { status: "faulted", ended_at: new Date().toISOString() },
+    { storageRoot: settings.storageRoot },
+  );
+  releaseLock(parsed.runId, {
+    sessionId: settings.sessionId,
+    storageRoot: settings.storageRoot,
+  });
+  emit({
+    error: "post_validation_failed",
+    state: state.id,
+    post_validations: postValidations.results,
+  });
+  process.exit(1);
+}
 
 const env = runEnv(parsed.runId, { storageRoot: settings.storageRoot });
 const envWithCommit = { ...env, ...outputsForFlow };

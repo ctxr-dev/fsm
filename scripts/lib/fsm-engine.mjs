@@ -354,16 +354,55 @@ export function resolveTransition(state, env, { judgementPick } = {}) {
   return { transition: firstMatch, evaluations };
 }
 
-// runPostValidations is a stub for v0.1 — the post_validations array is
-// declarative documentation today. v0.2 can wire predicate evaluation
-// here. Returns { valid, results[] } for trace recording.
-export function runPostValidations(state) {
-  const results = (state.post_validations ?? []).map((check) => ({
-    check,
-    result: "skipped",
-    note: "post_validations are declarative in v0.1; runtime evaluation deferred",
-  }));
-  return { valid: true, results };
+// runPostValidations evaluates each post_validations[] entry as a
+// predicate-DSL expression (see fsm-predicates.mjs) against the just-
+// committed outputs map. Multiple predicates are AND-composed: the overall
+// result is valid only if every entry evaluates true.
+//
+// Returns { valid, results[] } where each result is
+//   { check, result: true|false, expression, error? }.
+//
+// A malformed expression yields result=false with `error` carrying the
+// evaluator's message; overall valid is false in that case.
+//
+// `outputs` is the map of fields the worker just emitted (or the inline
+// state's computed outputs). Predicates reference those fields by name
+// (e.g. `len(findings) > 0`, `verdict == 'PASS'`).
+export function runPostValidations(state, outputs = {}) {
+  const env = outputs && typeof outputs === "object" ? outputs : {};
+  const checks = state.post_validations ?? [];
+  const results = [];
+  let valid = true;
+  for (const check of checks) {
+    // Schema validation only enforces that post_validations is an
+    // array; individual elements may slip through as non-strings if the
+    // YAML author makes a typo. Surface that as a typed evaluation
+    // failure rather than crashing evaluatePredicate, so the trace +
+    // CLI payload always carry the documented { check, expression,
+    // result, error } shape with string fields.
+    if (typeof check !== "string") {
+      results.push({
+        check: String(check),
+        expression: String(check),
+        result: false,
+        error: `post_validations entry must be a string, got ${typeof check}`,
+      });
+      valid = false;
+      continue;
+    }
+    const entry = { check, expression: check };
+    try {
+      const passed = Boolean(evaluatePredicate(check, env));
+      entry.result = passed;
+      if (!passed) valid = false;
+    } catch (err) {
+      entry.result = false;
+      entry.error = err.message;
+      valid = false;
+    }
+    results.push(entry);
+  }
+  return { valid, results };
 }
 
 // validateOutputs runs the worker.response_schema (if any) over the
