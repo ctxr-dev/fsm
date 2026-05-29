@@ -193,14 +193,19 @@ export function lintFile(filePath, source) {
     `\\b(?:${readApiAlternation})\\s*\\([^)\\n]*?(['"\`])[^'"\`\\n]*\\.fsm\\.yaml[^'"\`\\n]*\\1`,
   );
 
-  // Pre-compute the set of line numbers that fall inside a multi-line
-  // template literal so the per-line rules can skip them (those bodies
-  // are owned by no-inline-prompt-composition, and the YAML-read /
-  // LLM-call regexes should not fire on prompt-fixture prose).
+  // Pre-compute the set of line numbers that fall STRICTLY INSIDE a
+  // multi-line template literal so the per-line rules can skip them
+  // (those bodies are owned by no-inline-prompt-composition, and the
+  // YAML-read / LLM-call regexes should not fire on prompt-fixture
+  // prose). The start and end lines are intentionally NOT included:
+  // executable code can legitimately share a line with the opening
+  // backtick (`foo(` ... `)`) or follow the closing backtick on the
+  // same line (`` `...`; readFileSync("x.fsm.yaml") ``), and the
+  // per-line rules must still catch violations there.
   const templateLineSet = new Set();
   for (const tmpl of collectTemplateLiterals(source)) {
-    if (tmpl.endLine > tmpl.startLine) {
-      for (let n = tmpl.startLine; n <= tmpl.endLine; n++) {
+    if (tmpl.endLine > tmpl.startLine + 1) {
+      for (let n = tmpl.startLine + 1; n < tmpl.endLine; n++) {
         templateLineSet.add(n);
       }
     }
@@ -424,11 +429,14 @@ export function lintPaths(paths) {
     try {
       source = readFileSync(abs, "utf8");
     } catch (err) {
-      // `existsSync` only checks `stat`; a directory, an unreadable
-      // file (EISDIR / EPERM / etc.) or a broken symlink will still
-      // throw here. Surface it as a structured "unreadable" entry
-      // rather than crashing the CLI with a stack trace; the lint
-      // pass is advisory and should continue scanning siblings.
+      // `existsSync` uses an access check, so a broken symlink is
+      // usually already reported as "file not found" above and
+      // never reaches this catch. What can still throw here is a
+      // path that exists but is unreadable (a directory -> EISDIR,
+      // restrictive permissions -> EPERM/EACCES, or a transient
+      // filesystem error). Surface it as a structured "unreadable"
+      // entry rather than crashing the CLI with a stack trace; the
+      // lint pass is advisory and should continue scanning siblings.
       unreadable.push({ path: rawPath, error: err.code ?? err.message });
       continue;
     }
@@ -471,6 +479,20 @@ if (isDirectInvocation()) {
   // immediately after the last write. process.exit() can truncate a
   // multi-KB diagnostics dump on piped stdio (same failure mode that
   // motivated scripts/lib/emit.mjs in this repo).
+  //
+  // Also swallow EPIPE on both streams: when the linter is piped to a
+  // consumer that closes early (e.g. `fsm-lint-runner ... | head`)
+  // Node would otherwise crash with `Error: write EPIPE`. The
+  // diagnostics are advisory; a downstream reader closing the pipe
+  // mid-stream is a graceful exit, not a failure.
+  process.stdout.on("error", (err) => {
+    if (err.code === "EPIPE") process.exit(0);
+    throw err;
+  });
+  process.stderr.on("error", (err) => {
+    if (err.code === "EPIPE") process.exit(0);
+    throw err;
+  });
   const args = process.argv.slice(2);
   if (args.includes("--help") || args.includes("-h")) {
     process.stdout.write(USAGE);
