@@ -248,7 +248,13 @@ export function runLoopDecision(state, outputs, iterationN) {
   if (!loop) return { isLoop: false };
   const max = loop.max_iterations ?? 30;
   const doneField = loop.done_field;
-  const done = Boolean(outputs?.[doneField]);
+  // The schema requires the done field to be `boolean`; matching only
+  // the literal `true` here keeps the termination contract honest
+  // when a permissive worker schema or a caller that bypasses
+  // validation lets a non-boolean truthy value (e.g. `"false"`, `1`,
+  // `"yes"`) reach the engine. Anything other than literal `true` is
+  // treated as "continue".
+  const done = outputs?.[doneField] === true;
   if (done) {
     return { isLoop: true, terminate: true, reason: "done_field", iteration_n: iterationN };
   }
