@@ -1,0 +1,71 @@
+[project]
+name = "ctxr-fsm"
+version = "0.1.0a1"
+description = "SQLite-backed Python FSM substrate for deterministic LLM-orchestrated workflows."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.12"
+keywords = ["fsm", "state-machine", "orchestration", "agentic", "workflow", "llm", "claude", "mcp", "sqlite"]
+authors = [{ name = "ctxr-dev" }]
+dependencies = [
+  "pydantic>=2.7",
+  "uuid-utils>=0.9",
+  "typer>=0.12",
+  "anyio>=4.4",
+  "watchfiles>=0.22",
+  "jsonschema>=4.23",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+api = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "sse-starlette>=2.1", "httpx>=0.27"]
+sqlite = ["sqlalchemy>=2.0", "sqlmodel>=0.0.21", "alembic>=1.13"]
+all  = ["ctxr-fsm[mcp,api,sqlite]"]
+
+[project.scripts]
+ctxr-fsm = "ctxr.fsm.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/ctxr-dev/fsm"
+Issues = "https://github.com/ctxr-dev/fsm/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ctxr"]
+
+[tool.hatch.build]
+include = ["ctxr/**/*.py", "ctxr/**/*.md", "README.md", "LICENSE"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.6",
+  "mypy>=1.11",
+  "hypothesis>=6.112",
+  "types-jsonschema>=4.23",
+]
+
+[tool.uv]
+managed = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+packages = ["ctxr.fsm"]
+explicit_package_bases = true
+
+[tool.pytest.ini_options]
+addopts = "-ra -q --strict-markers"
+testpaths = ["tests"]
