@@ -64,21 +64,38 @@ export function stateById(doc, id) {
 // runEnv reads all exit trace records for a run and produces the cumulative
 // environment of outputs collected so far. Pulls args from the entry trace
 // of the entry state if present.
+//
+// readTrace returns records sorted by filename TEXT, which goes wrong once
+// the sequence counter reaches 5 digits ("0009999-..." sorts AFTER
+// "00010000-..."), so two exit records producing the same output key can
+// land in the env in the wrong order on cyclic / resumed runs. Re-sort by
+// the numeric `data.sequence` (falling back to the record's `sequence`
+// field) so the LAST write wins by chronological order, matching the run's
+// actual progression. Args use the FIRST entry trace chronologically, so
+// they get the same sort and pick `.find()`.
 export function runEnv(runId, opts = {}) {
   const trace = readTrace(runId, opts);
+  const seqOf = (r) => {
+    const fromData = r?.data?.sequence;
+    if (Number.isFinite(fromData)) return fromData;
+    const fromRecord = r?.sequence;
+    if (Number.isFinite(fromRecord)) return fromRecord;
+    return -Infinity;
+  };
+  const ordered = [...trace].sort((a, b) => seqOf(a) - seqOf(b));
   const env = {};
-  for (const record of trace) {
+  for (const record of ordered) {
     if (record.data?.phase !== "exit") continue;
     const outputs = record.data?.outputs;
     if (outputs && typeof outputs === "object") {
       Object.assign(env, outputs);
     }
   }
-  for (const record of trace) {
-    if (record.data?.phase === "entry" && record.data?.inputs?.args) {
-      env.args = record.data.inputs.args;
-      break;
-    }
+  const firstEntry = ordered.find(
+    (r) => r.data?.phase === "entry" && r.data?.inputs?.args,
+  );
+  if (firstEntry) {
+    env.args = firstEntry.data.inputs.args;
   }
   return env;
 }
