@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    name: Build, Lint, Validate & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      # Run each check script that exists in package.json.
+      # Add `lint`, `validate`, and/or `test` scripts and they will be
+      # exercised automatically. No workflow edits required.
+      - name: Run checks
+        run: |
+          FAILED=0
+          for check in lint validate test; do
+            if node -e "process.exit((require('./package.json').scripts||{})['$check']?0:1)" 2>/dev/null; then
+              echo "::group::npm run $check"
+              if ! npm run "$check"; then
+                FAILED=1
+              fi
+              echo "::endgroup::"
+            else
+              echo "skipping $check (not declared in package.json)"
+            fi
+          done
+          exit $FAILED
+
+      # Statically validate any example FSM YAMLs shipped with the
+      # repo. The fsm package itself is the validator, so we point
+      # `fsm-validate-static` at every `*.fsm.yaml` under `examples/`
+      # (if the folder exists). Zero matches is a clean no-op.
+      - name: Validate example FSM YAMLs
+        run: |
+          if [ ! -d examples ]; then
+            echo "no examples/ folder; skipping fsm-validate-static"
+            exit 0
+          fi
+          MATCHES=$(find examples -type f -name '*.fsm.yaml' 2>/dev/null || true)
+          if [ -z "$MATCHES" ]; then
+            echo "no *.fsm.yaml under examples/; skipping fsm-validate-static"
+            exit 0
+          fi
+          FAILED=0
+          while IFS= read -r f; do
+            echo "::group::fsm-validate-static $f"
+            if ! node scripts/fsm-validate-static.mjs "$f"; then
+              FAILED=1
+            fi
+            echo "::endgroup::"
+          done <<< "$MATCHES"
+          exit $FAILED
