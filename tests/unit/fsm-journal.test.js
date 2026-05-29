@@ -418,6 +418,26 @@ test("withJournal: rejects fn returning a manual Promise", () => {
   }
 });
 
+test("transaction.addStaged: rejects a stagedPath that diverges from canonical", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    assert.throws(
+      () =>
+        withJournal(runDir, (txn) => {
+          // Pass an arbitrary stagedPath that does NOT equal
+          // join(txnDir, relPath). The canonical-equality check
+          // refuses; a malicious helper cannot register a path the
+          // rename loop would later move into runDir.
+          txn.addStaged("manifest.json", "/tmp/somewhere-else.json");
+        }),
+      /must equal canonical/,
+    );
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
 // ─── appendTraceFile in-transaction return shape ────────────────────────
 
 test("appendTraceFile (transaction): returned path points at the staged file, final_path at its destination", () => {

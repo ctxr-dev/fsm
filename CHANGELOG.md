@@ -29,10 +29,11 @@ project follows [SemVer](https://semver.org/).
   optional `transaction` option that routes writes through the journal
   staging area.
 - Test injection hook: `FSM_TEST_PAUSE_BEFORE_FINALISE=<ms>` env var
-  inserts a synchronous busy-wait between the "ready_to_finalise"
-  journal write and the rename loop. Integration tests
-  (`tests/integration/atomic-tx.test.js`) SIGKILL the child during the
-  pause to assert journal recovery semantics.
+  inserts a synchronous sleep (implemented via `Atomics.wait` on a
+  private `SharedArrayBuffer`, so no CPU is burned) between the
+  "ready_to_finalise" journal write and the rename loop. Integration
+  tests (`tests/integration/atomic-tx.test.js`) SIGKILL the child
+  during the pause window to assert journal recovery semantics.
 
 ### Changed
 

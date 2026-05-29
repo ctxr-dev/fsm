@@ -671,18 +671,34 @@ export function withJournal(runDir, fn) {
     staged: stagedFiles,
     stage(relPath) {
       // stage() is the public surface for staging a write inside a
-      // transaction. Reject any relPath that could escape the txn dir
-      // here, so callers (including third-party storage helpers) cannot
-      // accidentally write outside <txnDir> by passing an absolute path
-      // or a ".."-bearing string.
+      // transaction. String-side relPath validation rejects "..",
+      // absolute paths, etc. Realpath containment then catches the
+      // symlink-escape class: if a subdir under `txnDir` (or `.journal`
+      // itself) was swapped for a symlink, the directory we are about
+      // to mkdirSync into and write into could resolve outside the
+      // journal root. Refuse to return a path whose resolved real
+      // dirname is not inside txnDir.
       assertSafeJournalRelPath(relPath, "transaction.stage");
       const stagedPath = join(txnDir, relPath);
       mkdirSync(dirname(stagedPath), { recursive: true });
+      assertWithin(dirname(stagedPath), txnDir, "transaction.stage");
       return stagedPath;
     },
     addStaged(relPath, stagedPath) {
+      // The canonical contract: stagedPath MUST equal
+      // join(txnDir, relPath). Accepting an arbitrary stagedPath would
+      // let a caller (or a compromised helper) register an arbitrary
+      // filesystem path that the finalisation rename loop then moves
+      // into runDir. Enforce equality so the only path the rename loop
+      // ever sees is the canonical staged path under txnDir.
       assertSafeJournalRelPath(relPath, "transaction.addStaged");
-      stagedFiles.push({ relPath, stagedPath });
+      const canonical = join(txnDir, relPath);
+      if (stagedPath !== canonical) {
+        throw new Error(
+          `transaction.addStaged: stagedPath "${stagedPath}" must equal canonical "${canonical}" (use the value returned by stage(relPath))`,
+        );
+      }
+      stagedFiles.push({ relPath, stagedPath: canonical });
     },
     stagedTraceCount() {
       return stagedFiles.filter((s) => s.relPath.startsWith("fsm-trace/"))
@@ -766,12 +782,17 @@ export function withJournal(runDir, fn) {
   for (const entry of stagedFiles) {
     const finalPath = join(runDir, entry.relPath);
     mkdirSync(dirname(finalPath), { recursive: true });
-    // Symlink-escape guard: if a subdir under runDir was replaced by a
-    // symlink between fn() returning and the rename loop (or by a
-    // malicious actor with write access), renameSync could write
-    // outside the run directory. Verify the resolved real path of
-    // dirname(finalPath) stays within realpathSync(runDir) before
-    // moving the staged file into place.
+    // Symlink-escape guards on BOTH sides of the rename:
+    //   1. SOURCE: txnDir or one of its subdirs could be swapped to a
+    //      symlink between staging and finalisation. Verify the
+    //      resolved real path of dirname(entry.stagedPath) stays
+    //      inside realpathSync(txnDir).
+    //   2. DEST: a subdir under runDir could be swapped to a symlink
+    //      by an external actor with write access. Verify the
+    //      resolved real path of dirname(finalPath) stays inside
+    //      realpathSync(runDir).
+    // Either failure throws; the journal stays on disk for inspection.
+    assertWithin(dirname(entry.stagedPath), txnDir, "withJournal (stagedPath)");
     assertWithin(dirname(finalPath), runDir, "withJournal (finalPath)");
     renameSync(entry.stagedPath, finalPath);
   }
