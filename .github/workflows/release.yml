@@ -1,0 +1,95 @@
+name: Release notes
+
+# Generate release notes for the current package.json version.
+# `workflow_dispatch`-only by design (Principle 2: manual publish,
+# sibling linking during dev). No publish step; this workflow only
+# composes notes and creates / updates a GitHub Release for the
+# current `v<version>` tag.
+#
+# Typical sequence:
+#   1. Operator dispatches `publish.yml` (bumps version, publishes
+#      to npm if not dry_run, pushes tag).
+#   2. Operator dispatches this workflow to draft / publish release
+#      notes for the new tag.
+#
+# This workflow does NOT bump the version, does NOT push to main,
+# and does NOT publish to npm. It only reads the current version
+# from `package.json` and operates on the matching `v<version>` tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      draft:
+        description: "Create as draft (true) or publish immediately (false)"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-notes
+  cancel-in-progress: false
+
+jobs:
+  notes:
+    name: Generate release notes for current package version
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Read current package.json version
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag exists
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          if ! git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} does not exist locally. Dispatch publish.yml first (with dry_run=false) or push the tag manually."
+            exit 1
+          fi
+
+      - name: Generate or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          DRAFT_FLAG=""
+          if [ "${{ inputs.draft }}" = "true" ]; then
+            DRAFT_FLAG="--draft"
+          fi
+
+          # If a release already exists for this tag, regenerate
+          # notes in-place. Otherwise create a new release with
+          # auto-generated notes from commits since the previous
+          # tag (gh's --generate-notes).
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} exists; regenerating notes."
+            gh release edit "${TAG}" \
+              --notes-start-tag "$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")" \
+              --verify-tag
+            gh release view "${TAG}"
+          else
+            echo "Creating release ${TAG} ${DRAFT_FLAG:-(published)}."
+            gh release create "${TAG}" \
+              --title "${TAG}" \
+              --generate-notes \
+              --verify-tag \
+              ${DRAFT_FLAG}
+          fi
