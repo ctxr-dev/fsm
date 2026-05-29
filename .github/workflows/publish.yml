@@ -128,8 +128,22 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Publish to npm
+      - name: Skip publish if version already on npm (re-run recovery)
+        id: already_published
         if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          PKG="$(node -p "require('./package.json').name")"
+          AFTER="${{ steps.bump.outputs.after }}"
+          if npm view "${PKG}@${AFTER}" version >/dev/null 2>&1; then
+            echo "::notice::${PKG}@${AFTER} is already on npm; skipping publish step (re-run recovery)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npm
+        if: ${{ !inputs.dry_run && steps.already_published.outputs.skip != 'true' }}
         run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
