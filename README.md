@@ -124,6 +124,8 @@ gh workflow run publish.yml --ref main -f version_bump=patch -f dry_run=true
 
 After `dry_run=false` succeeds, optionally dispatch `release.yml` to draft or publish GitHub release notes for the new tag.
 
+> **Operator setup.** `publish.yml` (both the `dry_run` step and the real publish) reads `NODE_AUTH_TOKEN` from the `NPM_TOKEN` repo secret. Configure the secret once under **Settings -> Secrets and variables -> Actions -> Repository secrets** before the first dispatch, otherwise the workflow will fail at `npm publish`.
+
 ## License
 
 MIT.

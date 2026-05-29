@@ -8,7 +8,7 @@ on:
 
 jobs:
   check:
-    name: Build, Lint, Validate & Test
+    name: Lint, Validate, Test
     runs-on: ubuntu-latest
 
     steps:

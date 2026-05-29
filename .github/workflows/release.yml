@@ -38,9 +38,23 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Refuse non-main dispatches
+        # release.yml reads package.json from whatever ref it was
+        # dispatched against and then mutates the GitHub Release for the
+        # corresponding v<version> tag. Dispatching against a branch
+        # that happens to share the version string would silently
+        # overwrite the wrong release's notes; lock the workflow to
+        # main, matching the same guard publish.yml carries.
+        if: ${{ github.ref != 'refs/heads/main' }}
+        run: |
+          echo "::error::release.yml only supports dispatching against refs/heads/main; got ${{ github.ref }}."
+          echo "::error::Re-dispatch with ref=main, or update the workflow if you intend to release from a different branch."
+          exit 1
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: main
 
       - uses: actions/setup-node@v4
         with:
