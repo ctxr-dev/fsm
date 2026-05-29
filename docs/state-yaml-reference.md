@@ -142,7 +142,7 @@ A missing identifier resolves to `undefined`. Comparisons with `undefined` follo
 | Category | Tokens |
 |----------|--------|
 | Comparison | `==`, `!=`, `<`, `>`, `<=`, `>=` |
-| Logical | `AND`, `OR`, `NOT` (case-insensitive); aliases `&&`, double-pipe, `!` |
+| Logical | `AND`, `OR`, `NOT` (case-insensitive); aliases `&&`, `||`, `!` |
 | Grouping | `(`, `)` |
 
 Operator precedence (highest to lowest): grouping, function-call, `NOT`, comparison, `AND`, `OR`.
@@ -194,7 +194,7 @@ The post-validation DSL is the same as the transition DSL, summarised here for c
 | Literals | numbers, `'...'` / `"..."` strings, `true`, `false`, `null` |
 | Identifiers | dotted paths into `outputs` (e.g. `findings`, `summary.total`) |
 | Comparison | `==`, `!=`, `<`, `>`, `<=`, `>=` |
-| Logical | `AND`, `OR`, `NOT` (case-insensitive); aliases `&&`, double-pipe, `!` |
+| Logical | `AND`, `OR`, `NOT` (case-insensitive); aliases `&&`, `||`, `!` |
 | Grouping | `(`, `)` |
 | Functions | `len(x)`, `empty(x)`, `in(x, list)` |
 
