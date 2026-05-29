@@ -127,10 +127,16 @@ if (parsed.newRun) {
   });
   const entryState = stateById(fsm.doc, fsm.doc.fsm.entry);
   const env = { args: parsed.args ?? {} };
-  const inputs = entryState.worker?.inputs?.reduce((acc, name) => {
+  // A loop state declares its worker under state.loop.worker; reading
+  // only state.worker.inputs would silently drop `args` (and any other
+  // declared input) from the entry trace, which runEnv on resume reads
+  // back as `env.args`. Fall through to loop.worker.inputs if present.
+  const entryInputsDecl =
+    entryState.worker?.inputs ?? entryState.loop?.worker?.inputs ?? [];
+  const inputs = entryInputsDecl.reduce((acc, name) => {
     acc[name] = env[name];
     return acc;
-  }, {}) ?? {};
+  }, {});
   writeEntryTrace(
     runId,
     { state: entryState, inputs },

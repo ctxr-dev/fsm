@@ -86,17 +86,22 @@ export function aggregateLoopOutputs(runDir, state, { mergeField = "findings" } 
       .sort((a, b) => a.n - b.n);
     for (const { name, n } of numbered) {
       const filePath = join(iterDir, name);
+      // Report paths relative to runDir with POSIX separators so the
+      // aggregator never leaks absolute filesystem paths (which would
+      // reveal local layout in logs) and matches the rest of the
+      // worker-contract path style.
+      const relPath = posixRel("workers", iterSubdir, name);
       let payload;
       try {
         payload = JSON.parse(readFileSync(filePath, "utf8"));
       } catch (err) {
-        validationErrors.push({ path: filePath, error: `parse_error: ${err.message}` });
+        validationErrors.push({ path: relPath, error: `parse_error: ${err.message}` });
         continue;
       }
       if (schema) {
         const result = validateWorkerResponse(schema, payload);
         if (!result.valid) {
-          validationErrors.push({ path: filePath, error: `schema: ${result.errors.join("; ")}` });
+          validationErrors.push({ path: relPath, error: `schema: ${result.errors.join("; ")}` });
           continue;
         }
       }

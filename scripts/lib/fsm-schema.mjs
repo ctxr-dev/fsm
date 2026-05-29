@@ -160,13 +160,28 @@ function validateLoop(loop, prefix, errors) {
   if (loop.iteration_outputs_dir !== undefined) {
     if (typeof loop.iteration_outputs_dir !== "string" || !loop.iteration_outputs_dir) {
       errors.push(`${prefix}.iteration_outputs_dir must be a non-empty string`);
-    } else if (
-      loop.iteration_outputs_dir.startsWith("/") ||
-      loop.iteration_outputs_dir.split("/").includes("..")
-    ) {
-      errors.push(
-        `${prefix}.iteration_outputs_dir must be a relative path under workers/ (no leading "/" and no ".." segments)`,
-      );
+    } else {
+      const raw = loop.iteration_outputs_dir;
+      // Reject backslashes outright: `path.join` treats them as
+      // separators on Windows, so `foo\..\bar` would slip past a
+      // POSIX-only split-and-check and still escape workers/.
+      if (raw.includes("\\")) {
+        errors.push(
+          `${prefix}.iteration_outputs_dir must not contain backslashes; use forward slashes`,
+        );
+      }
+      const trimmed = raw.replace(/^\/+/, "").replace(/\/+$/, "");
+      const parts = trimmed.split("/");
+      if (
+        raw.startsWith("/") ||
+        parts.includes("..") ||
+        parts.includes(".") ||
+        parts.some((p) => p === "")
+      ) {
+        errors.push(
+          `${prefix}.iteration_outputs_dir must be a relative path under workers/ (no leading "/", no "." or ".." segments, no empty segments)`,
+        );
+      }
     }
   }
   // Best-effort: done_field must appear as a property in the worker's

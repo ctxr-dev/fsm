@@ -134,6 +134,16 @@ export function sanitiseLoopOutputsDirSegment(raw, fallbackStateId) {
   const candidate = raw && typeof raw === "string" && raw.length > 0
     ? raw
     : `${fallbackStateId}-iters/`;
+  // Backslashes are a path separator on Windows where `path.join`
+  // interprets them as such; allowing them through the POSIX-split
+  // check below would let `foo\..\bar` traverse out of workers/ on a
+  // Windows host. Reject the whole value up-front so the guard is
+  // platform-portable.
+  if (candidate.includes("\\")) {
+    throw new Error(
+      `sanitiseLoopOutputsDirSegment: iteration_outputs_dir "${raw}" must not contain backslashes (use forward slashes)`,
+    );
+  }
   const trimmed = candidate.replace(/^\/+/, "").replace(/\/+$/, "");
   if (trimmed.length === 0) {
     throw new Error(

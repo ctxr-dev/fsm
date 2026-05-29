@@ -277,10 +277,16 @@ if (!transition) {
 }
 
 const nextState = stateById(fsm.doc, transition.to);
-const nextInputs = nextState.worker?.inputs?.reduce((acc, name) => {
+// Loop states declare their worker under state.loop.worker; falling back
+// here keeps the entry trace's recorded inputs consistent with what
+// buildBrief will pass to the worker dispatch (otherwise the trace shows
+// no inputs for a loop-entry state, which is misleading on inspection).
+const nextInputsDecl =
+  nextState.worker?.inputs ?? nextState.loop?.worker?.inputs ?? [];
+const nextInputs = nextInputsDecl.reduce((acc, name) => {
   acc[name] = envWithCommit[name];
   return acc;
-}, {}) ?? {};
+}, {});
 writeEntryTrace(
   parsed.runId,
   { state: nextState, inputs: nextInputs },
