@@ -1,131 +1,71 @@
-# `@ctxr/fsm`
+# fsm/
 
-Generic finite-state-machine substrate for deterministic LLM-orchestrated workflows.
+Two roots cohabiting during the JavaScript → Python migration:
 
-Consumers (skills, agents, CI workflows) declare a YAML state machine + worker prompt templates and call this package's CLIs to drive a run. The CLIs handle:
+- **`./` (this root)** — the new `ctxr-fsm` Python 3.12+ library, with SQLite as the primary persistence layer, plus shipped subsystems: `ctxr.fsm.core`, `ctxr.fsm.sqlite`, `ctxr.fsm.mcp` (MCP server), `ctxr.fsm.api` (FastAPI), `fsm-ui` (Vite + Preact + Tailwind v4 SPA at `ui/`), and runnable agent-orchestration examples under `examples/`. Imported as `ctxr.fsm` via PEP 420 namespace packages (no top-level `ctxr/__init__.py`). PyPI distribution: `ctxr-fsm`. Not yet published — `0.1.0` is in active build.
+- **`./legacy-js/`** — the existing published `@ctxr/fsm` Node.js library (251 tests, A1–A9 + A7 atomic-tx journal, 0.2.0-pre). Still publishes from there via `legacy-js/.github/workflows/publish.yml` so `skill-code-review` and every other npm consumer keeps working unchanged during the rewrite. Migrating JS consumers to the new Python system is a separate plan; until that lands, the JS root is the source of truth for shipped behaviour.
 
-- Atomic state writes (POSIX `O_EXCL` lock files with TTL; write-tmp+fsync+rename).
-- Date-sharded filesystem layout for any volume of runs (256 shards under each day).
-- JSON-Schema-validated worker outputs at every state boundary.
-- Safe deterministic-predicate DSL (no `eval`, no string interpolation).
-- Trace files capturing every transition with inputs / outputs / predicate evaluations.
-
-The package is consumer-agnostic — no project-specific paths, no hardcoded state names. Configure via `--storage-root` / `--fsm-path` flags or a `.fsmrc.json` config file at the consumer's project root.
+The full plan, including all locked decisions, sequenced workstreams (W0–W12), and verification gates, lives at `/Users/developer/.claude/plans/how-it-fits-toasty-gray.md` in the developer workspace.
 
 ## Status
 
-**v0.1 — foundations.** Stable interface for the four core CLIs. v0.2 adds lifecycle CLIs (resume, pause, abandon, pivot, stale-cleanup, validate-trace). See [`docs/orchestration-design.md`](docs/orchestration-design.md) for the full roadmap.
+| Subsystem | State | Path |
+|---|---|---|
+| `legacy-js/` Node `@ctxr/fsm` | Published, frozen feature set (bug-fix only) | `legacy-js/` |
+| `ctxr.fsm.core` (Pydantic + engine) | In build (W1) | `ctxr/fsm/core/` |
+| `ctxr.fsm.sqlite` (schema + repo) | In build (W2) | `ctxr/fsm/sqlite/` |
+| `ctxr.fsm.cli` (typer) | In build (W3) | `ctxr/fsm/cli/` |
+| `ctxr.fsm.mcp` (MCP server) | In build (W4) | `ctxr/fsm/mcp/` |
+| `ctxr.fsm.api` (FastAPI) | In build (W5) | `ctxr/fsm/api/` |
+| `fsm-ui` (Vite + Preact + Tailwind v4) | In build (W6) | `ui/` |
+| Service lifecycle (supervisor) | In build (W7) | `ctxr/fsm/cli/serve.py` |
+| Examples | In build (W8) | `examples/` |
+| Principles + memory injection | In build (W11) | `ctxr/fsm/memory/` |
+| Enforcement primitives | In build (W12) | across W1/W2/W4/W7 |
 
-## Install
-
-While the package is in early development, consumers reference it via a `file://` path to the sibling repo:
-
-```json
-{
-  "dependencies": {
-    "@ctxr/fsm": "file:../fsm"
-  }
-}
-```
-
-After publication to npm, consumers will use the standard semver form.
-
-## Quick start
-
-1. **Author an FSM YAML** at e.g. `fsm/my-orchestrator.fsm.yaml`. See [`docs/state-yaml-reference.md`](docs/state-yaml-reference.md) for the schema.
-
-2. **Author worker prompt templates** for each state with a `worker:` block. See [`docs/worker-contract.md`](docs/worker-contract.md).
-
-3. **Add a `.fsmrc.json`** at your project root. The `fsms[]` array supports any number of named FSMs (one per agent / logical pipeline):
-
-   ```json
-   {
-     "fsms": [
-       {
-         "name": "code-review",
-         "fsm_path": "fsm/code-review.fsm.yaml",
-         "storage_root": ".my-app/runs/code-review"
-       },
-       {
-         "name": "report-builder",
-         "fsm_path": "fsm/report-builder.fsm.yaml",
-         "storage_root": ".my-app/runs/reports"
-       }
-     ]
-   }
-   ```
-
-   The config file is static — only project-level setup. Runtime concerns like `session_id` are passed via CLI flags (`--session-id`) or auto-generated, never persisted in the config.
-
-4. **Validate the FSM**:
-
-   ```bash
-   npx fsm-validate-static fsm/my-orchestrator.fsm.yaml
-   ```
-
-5. **Drive a run** from your orchestrator. With one FSM in the config you can omit `--fsm`; with multiple FSMs you pass `--fsm <name>` to pick:
-
-   ```bash
-   # Start a new run (single-FSM config)
-   npx fsm-next --new-run --repo my-app --base-sha aaa --head-sha bbb --args '{"some":"input"}'
-
-   # Start a new run against a named FSM in a multi-FSM config
-   npx fsm-next --fsm code-review --new-run --repo my-app --base-sha aaa --head-sha bbb --args '{"some":"input"}'
-
-   # ...orchestrator dispatches workers, collects JSON outputs...
-
-   # Commit each state's output and advance
-   npx fsm-commit --fsm code-review --run-id <run-id> --outputs '{"x":42}'
-
-   # Inspect at any time
-   npx fsm-inspect --fsm code-review --run-id <run-id>
-   ```
-
-   You can always bypass the config by passing `--fsm-path` + `--storage-root` directly.
-
-The CLIs all return JSON to stdout. Exit codes: `0` success, `1` runtime error (lock conflict, schema violation, etc.), `2` argument error.
-
-## Documentation
-
-- [`docs/orchestration-design.md`](docs/orchestration-design.md) — design substrate; failure-mode analysis; architecture; on-disk schemas; roadmap.
-- [`docs/cli-reference.md`](docs/cli-reference.md) — exhaustive CLI reference for `fsm-next`, `fsm-commit`, `fsm-inspect`, `fsm-validate-static`.
-- [`docs/state-yaml-reference.md`](docs/state-yaml-reference.md) — FSM YAML schema with examples.
-- [`docs/worker-contract.md`](docs/worker-contract.md) — worker prompt template conventions and JSON Schema response contract.
-- [`docs/storage-layout.md`](docs/storage-layout.md) — disk layout, lock semantics, manifest schema.
-
-## Programmatic API
-
-The package's [`scripts/lib/index.mjs`](scripts/lib/index.mjs) re-exports the engine and helpers for consumers who want to embed the engine directly. The CLIs are the recommended interface — they handle the structured-emit protocol, atomic writes, and lock management for free.
-
-```js
-import { evaluatePredicate, loadFsm, runEnv, resolveTransition } from "@ctxr/fsm";
-
-const fsm = loadFsm({ fsmPath: "fsm/my-orchestrator.fsm.yaml" });
-const env = runEnv("20260426-001512-a3f7c9b", { storageRoot: ".my-app/runs" });
-const { transition } = resolveTransition(stateById(fsm.doc, "my_state"), env);
-```
-
-## Tests
+## Quick start (once W0 + W1 + W2 land)
 
 ```bash
-npm install
-npm test
+# In your consumer project:
+uv add ctxr-fsm                      # or: pip install ctxr-fsm
+ctxr-fsm init                        # creates .ctxr-fsm/fsm.db + applies migrations + patches CLAUDE.md/AGENTS.md
+ctxr-fsm serve --mode dev            # boots MCP + FastAPI + fsm-ui dev server
+# browse http://localhost:<port>     # see the run dashboard
 ```
 
-The test suite covers the storage layer, predicate DSL, schema validators, static FSM validation, and the CLI runtime end-to-end.
-
-## Releasing
-
-Publishing to npm is **always manual** ([Principle 2: manual publish, sibling linking during dev](https://github.com/ctxr-dev/common-dev-principles)). CI runs `npm run lint`, `npm test`, and an FSM-static-validation pass over any example YAMLs under `examples/` on every PR and main push; `tag-on-main.yml` auto-creates the matching `v<version>` tag when `package.json` `version` changes on `main`; but nothing publishes to npm without an explicit operator dispatch. To cut a release, dispatch `publish.yml` from the Actions UI on `main` with the desired `version_bump` (`patch` / `minor` / `major`) and `dry_run` toggle. The workflow runs `npm version <bump>` first (so the inspected tarball reflects the bumped version), then either `npm publish --dry-run` (when `dry_run=true`; the version bump is NOT committed/pushed in this case) or the real `npm publish` followed by an atomic branch + tag push (when `dry_run=false`):
+## Legacy quick start (npm)
 
 ```bash
-gh workflow run publish.yml --ref main -f version_bump=patch -f dry_run=true
+cd legacy-js && npm install
+npx @ctxr/fsm --help
 ```
 
-After `dry_run=false` succeeds, optionally dispatch `release.yml` to draft or publish GitHub release notes for the new tag.
+See `legacy-js/README.md` for the JS API surface and CLI reference.
 
-> **Operator setup.** `publish.yml` (both the `dry_run` step and the real publish) reads `NODE_AUTH_TOKEN` from the `NPM_TOKEN` repo secret. Configure the secret once under **Settings -> Secrets and variables -> Actions -> Repository secrets** before the first dispatch, otherwise the workflow will fail at `npm publish`.
+## Migration plan
+
+The plan file (`how-it-fits-toasty-gray.md` in the developer workspace) is the single source of truth for what lands when. The high-level sequence:
+
+```
+W0  cohabitation       (you are here)
+W1  core lib           Pydantic + engine + predicates + loop + aggregator
+W2  sqlite             schema + alembic + repo + event bus + transactions
+W3  CLI                typer app + init + runs + spec + serve
+W4  MCP server         fsm.* tools incl. healthcheck + observe + confirm
+W5  FastAPI            REST + SSE
+W6  fsm-ui             Vite + Preact + Tailwind v4 SPA
+W7  service lifecycle  supervisor + ports + PIDs + reuse + live reload
+W8  examples           three runnable agent workflows
+W11 principles + install-memory CLI
+W12 enforcement        spec-hash lock + cosignature + verifier + drift detector + hook
+W9  documentation
+W10 CI/CD (manual publish only, per Principle 2)
+```
+
+## Contributing
+
+This is part of the [ctxr-dev workspace](https://github.com/ctxr-dev). New Python work lands under `ctxr/fsm/` and is driven by per-workstream branches and PRs. JS bug fixes land under `legacy-js/`. Cross-cutting changes (the two-roots layout itself) live at this top level.
 
 ## License
 
-MIT.
+MIT for both roots. See `LICENSE` (Python) and `legacy-js/LICENSE` (JS).
