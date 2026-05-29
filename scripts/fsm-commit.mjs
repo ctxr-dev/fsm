@@ -175,6 +175,16 @@ if (state.loop) {
   );
   const decision = runLoopDecision(state, parsed.outputs, iterationN);
   if (!decision.terminate) {
+    // Bump the manifest's last_update_at on every loop iteration so
+    // run-health and stale-run signals still tick over while the loop
+    // is making progress. current_state is reaffirmed defensively (it
+    // is unchanged for a continuing loop, but this keeps the patch
+    // self-explanatory and survives manifest schema drift).
+    updateManifest(
+      parsed.runId,
+      { current_state: state.id },
+      { storageRoot: settings.storageRoot },
+    );
     const envSoFar = runEnv(parsed.runId, { storageRoot: settings.storageRoot });
     const continueBrief = buildBrief({
       doc: fsm.doc,

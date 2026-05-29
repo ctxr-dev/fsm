@@ -144,7 +144,16 @@ export function sanitiseLoopOutputsDirSegment(raw, fallbackStateId) {
       `sanitiseLoopOutputsDirSegment: iteration_outputs_dir "${raw}" must not contain backslashes (use forward slashes)`,
     );
   }
-  const trimmed = candidate.replace(/^\/+/, "").replace(/\/+$/, "");
+  // Reject leading "/" explicitly rather than silently normalising it
+  // away. The schema layer rejects absolute paths at FSM load time, and
+  // the runtime helper should match (otherwise "/abs/path" would walk
+  // through as "abs/path" and disagree with the schema diagnostic).
+  if (candidate.startsWith("/")) {
+    throw new Error(
+      `sanitiseLoopOutputsDirSegment: iteration_outputs_dir "${raw}" must be relative; absolute paths are not allowed`,
+    );
+  }
+  const trimmed = candidate.replace(/\/+$/, "");
   if (trimmed.length === 0) {
     throw new Error(
       "sanitiseLoopOutputsDirSegment: iteration_outputs_dir collapses to empty after trimming slashes",

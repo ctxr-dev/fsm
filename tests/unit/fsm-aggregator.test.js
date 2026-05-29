@@ -204,8 +204,12 @@ test("aggregateLoopOutputs: writes aggregated and meta files atomically (no tmp 
     assert.ok(existsSync(join(runDir, result.aggregated_path)));
     assert.ok(existsSync(join(runDir, result.iteration_meta_path)));
     const workersDir = join(runDir, "workers");
-    const tmpLeftovers = readdirSync(workersDir).filter(
-      (n) => n.endsWith(".tmp") || n.endsWith(".tmp~"),
+    // atomicWriteFile names its temp shadow `<basename>.tmp.<pid>.<ms>.<hex>`
+    // (see fsm-storage.mjs), so the leftover-detector has to match that
+    // shape directly. The old endsWith(".tmp" | ".tmp~") never matched
+    // the real pattern and would never flag a stuck atomic write.
+    const tmpLeftovers = readdirSync(workersDir).filter((n) =>
+      /\.tmp\.\d+\.\d+\.[0-9a-f]+$/.test(n),
     );
     assert.equal(tmpLeftovers.length, 0);
   } finally {
