@@ -34,15 +34,13 @@
 //
 //   no-orchestrator-llm-call
 //     Pattern: a call expression whose callee name matches one of
-//     the known LLM-tool dispatch verbs:
+//     the known LLM-tool dispatch verbs. The match is name-only (no
+//     payload inspection); a legitimate invocation suppresses with
+//     `// fsm-lint:ignore`.
 //       Anthropic SDK / clients: messages.create, completions.create,
 //         anthropic.messages, client.messages.
-//       Tool-name shaped invocations: Task(, Agent(, Skill(, WebFetch(,
-//         WebSearch(, Bash( when followed by an LLM-shaped payload.
-//     This is the loosest heuristic; comments in the runner that
-//     explain WHY a Task( call is legitimately at orchestrator level
-//     (e.g. spawning a worker via the harness's Agent tool, which IS
-//     the intended pattern) can suppress with `// fsm-lint:ignore`.
+//       Harness tool-shaped invocations: Task(, Agent(, Skill(,
+//         Bash(, WebFetch(, WebSearch(.
 //     Why: the orchestrator shells out to fsm-next / fsm-commit; the
 //     LLM work happens inside the worker the FSM engine asks the
 //     harness to dispatch.

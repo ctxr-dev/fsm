@@ -99,7 +99,7 @@ test("clean runner produces no diagnostics and exits 0", () => {
   }
 });
 
-test("readFileSync(\".fsm.yaml\") fires no-direct-fsm-yaml-read and exits 1", () => {
+test("readFileSync of a *.fsm.yaml path fires no-direct-fsm-yaml-read and exits 1", () => {
   const dir = tmpDir();
   try {
     write(dir, "bad-yaml-read.mjs", DIRECT_YAML_READ_RUNNER);
