@@ -181,18 +181,42 @@ const entryRecord = entriesForState.reduce((best, r) => {
 }, entriesForState[0]);
 const entrySequence = entryRecord.data.sequence;
 
-// Release any prior lock regardless of holder, since resume is an explicit
-// operator action. The lock file path lives under the run dir; release
-// via session match first, then force-delete if a stale or alien lock
-// remains. This guarantees we acquire a fresh lock cleanly.
+// Lock takeover policy. fsm-commit only checks the lock at startup,
+// so if we force-stole the lock from an active in_progress writer it
+// would keep writing traces and the manifest after we've pruned and
+// reset the run, leaving state corrupted. Therefore:
+//
+//  1. If the existing lock is stale (TTL expired), forcibly remove it
+//     and acquire a fresh one.
+//  2. Otherwise, only take over when the manifest's status is paused
+//     or faulted (those statuses have no active writer by definition,
+//     and the lock file is leftover metadata).
+//  3. For an active in_progress run with a live lock, refuse: the
+//     operator must wait for the writer to release or escalate via
+//     pause / fault before retrying resume.
 const runDir = runDirPath(parsed.runId, { storageRoot: settings.storageRoot });
 const lockPath = join(runDir, "lock.json");
 if (existsSync(lockPath)) {
-  // Best-effort owner release: if the existing lock belongs to the
-  // calling session, take the friendly path. Otherwise, force-unlink.
   const existing = readLock(parsed.runId, { storageRoot: settings.storageRoot });
   if (existing) {
-    rmSync(lockPath, { force: true });
+    const now = Date.now();
+    const expiresAt = Date.parse(existing.expires_at ?? "");
+    const isStale = Number.isFinite(expiresAt) && expiresAt < now;
+    const isPassiveStatus =
+      manifest.status === "paused" || manifest.status === "faulted";
+    if (isStale || isPassiveStatus) {
+      rmSync(lockPath, { force: true });
+    } else {
+      emit({
+        error: "run_locked",
+        run_id: parsed.runId,
+        run_status: manifest.status,
+        lock: existing,
+        hint:
+          "resume refuses to take a non-stale lock from an in_progress run; pause the run or wait for the writer to release before retrying.",
+      });
+      process.exit(1);
+    }
   }
 }
 

@@ -30,7 +30,33 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { pruneTraceAfter, readManifest, readTrace } from "../../scripts/lib/fsm-storage.mjs";
+import {
+  pruneTraceAfter,
+  readManifest,
+  readTrace,
+  writeManifest,
+} from "../../scripts/lib/fsm-storage.mjs";
+
+// Resume refuses to take a non-stale lock from an in_progress run (so
+// it cannot race a live writer that has not yet checked the lock).
+// The tests do not actually run a concurrent writer; they just leave
+// behind the in_progress manifest + lock from the drive-to-state
+// preamble. Flip the status to "paused" so the lock takeover is
+// allowed under the same code path a real operator would use after
+// pausing the run.
+function markPausedForResumeTest(runId, storageRoot) {
+  const m = readManifest(runId, { storageRoot });
+  writeManifest(
+    runId,
+    {
+      ...m,
+      status: "paused",
+      paused_at: new Date().toISOString(),
+      pause_reason: "test-fixture",
+    },
+    { storageRoot },
+  );
+}
 
 const SCRIPT_DIR = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -160,6 +186,7 @@ test("pruneTraceAfter: removes only files with sequence > given value", () => {
   try {
     const session = "prune-1";
     const runId = driveToInline(tmp, session);
+    markPausedForResumeTest(runId, join(tmp, "store"));
     const before = readTrace(runId, { storageRoot: join(tmp, "store") });
     // Sanity: we expect ≥ 5 trace files (entry-a, exit-a, entry-b, exit-b, entry-c).
     assert.ok(before.length >= 5, `expected ≥5 trace files, got ${before.length}`);
@@ -223,6 +250,7 @@ test("fsm-resume: resumes from a worker state (b); prunes later traces; annotate
   try {
     const session = "resume-worker";
     const runId = driveToInline(tmp, session);
+    markPausedForResumeTest(runId, join(tmp, "store"));
     const beforeTrace = readTrace(runId, { storageRoot: join(tmp, "store") });
     // Locate b's entry sequence so we can assert the prune cut-off.
     const entryB = beforeTrace.find(
@@ -303,6 +331,7 @@ test("fsm-resume: resumes from an inline state (c) with no worker; brief reflect
   try {
     const session = "resume-inline";
     const runId = driveToInline(tmp, session);
+    markPausedForResumeTest(runId, join(tmp, "store"));
     const resume = parseJsonStdout(
       runScript("fsm-resume.mjs", [
         "--run-id", runId,
@@ -335,6 +364,7 @@ test("fsm-resume: refuses on a state name that is not in the FSM at all (unknown
   try {
     const session = "resume-unknown";
     const runId = driveToInline(tmp, session);
+    markPausedForResumeTest(runId, join(tmp, "store"));
     const result = runScript("fsm-resume.mjs", [
       "--run-id", runId,
       "--from-state", "does-not-exist",
@@ -432,6 +462,7 @@ test("fsm-resume: after resume from b, a fresh commit advances normally (b→c)"
   try {
     const session = "resume-then-commit";
     const runId = driveToInline(tmp, session);
+    markPausedForResumeTest(runId, join(tmp, "store"));
     const resumeSession = "resume-session-5";
     parseJsonStdout(
       runScript("fsm-resume.mjs", [
@@ -465,6 +496,7 @@ test("fsm-resume: takes over a prior lock held by a different session", () => {
   try {
     const originalSession = "original";
     const runId = driveToInline(tmp, originalSession);
+    markPausedForResumeTest(runId, join(tmp, "store"));
     // The original session still holds the lock. Resume with a fresh session.
     const newSession = "resume-takeover";
     const resume = parseJsonStdout(
