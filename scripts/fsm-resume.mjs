@@ -243,6 +243,11 @@ updateManifest(
     resume_history: [...priorHistory, annotation],
     transitions_count: retainedExitCount,
     ended_at: null,
+    // Clear any pause metadata so the manifest does not advertise a
+    // stale paused_at/pause_reason on what is now an in_progress run.
+    // These fields only have meaning while status === "paused".
+    paused_at: null,
+    pause_reason: null,
   },
   { storageRoot: settings.storageRoot },
 );
@@ -268,12 +273,19 @@ const brief = buildBrief({
 // the manifest. The manifest is the source of truth; this is convenience.
 function writeResumeSidecar() {
   const sidecarPath = join(runDir, "fsm-trace", `RESUMED-from-${parsed.fromState}-at-${timestamp.replace(/[:.]/g, "-")}.yaml`);
+  // The CLI session_id (and, defensively, every other scalar emitted
+  // here) is user-supplied and may contain ":", newlines, or quotes;
+  // emitting it as an unquoted plain scalar could either produce
+  // malformed YAML or, worse, inject extra fields into the sidecar.
+  // Wrap each scalar in a single-quoted YAML string and double up any
+  // embedded single quote per the YAML 1.2 single-quoted-style spec.
+  const quote = (v) => `'${String(v).replace(/'/g, "''")}'`;
   const payload = [
     `# Resume annotation (mirror of manifest.resume_history[-1])`,
-    `from_state: ${parsed.fromState}`,
-    `timestamp: ${timestamp}`,
-    `pruned_traces_count: ${pruneResult.removed}`,
-    `session_id: ${settings.sessionId}`,
+    `from_state: ${quote(parsed.fromState)}`,
+    `timestamp: ${quote(timestamp)}`,
+    `pruned_traces_count: ${Number.isInteger(pruneResult.removed) ? pruneResult.removed : 0}`,
+    `session_id: ${quote(settings.sessionId)}`,
     "",
   ].join("\n");
   const fd = openSync(sidecarPath, "w", 0o644);
