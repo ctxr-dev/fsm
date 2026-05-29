@@ -123,6 +123,34 @@ export function buildBrief({ doc, state, env, runId, opts = {} }) {
   return brief;
 }
 
+// sanitiseLoopOutputsDirSegment normalises a loop state's
+// iteration_outputs_dir into a single relative subpath under workers/.
+// Schema validation rejects "/"-leading and ".." segments at FSM load
+// time, but the engine is also called from contexts that may not have
+// re-validated the doc (tests, dynamic FSMs). Re-running the checks here
+// keeps the runtime defensive: a malicious or stale state cannot escape
+// <run_dir>/workers/ via path traversal.
+export function sanitiseLoopOutputsDirSegment(raw, fallbackStateId) {
+  const candidate = raw && typeof raw === "string" && raw.length > 0
+    ? raw
+    : `${fallbackStateId}-iters/`;
+  const trimmed = candidate.replace(/^\/+/, "").replace(/\/+$/, "");
+  if (trimmed.length === 0) {
+    throw new Error(
+      "sanitiseLoopOutputsDirSegment: iteration_outputs_dir collapses to empty after trimming slashes",
+    );
+  }
+  const parts = trimmed.split("/");
+  for (const part of parts) {
+    if (part === "" || part === "." || part === "..") {
+      throw new Error(
+        `sanitiseLoopOutputsDirSegment: iteration_outputs_dir "${raw}" contains an invalid segment ("${part}")`,
+      );
+    }
+  }
+  return trimmed;
+}
+
 // buildLoopBrief composes the per-iteration brief for a loop state. The
 // orchestrator dispatches the worker with `worker.prompt_template` and is
 // expected to write the JSON output to `loop.outputs_path`. Subsequent
@@ -130,8 +158,10 @@ export function buildBrief({ doc, state, env, runId, opts = {} }) {
 export function buildLoopBrief({ doc, state, env, runId, opts = {} }) {
   const loop = state.loop;
   const max = loop.max_iterations ?? 30;
-  const dirSegment = (loop.iteration_outputs_dir ?? `${state.id}-iters/`).replace(/^\/+/, "").replace(/\/+$/, "");
+  const dirSegment = sanitiseLoopOutputsDirSegment(loop.iteration_outputs_dir, state.id);
   const iterationN = countLoopIterations(runId, state.id, opts) + 1;
+  // outputs_path is part of the worker contract and is consumed across
+  // platforms; always emit POSIX forward slashes regardless of host OS.
   const outputsPath = `workers/${dirSegment}/iter-${iterationN}.json`;
   const fakeStateForInputs = { worker: { inputs: loop.worker.inputs ?? [] } };
   return {

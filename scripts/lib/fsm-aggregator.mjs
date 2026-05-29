@@ -21,8 +21,21 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
+import { sanitiseLoopOutputsDirSegment } from "./fsm-engine.mjs";
 import { atomicWriteJson } from "./fsm-storage.mjs";
 import { validateWorkerResponse } from "./fsm-schema.mjs";
+
+// Returned relative paths must be POSIX (forward slash) so consumers on
+// any platform see the same wire shape as the rest of the worker
+// contract paths under workers/. join() uses os-native separators, which
+// produces backslashes on Windows; use this helper for ANY path returned
+// to the caller.
+function posixRel(...segments) {
+  return segments
+    .filter((s) => typeof s === "string" && s.length > 0)
+    .join("/")
+    .replace(/\/{2,}/g, "/");
+}
 
 // aggregateLoopOutputs reads per-iteration JSON files for a loop state
 // and produces a unified aggregated array. `runDir` is the absolute path
@@ -46,9 +59,20 @@ export function aggregateLoopOutputs(runDir, state, { mergeField = "findings" } 
   if (!runDir || typeof runDir !== "string") {
     throw new TypeError("aggregateLoopOutputs: runDir must be a non-empty string path");
   }
+  if (typeof state.id !== "string" || state.id.length === 0) {
+    throw new TypeError("aggregateLoopOutputs: state.id must be a non-empty string");
+  }
+  if (typeof mergeField !== "string" || mergeField.length === 0) {
+    throw new TypeError("aggregateLoopOutputs: mergeField must be a non-empty string");
+  }
   const stateId = state.id;
   const loop = state.loop;
-  const iterSubdir = (loop.iteration_outputs_dir ?? `${stateId}-iters/`).replace(/^\/+/, "").replace(/\/+$/, "");
+  // Sanitise the configured iteration_outputs_dir at runtime too: the
+  // schema validates this at load time, but the aggregator is part of
+  // the public surface and may be called with a state object whose
+  // origin is not under our control. Reject leading "/" and ".." here
+  // explicitly to prevent path traversal out of <runDir>/workers/.
+  const iterSubdir = sanitiseLoopOutputsDirSegment(loop.iteration_outputs_dir, stateId);
   const iterDir = join(runDir, "workers", iterSubdir);
   const schema = loop.worker?.response_schema;
 
@@ -93,11 +117,14 @@ export function aggregateLoopOutputs(runDir, state, { mergeField = "findings" } 
     iterationMeta.push(meta);
   }
 
-  const aggregatedRel = join("workers", `${stateId}-aggregated.json`);
-  const metaRel = join("workers", `${stateId}-iteration-meta.json`);
+  // Returned relative paths use POSIX separators (the wire format the
+  // worker contract is documented in). Filesystem writes go through
+  // join() so they use OS-native separators locally.
+  const aggregatedRel = posixRel("workers", `${stateId}-aggregated.json`);
+  const metaRel = posixRel("workers", `${stateId}-iteration-meta.json`);
   mkdirSync(join(runDir, "workers"), { recursive: true });
-  atomicWriteJson(join(runDir, aggregatedRel), { state: stateId, merge_field: mergeField, items: merged });
-  atomicWriteJson(join(runDir, metaRel), { state: stateId, iterations: iterationMeta });
+  atomicWriteJson(join(runDir, "workers", `${stateId}-aggregated.json`), { state: stateId, merge_field: mergeField, items: merged });
+  atomicWriteJson(join(runDir, "workers", `${stateId}-iteration-meta.json`), { state: stateId, iterations: iterationMeta });
 
   return {
     aggregated_path: aggregatedRel,
