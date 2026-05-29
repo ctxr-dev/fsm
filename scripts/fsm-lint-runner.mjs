@@ -144,13 +144,39 @@ const SCHEMA_MARKERS = [
 // Suppression is documented as `// fsm-lint:ignore`. Returning true only
 // when the marker lives in a `//` line comment prevents bypassing
 // diagnostics by embedding the literal string inside source like
-// `console.log("fsm-lint:ignore")`. The match looks for `//` followed
-// by any prefix and then the marker, scanned left to right.
+// `console.log("fsm-lint:ignore")`. The scan walks the line tracking
+// string-literal state so a `//` inside a string (e.g. a URL like
+// "http://x") is NOT treated as a comment start.
 function lineCommentHasIgnoreMarker(line) {
   if (typeof line !== "string" || !line.includes(IGNORE_MARKER)) return false;
-  const commentIdx = line.indexOf("//");
-  if (commentIdx < 0) return false;
-  return line.indexOf(IGNORE_MARKER, commentIdx) >= 0;
+  let i = 0;
+  const len = line.length;
+  let inString = null; // null | "'" | '"' | "`"
+  while (i < len) {
+    const ch = line[i];
+    if (inString) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === inString) {
+        inString = null;
+      }
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      inString = ch;
+      i++;
+      continue;
+    }
+    if (ch === "/" && line[i + 1] === "/") {
+      // Real line comment starts here.
+      return line.indexOf(IGNORE_MARKER, i) >= 0;
+    }
+    i++;
+  }
+  return false;
 }
 
 export function lintFile(filePath, source) {
@@ -187,14 +213,15 @@ export function lintFile(filePath, source) {
     // Skip lines that are clearly source comments -- both the read-API
     // and the LLM-call rules are about real code, not prose in the
     // header banner. We detect a comment by the first non-space chars
-    // being `//`, `/*`, `*`, or `#` (shebangs / shell). Block-comment
-    // openers / middles all start with `/*` or ` *`.
+    // being `//`, `/*`, ` *` (block-comment middles), or `#!`
+    // (shebang only; a bare `#` would falsely skip valid ES class
+    // private members like `#client = ...`).
     const trimmed = line.trimStart();
     const isComment =
       trimmed.startsWith("//") ||
       trimmed.startsWith("/*") ||
       trimmed.startsWith("*") ||
-      trimmed.startsWith("#");
+      trimmed.startsWith("#!");
     if (isComment) continue;
 
     // Rule: no-direct-fsm-yaml-read. Match a known read API name
@@ -416,35 +443,39 @@ function isDirectInvocation() {
 }
 
 if (isDirectInvocation()) {
+  // Set process.exitCode and let Node exit naturally after the
+  // stdout/stderr streams flush, rather than calling process.exit()
+  // immediately after the last write. process.exit() can truncate a
+  // multi-KB diagnostics dump on piped stdio (same failure mode that
+  // motivated scripts/lib/emit.mjs in this repo).
   const args = process.argv.slice(2);
   if (args.includes("--help") || args.includes("-h")) {
     process.stdout.write(USAGE);
-    process.exit(0);
-  }
-  if (args.length === 0) {
+    process.exitCode = 0;
+  } else if (args.length === 0) {
     process.stderr.write(
       "fsm-lint-runner: at least one runner file path is required\n",
     );
     process.stderr.write(USAGE);
-    process.exit(2);
-  }
+    process.exitCode = 2;
+  } else {
+    const { diagnostics, missing, unreadable } = lintPaths(args);
 
-  const { diagnostics, missing, unreadable } = lintPaths(args);
+    for (const m of missing) {
+      process.stderr.write(`fsm-lint-runner: file not found: ${m}\n`);
+    }
+    for (const u of unreadable) {
+      process.stderr.write(
+        `fsm-lint-runner: unreadable: ${u.path} (${u.error})\n`,
+      );
+    }
 
-  for (const m of missing) {
-    process.stderr.write(`fsm-lint-runner: file not found: ${m}\n`);
-  }
-  for (const u of unreadable) {
-    process.stderr.write(
-      `fsm-lint-runner: unreadable: ${u.path} (${u.error})\n`,
-    );
-  }
+    for (const d of diagnostics) {
+      process.stdout.write(`${formatDiagnostic(d)}\n`);
+    }
 
-  for (const d of diagnostics) {
-    process.stdout.write(`${formatDiagnostic(d)}\n`);
+    const failed =
+      diagnostics.length > 0 || missing.length > 0 || unreadable.length > 0;
+    process.exitCode = failed ? 1 : 0;
   }
-
-  const failed =
-    diagnostics.length > 0 || missing.length > 0 || unreadable.length > 0;
-  process.exit(failed ? 1 : 0);
 }
