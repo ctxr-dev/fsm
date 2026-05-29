@@ -48,7 +48,7 @@ import {
   stateById,
   updateManifest,
 } from "./lib/fsm-engine.mjs";
-import { resolveSettings } from "./lib/fsm-config.mjs";
+import { resolveSettings, resolveStorageRoot } from "./lib/fsm-config.mjs";
 
 function parseArgs(argv) {
   const args = {};
@@ -108,6 +108,26 @@ try {
   fail(err.message, 2);
 }
 
+// --journal {discard|replay}: dedicated A7 recovery short-circuit.
+//
+// Runs BEFORE resolveSettings + loadFsm because recovery only needs
+// `storageRoot + runId`. resolveSettings requires fsmPath (CLI override
+// OR a .fsmrc.json entry), which would block recovery in setups
+// without config. Use the lightweight resolveStorageRoot helper to
+// honour --storage-root if passed, or fall back to .fsmrc.json's
+// storage_root. An operator should be able to discard or replay an
+// incomplete commit even when the FSM YAML has been moved / renamed /
+// deleted.
+if (parsed.journalAction) {
+  let recoveryStorageRoot;
+  try {
+    recoveryStorageRoot = resolveStorageRoot(parsed);
+  } catch (err) {
+    fail(err.message, 2);
+  }
+  doJournalRecovery(recoveryStorageRoot);
+}
+
 let settings;
 try {
   settings = resolveSettings(parsed);
@@ -115,7 +135,6 @@ try {
   fail(err.message, 2);
 }
 
-// --journal {discard|replay}: dedicated A7 recovery short-circuit.
 // Inspects <run_dir>/.journal/ and either rolls back the pending
 // transaction (discard) or finalises it idempotently (replay). Does NOT
 // touch the lock, the trace, or the manifest beyond what the recovery
@@ -129,8 +148,8 @@ try {
 // the run's manifest somehow got truncated — both would make a regular
 // --from-state resume impossible, but a journal can still be
 // discarded or replayed bytewise.
-if (parsed.journalAction) {
-  const recoveryRunDir = runDirPath(parsed.runId, { storageRoot: settings.storageRoot });
+function doJournalRecovery(storageRoot) {
+  const recoveryRunDir = runDirPath(parsed.runId, { storageRoot });
   const jstate = journalState(recoveryRunDir);
   if (!jstate.hasJournal) {
     emit({

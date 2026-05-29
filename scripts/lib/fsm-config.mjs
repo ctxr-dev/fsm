@@ -181,3 +181,44 @@ export function resolveSettings(cliArgs = {}, cwd = process.cwd()) {
 function defaultSessionId() {
   return `session-${process.pid}-${Date.now()}`;
 }
+
+// resolveStorageRoot returns just the storageRoot (absolute path).
+// Used by CLIs that DO NOT need the FSM YAML — fsm-inspect for read-only
+// inspection, fsm-resume --journal {discard|replay} for journal-only
+// recovery. Skipping the fsmPath requirement lets these flows succeed
+// even when the FSM YAML has been moved, renamed, or deleted.
+//
+// Resolution order matches resolveSettings:
+//   1. CLI `--storage-root` if provided (no config lookup needed).
+//   2. Single .fsmrc.json entry: use its storage_root.
+//   3. Multi-FSM .fsmrc.json with `--fsm <name>`: pick the named entry.
+//   4. Multi-FSM .fsmrc.json without `--fsm`: error (must disambiguate).
+//   5. No config: error (must pass `--storage-root`).
+export function resolveStorageRoot(cliArgs = {}, cwd = process.cwd()) {
+  if (cliArgs.storageRoot) {
+    return resolve(cwd, cliArgs.storageRoot);
+  }
+  const cfg = loadConfig(cwd);
+  let entry;
+  if (cliArgs.fsmName) {
+    entry = cfg.fsms.find((f) => f.name === cliArgs.fsmName);
+    if (!entry) {
+      const available = cfg.fsms.map((f) => f.name).join(", ") || "(none)";
+      throw new Error(
+        `fsm: --fsm "${cliArgs.fsmName}" not found in ${cfg._config_path ?? ".fsmrc.json"}. Available: ${available}`,
+      );
+    }
+  } else if (cfg.fsms.length === 1) {
+    entry = cfg.fsms[0];
+  } else if (cfg.fsms.length === 0) {
+    throw new Error(
+      "fsm: no FSM configured. Pass --storage-root, or add a .fsmrc.json with fsms[].",
+    );
+  } else {
+    const available = cfg.fsms.map((f) => f.name).join(", ");
+    throw new Error(
+      `fsm: multiple FSMs configured (${available}). Pass --fsm <name> to pick one, or --storage-root to bypass the config.`,
+    );
+  }
+  return resolve(cwd, entry.storage_root);
+}

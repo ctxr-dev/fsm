@@ -6,8 +6,6 @@
 //
 // Output: JSON with manifest + lock state + ordered list of trace records.
 
-import { resolve } from "node:path";
-
 import { emitJson } from "./lib/emit.mjs";
 import {
   journalState,
@@ -17,7 +15,7 @@ import {
   readTrace,
   runDirPath,
 } from "./lib/fsm-storage.mjs";
-import { loadConfig } from "./lib/fsm-config.mjs";
+import { resolveStorageRoot as resolveStorageRootFromConfig } from "./lib/fsm-config.mjs";
 
 function parseArgs(argv) {
   const args = {};
@@ -49,41 +47,15 @@ try {
   process.exit(2);
 }
 
-// fsm-inspect only needs storage_root (no FSM YAML loaded). Resolve it
-// directly via loadConfig + CLI override, without the full resolveSettings
-// machinery that requires fsmPath.
+// fsm-inspect only needs storage_root (no FSM YAML loaded). Use the
+// shared resolveStorageRoot helper (also used by fsm-resume's journal
+// recovery short-circuit) so the resolution rules stay in one place.
 let storageRoot;
 try {
-  storageRoot = resolveStorageRoot(parsed);
+  storageRoot = resolveStorageRootFromConfig(parsed);
 } catch (err) {
   process.stderr.write(`fsm-inspect: ${err.message}\n`);
   process.exit(2);
-}
-
-function resolveStorageRoot(cliArgs) {
-  const cwd = process.cwd();
-  if (cliArgs.storageRoot) return resolve(cwd, cliArgs.storageRoot);
-  const cfg = loadConfig(cwd);
-  let entry;
-  if (cliArgs.fsmName) {
-    entry = cfg.fsms.find((f) => f.name === cliArgs.fsmName);
-    if (!entry) {
-      const available = cfg.fsms.map((f) => f.name).join(", ") || "(none)";
-      throw new Error(
-        `--fsm "${cliArgs.fsmName}" not found in ${cfg._config_path ?? ".fsmrc.json"}. Available: ${available}`,
-      );
-    }
-  } else if (cfg.fsms.length === 1) {
-    entry = cfg.fsms[0];
-  } else if (cfg.fsms.length === 0) {
-    throw new Error("must pass --storage-root or have a .fsmrc.json with fsms[]");
-  } else {
-    const available = cfg.fsms.map((f) => f.name).join(", ");
-    throw new Error(
-      `multiple FSMs configured (${available}); pass --fsm <name> or --storage-root`,
-    );
-  }
-  return resolve(cwd, entry.storage_root);
 }
 
 const manifest = readManifest(parsed.runId, { storageRoot });
@@ -101,8 +73,8 @@ const journal = jstate.hasJournal
       present: true,
       ...publicJournalProjection(jstate),
       recovery: {
-        discard: `fsm-resume --run-id ${parsed.runId} --journal discard`,
-        replay: `fsm-resume --run-id ${parsed.runId} --journal replay`,
+        discard: `fsm-resume --run-id ${parsed.runId} --journal discard --storage-root ${storageRoot}`,
+        replay: `fsm-resume --run-id ${parsed.runId} --journal replay --storage-root ${storageRoot}`,
       },
     }
   : { present: false };
