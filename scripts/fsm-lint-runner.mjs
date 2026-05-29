@@ -137,7 +137,12 @@ const ROLE_MARKERS = [
 const SCHEMA_MARKERS = [
   /\$schema/,
   /"type"\s*:\s*"object"/,
-  /"required"\s*:\s*\[/,
+  // Match the documented `"required":` marker on its own (object or
+  // array RHS, or even with the RHS missing in a partial fixture).
+  // Previously the regex required `[` immediately after the colon,
+  // contradicting the header comment and producing surprising
+  // false negatives.
+  /"required"\s*:/,
   /response_schema/,
 ];
 
