@@ -142,7 +142,7 @@ A missing identifier resolves to `undefined`. Comparisons with `undefined` follo
 | Category | Tokens |
 |----------|--------|
 | Comparison | `==`, `!=`, `<`, `>`, `<=`, `>=` |
-| Logical | `AND`, `OR`, `NOT` (case-insensitive); aliases `&&`, `||`, `!` |
+| Logical | `AND`, `OR`, `NOT` (case-insensitive); aliases `&&`, `&#124;&#124;`, `!` |
 | Grouping | `(`, `)` |
 
 Operator precedence (highest to lowest): grouping, function-call, `NOT`, comparison, `AND`, `OR`.
@@ -194,7 +194,7 @@ The post-validation DSL is the same as the transition DSL, summarised here for c
 | Literals | numbers, `'...'` / `"..."` strings, `true`, `false`, `null` |
 | Identifiers | dotted paths into `outputs` (e.g. `findings`, `summary.total`) |
 | Comparison | `==`, `!=`, `<`, `>`, `<=`, `>=` |
-| Logical | `AND`, `OR`, `NOT` (case-insensitive); aliases `&&`, `||`, `!` |
+| Logical | `AND`, `OR`, `NOT` (case-insensitive); aliases `&&`, `&#124;&#124;`, `!` |
 | Grouping | `(`, `)` |
 | Functions | `len(x)`, `empty(x)`, `in(x, list)` |
 | Literals (extras) | `always` evaluates `true` (matches the transition DSL); useful for documenting an intentionally always-pass check during development |
