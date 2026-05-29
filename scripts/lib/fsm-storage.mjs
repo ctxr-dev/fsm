@@ -300,6 +300,33 @@ export function readTrace(runId, opts = {}) {
     });
 }
 
+// pruneTraceAfter removes every trace file whose NNNN- sequence is strictly
+// greater than the given `sequence`. The file at sequence itself is kept;
+// everything past it is unlinked. Returns the count of files removed and
+// the names of the files that were pruned (sorted ascending).
+//
+// Used by fsm-resume: after locating the target state's entry trace at
+// sequence N, the caller prunes everything past N so the run resumes
+// from a clean slate at that state.
+export function pruneTraceAfter(runId, sequence, opts = {}) {
+  if (!Number.isInteger(sequence) || sequence < 0) {
+    throw new Error(
+      `pruneTraceAfter: sequence must be a non-negative integer, got ${sequence}`,
+    );
+  }
+  const traceDir = join(runDirPath(runId, opts), "fsm-trace");
+  if (!existsSync(traceDir)) return { removed: 0, files: [] };
+  const candidates = readdirSync(traceDir)
+    .filter((n) => /^\d+-/.test(n))
+    .map((n) => ({ name: n, seq: Number.parseInt(n.split("-", 1)[0], 10) }))
+    .filter((entry) => entry.seq > sequence)
+    .sort((a, b) => a.seq - b.seq);
+  for (const entry of candidates) {
+    rmSync(join(traceDir, entry.name), { force: true });
+  }
+  return { removed: candidates.length, files: candidates.map((c) => c.name) };
+}
+
 // ─── cross-run queries ──────────────────────────────────────────────────
 
 // listRecentRuns walks the date-sharded directory tree for the last

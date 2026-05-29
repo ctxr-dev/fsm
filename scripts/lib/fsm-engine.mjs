@@ -396,6 +396,7 @@ export function initialiseManifest({
     args: args ?? {},
     verdict: null,
     transitions_count: 0,
+    resume_history: [],
   };
   writeManifest(runId, data, { storageRoot });
   return data;
