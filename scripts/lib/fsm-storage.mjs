@@ -435,6 +435,25 @@ function assertWithin(targetDir, parentDir, context) {
   }
 }
 
+// assertNearestExistingAncestorWithin walks `targetDir` upward to the
+// deepest existing ancestor (the last segment that exists on disk) and
+// asserts THAT path stays inside `parentDir`. Use this as a pre-flight
+// check before `mkdirSync({ recursive: true })`: assertWithin alone runs
+// AFTER mkdir, which would have already created directories outside
+// parentDir if an existing ancestor was a symlink. Calling this first
+// makes the operation fail with NO side effects when an ancestor escapes.
+function assertNearestExistingAncestorWithin(targetDir, parentDir, context) {
+  let candidate = targetDir;
+  while (!existsSync(candidate)) {
+    const up = dirname(candidate);
+    if (up === candidate) break;
+    candidate = up;
+  }
+  if (existsSync(candidate)) {
+    assertWithin(candidate, parentDir, context);
+  }
+}
+
 // assertSafeTxnId rejects any txnId that contains path separators,
 // traversal segments, colons, or backslashes, so a caller-supplied
 // value can never escape <journalRoot>. discardJournal and
@@ -612,7 +631,18 @@ export function replayJournal(runDir, txnId) {
     // outside the journal root or run root. Verify the real path of
     // both the staged source dir AND the final destination dir stays
     // inside their respective parents before any rename.
+    //
+    // The destination dir is checked BEFORE mkdirSync (pre-flight on
+    // the nearest existing ancestor) so we don't create directories
+    // outside runDir if an existing parent segment is a symlink. The
+    // staged source dir already exists at this point, so the direct
+    // assertWithin is sufficient.
     assertWithin(dirname(stagedPath), txnDir, "replayJournal (stagedPath)");
+    assertNearestExistingAncestorWithin(
+      dirname(finalPath),
+      runDir,
+      "replayJournal (finalPath ancestor)",
+    );
     mkdirSync(dirname(finalPath), { recursive: true });
     assertWithin(dirname(finalPath), runDir, "replayJournal (finalPath)");
     renameSync(stagedPath, finalPath);
@@ -781,18 +811,27 @@ export function withJournal(runDir, fn) {
 
   for (const entry of stagedFiles) {
     const finalPath = join(runDir, entry.relPath);
-    mkdirSync(dirname(finalPath), { recursive: true });
     // Symlink-escape guards on BOTH sides of the rename:
     //   1. SOURCE: txnDir or one of its subdirs could be swapped to a
     //      symlink between staging and finalisation. Verify the
     //      resolved real path of dirname(entry.stagedPath) stays
     //      inside realpathSync(txnDir).
     //   2. DEST: a subdir under runDir could be swapped to a symlink
-    //      by an external actor with write access. Verify the
-    //      resolved real path of dirname(finalPath) stays inside
-    //      realpathSync(runDir).
+    //      by an external actor with write access. Pre-flight on the
+    //      nearest existing ancestor BEFORE mkdir, so we never create
+    //      directories outside runDir even on a deep relPath where an
+    //      existing parent segment is a symlink that escapes. Then
+    //      assertWithin AGAIN after mkdir so a race that drops a
+    //      symlink in between the pre-flight and the rename is still
+    //      caught.
     // Either failure throws; the journal stays on disk for inspection.
     assertWithin(dirname(entry.stagedPath), txnDir, "withJournal (stagedPath)");
+    assertNearestExistingAncestorWithin(
+      dirname(finalPath),
+      runDir,
+      "withJournal (finalPath ancestor)",
+    );
+    mkdirSync(dirname(finalPath), { recursive: true });
     assertWithin(dirname(finalPath), runDir, "withJournal (finalPath)");
     renameSync(entry.stagedPath, finalPath);
   }

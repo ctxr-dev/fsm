@@ -500,6 +500,41 @@ test("withJournal: refuses to rename into a symlinked subdir that escapes runDir
   }
 });
 
+test("withJournal: deep relPath with escaping ancestor symlink creates NO directories outside runDir", () => {
+  const store = tmpStore();
+  const escapeRoot = mkdtempSync(join(tmpdir(), "fsm-journal-escape-"));
+  try {
+    const { runId, runDir, opts } = makeRun(store);
+    // Symlink runDir/workers -> escapeRoot/out, then attempt to stage
+    // a DEEP relPath ("workers/sub/nested/payload.json") whose parents
+    // do not yet exist on disk. Without the pre-flight check,
+    // mkdirSync({recursive:true}) would happily create `sub/nested/`
+    // inside escapeRoot/out before assertWithin throws. The
+    // pre-flight on the nearest existing ancestor catches the symlink
+    // at the `workers` level and refuses BEFORE any mkdir runs.
+    rmSync(join(runDir, "workers"), { recursive: true, force: true });
+    mkdirSync(join(escapeRoot, "out"), { recursive: true });
+    symlinkSync(join(escapeRoot, "out"), join(runDir, "workers"));
+    assert.throws(
+      () =>
+        withJournal(runDir, (txn) => {
+          // Stage at the canonical path (under txnDir, no escape there).
+          const relPath = "workers/sub/nested/payload.json";
+          const stagedPath = txn.stage(relPath);
+          writeFileSync(stagedPath, "{}");
+          txn.addStaged(relPath, stagedPath);
+        }),
+      /resolves to .* which is outside/,
+    );
+    // Critical assertion: escapeRoot/out remains EMPTY. No `sub/` or
+    // `sub/nested/` was created outside runDir.
+    assert.deepEqual(readdirSync(join(escapeRoot, "out")), []);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+    rmSync(escapeRoot, { recursive: true, force: true });
+  }
+});
+
 test("replayJournal: refuses to rename into a symlinked subdir that escapes runDir", () => {
   const store = tmpStore();
   const escapeRoot = mkdtempSync(join(tmpdir(), "fsm-journal-escape-"));
