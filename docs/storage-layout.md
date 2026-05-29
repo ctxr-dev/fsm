@@ -18,6 +18,9 @@ The package writes only to `<storage-root>/`. Consumers configure `storage_root`
               0002-exit-<state>.yaml
               ...
             workers/                ← consumer-managed worker artifacts (optional)
+            manifest-aggregates/    ← cross-state aggregate arrays (optional)
+              findings.json
+              <merge-field>.json
 ```
 
 ### Why each path component
@@ -86,6 +89,67 @@ See [`orchestration-design.md`](orchestration-design.md) "File schemas" for the 
 - `status` enum: `in_progress | paused | completed | faulted | abandoned | stale | superseded`.
 - `current_state` is the last-entered state (the one the orchestrator is currently working on); `next_state` is null between commits.
 - `transitions_count` increments on every `fsm-commit`.
+
+### Optional `aggregates` map
+
+Skills whose FSMs produce arrays across multiple states (e.g. a loop state that emits `findings[]` followed by a verifier state that emits more `findings[]`) can carry a single unified array in the manifest via a top-level `aggregates` map. The map is keyed by the merge field name (one key per cross-state aggregate). Each entry points at the on-disk unified file under `manifest-aggregates/` and records which states contributed.
+
+Schema:
+
+```json
+{
+  "aggregates": {
+    "<merge-field>": {
+      "from_states": ["<state-id>", "<state-id>"],
+      "field": "<merge-field>",
+      "path": "manifest-aggregates/<merge-field>.json",
+      "merged_length": 8,
+      "missing_states": []
+    }
+  }
+}
+```
+
+Example (a plan-reviewer-style skill that folds findings from two states into one list):
+
+```json
+{
+  "run_id": "20260426-001512-a3f7c9b",
+  "...": "...",
+  "aggregates": {
+    "findings": {
+      "from_states": ["explore_loop", "verify_coverage"],
+      "field": "findings",
+      "path": "manifest-aggregates/findings.json",
+      "merged_length": 8,
+      "missing_states": []
+    }
+  }
+}
+```
+
+The file at `<run_dir>/<entry.path>` has the shape:
+
+```json
+{
+  "field": "findings",
+  "from_states": ["explore_loop", "verify_coverage"],
+  "state_count": 2,
+  "missing_states": [],
+  "merged_length": 8,
+  "items": [ /* ... */ ]
+}
+```
+
+#### How it gets produced
+
+The `@ctxr/fsm` package exports `aggregateAcrossStates(runDir, { stateIds, mergeField })` from `scripts/lib/fsm-aggregator.mjs`. It reads each state's most recent exit-trace record from `<run_dir>/fsm-trace/`, pulls `outputs[mergeField]` from each, concatenates the arrays in the caller-supplied order, and atomic-writes `<run_dir>/manifest-aggregates/<merge-field>.json`. It returns `{ aggregated_path, state_count, merged_length, missing_states }`. Missing states (no exit trace yet) are reported, never thrown.
+
+The companion `manifestAggregateEntry(...)` helper returns the canonical entry shape above, so every skill runner stamps the same fields with the same names. Wiring the entry into `manifest.aggregates` is the **skill runner's** responsibility: the FSM YAML has no aggregate-declaration syntax in 0.2.0, so the runner calls `updateManifest` itself after the cross-state state completes. See the file header of `scripts/lib/fsm-aggregator.mjs` for the deferred-wiring rationale.
+
+#### Loop-state caveat
+
+A loop state's exit trace stores an `aggregated_<state-id>` path (produced by `aggregateLoopOutputs`), NOT a flat `findings[]` array. If a skill needs to fold a loop state into a cross-state aggregate, the runner must first re-stamp the loop state's exit-trace outputs with the flattened array under `outputs[mergeField]`, or emit a follow-on inline state that does so. The cross-state aggregator deliberately does NOT auto-resolve aggregated paths; the one-line contract stays: `outputs[mergeField]` must be an array.
 
 ## Trace records
 
