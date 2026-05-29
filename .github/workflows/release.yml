@@ -75,14 +75,23 @@ jobs:
             DRAFT_FLAG="--draft"
           fi
 
-          # If a release already exists for this tag, regenerate
-          # notes in-place. Otherwise create a new release with
-          # auto-generated notes from commits since the previous
-          # tag (gh's --generate-notes).
+          # If a release already exists for this tag, regenerate notes
+          # by computing them via the GitHub API and updating the body
+          # in place. `gh release edit` has no --generate-notes flag, so
+          # `gh api repos/.../releases/generate-notes` is the canonical
+          # way to recompute the body without deleting the release
+          # (which would lose any attached assets and the original
+          # publish timestamp).
           if gh release view "${TAG}" >/dev/null 2>&1; then
             echo "Release ${TAG} exists; regenerating notes."
+            PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")"
+            NOTES="$(gh api repos/${{ github.repository }}/releases/generate-notes \
+              -f tag_name="${TAG}" \
+              ${PREV:+-f previous_tag_name="${PREV}"} \
+              --jq .body)"
+            printf '%s\n' "${NOTES}" > /tmp/release-notes.md
             gh release edit "${TAG}" \
-              --notes-start-tag "$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")" \
+              --notes-file /tmp/release-notes.md \
               --verify-tag
             gh release view "${TAG}"
           else

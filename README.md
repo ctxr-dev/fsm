@@ -116,7 +116,7 @@ The test suite covers the storage layer, predicate DSL, schema validators, stati
 
 ## Releasing
 
-Publishing to npm is **always manual** ([Principle 2: manual publish, sibling linking during dev](https://github.com/ctxr-dev/common-dev-principles)). CI runs lint, validate, and tests on every PR and main push; `tag-on-main.yml` auto-creates the matching `v<version>` tag when `package.json` `version` changes on `main`; but nothing publishes to npm without an explicit operator dispatch. To cut a release, dispatch `publish.yml` from the Actions UI on `main` with the desired `version_bump` (`patch` / `minor` / `major`) and `dry_run` toggle (default `true` runs `npm publish --dry-run` so the tarball can be inspected first):
+Publishing to npm is **always manual** ([Principle 2: manual publish, sibling linking during dev](https://github.com/ctxr-dev/common-dev-principles)). CI runs `npm run lint`, `npm test`, and an FSM-static-validation pass over any example YAMLs under `examples/` on every PR and main push; `tag-on-main.yml` auto-creates the matching `v<version>` tag when `package.json` `version` changes on `main`; but nothing publishes to npm without an explicit operator dispatch. To cut a release, dispatch `publish.yml` from the Actions UI on `main` with the desired `version_bump` (`patch` / `minor` / `major`) and `dry_run` toggle (default `true` runs `npm publish --dry-run` so the tarball can be inspected first):
 
 ```bash
 gh workflow run publish.yml --ref main -f version_bump=patch -f dry_run=true
