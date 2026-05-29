@@ -628,6 +628,26 @@ test("fsm-resume: rejects --journal followed by another flag", () => {
   assert.match(result.stderr, /--journal requires a value/);
 });
 
+test("fsm-resume: --journal recovery emits malformed_run_id for a bad run-id", () => {
+  // parseRunId throws on anything not matching YYYYMMDD-HHMMSS-<7hex>.
+  // Operator recovery should surface this as a structured payload,
+  // NOT a stack trace from runDirPath.
+  const tmp = setupFixture();
+  try {
+    const result = runScript("fsm-resume.mjs", [
+      "--run-id", "not-a-valid-run-id",
+      "--journal", "discard",
+      "--storage-root", join(tmp, "store"),
+    ]);
+    assert.notEqual(result.status, 0);
+    const body = JSON.parse(result.stdout);
+    assert.equal(body.error, "malformed_run_id");
+    assert.equal(body.run_id, "not-a-valid-run-id");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("fsm-resume: --journal recovery returns run_not_found when the run dir does not exist", () => {
   // An operator that mistypes a run-id (or points at the wrong
   // storage root) should NOT get an ambiguous {ok:true,

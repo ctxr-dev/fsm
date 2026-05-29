@@ -150,7 +150,21 @@ try {
 // --from-state resume impossible, but a journal can still be
 // discarded or replayed bytewise.
 function doJournalRecovery(storageRoot) {
-  const recoveryRunDir = runDirPath(parsed.runId, { storageRoot });
+  // runDirPath calls parseRunId, which throws on a malformed run-id.
+  // Surface that as a structured malformed_run_id payload rather
+  // than crashing the recovery CLI with a stack trace.
+  let recoveryRunDir;
+  try {
+    recoveryRunDir = runDirPath(parsed.runId, { storageRoot });
+  } catch (err) {
+    emit({
+      error: "malformed_run_id",
+      run_id: parsed.runId,
+      journal_action: parsed.journalAction,
+      detail: err.message,
+    });
+    process.exit(1);
+  }
   // Distinguish "run dir does not exist" from "run dir exists but
   // carries no journal". The previous unconditional `no_journal_present`
   // misled operators into thinking recovery succeeded when they had

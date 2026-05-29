@@ -29,7 +29,6 @@ import {
   publicJournalProjection,
   readManifest,
   replayJournal,
-  runDirPath,
   withJournal,
   writeManifest,
 } from "../../scripts/lib/fsm-storage.mjs";
