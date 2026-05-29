@@ -357,6 +357,22 @@ export function runPostValidations(state, outputs = {}) {
   const results = [];
   let valid = true;
   for (const check of checks) {
+    // Schema validation only enforces that post_validations is an
+    // array; individual elements may slip through as non-strings if the
+    // YAML author makes a typo. Surface that as a typed evaluation
+    // failure rather than crashing evaluatePredicate, so the trace +
+    // CLI payload always carry the documented { check, expression,
+    // result, error } shape with string fields.
+    if (typeof check !== "string") {
+      results.push({
+        check: String(check),
+        expression: String(check),
+        result: false,
+        error: `post_validations entry must be a string, got ${typeof check}`,
+      });
+      valid = false;
+      continue;
+    }
     const entry = { check, expression: check };
     try {
       const passed = Boolean(evaluatePredicate(check, env));

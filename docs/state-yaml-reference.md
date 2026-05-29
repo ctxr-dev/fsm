@@ -197,6 +197,7 @@ The post-validation DSL is the same as the transition DSL, summarised here for c
 | Logical | `AND`, `OR`, `NOT` (case-insensitive); aliases `&&`, `||`, `!` |
 | Grouping | `(`, `)` |
 | Functions | `len(x)`, `empty(x)`, `in(x, list)` |
+| Literals (extras) | `always` evaluates `true` (matches the transition DSL); useful for documenting an intentionally always-pass check during development |
 
 ### Examples
 
