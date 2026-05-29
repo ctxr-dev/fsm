@@ -524,6 +524,42 @@ test("fsm-resume: takes over a prior lock held by a different session", () => {
   }
 });
 
+test("fsm-resume: refuses takeover of a non-stale lock on an in_progress run", () => {
+  const tmp = setupFixture();
+  try {
+    const originalSession = "live-writer";
+    const runId = driveToInline(tmp, originalSession);
+    // Intentionally DO NOT call markPausedForResumeTest here: the run
+    // is still status=in_progress with the original session's lock,
+    // which is exactly the live-writer scenario the new takeover
+    // policy must refuse. A regression here would corrupt the run.
+
+    const result = runScript("fsm-resume.mjs", [
+      "--run-id", runId,
+      "--from-state", "b",
+      "--session-id", "resume-attempt",
+      ...commonArgs(tmp),
+    ]);
+    assert.notEqual(result.status, 0);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.error, "run_locked");
+    assert.equal(payload.run_status, "in_progress");
+    assert.ok(payload.lock, "expected the lock payload to be surfaced");
+    assert.match(
+      payload.hint || "",
+      /pause the run or wait for the writer to release/i,
+    );
+
+    // Manifest must NOT have been mutated: status, current_state and
+    // resume_history remain whatever drive-to-state left behind.
+    const m = readManifest(runId, { storageRoot: join(tmp, "store") });
+    assert.equal(m.status, "in_progress");
+    assert.equal((m.resume_history ?? []).length, 0);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 // ─── arg validation ────────────────────────────────────────────────────
 
 test("fsm-resume: rejects missing --run-id", () => {
