@@ -26,7 +26,8 @@
     "./storage": "./scripts/lib/fsm-storage.mjs",
     "./schema": "./scripts/lib/fsm-schema.mjs",
     "./predicates": "./scripts/lib/fsm-predicates.mjs",
-    "./engine": "./scripts/lib/fsm-engine.mjs"
+    "./engine": "./scripts/lib/fsm-engine.mjs",
+    "./aggregator": "./scripts/lib/fsm-aggregator.mjs"
   },
   "bin": {
     "fsm-next": "scripts/fsm-next.mjs",
