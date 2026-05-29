@@ -576,7 +576,7 @@ test("fsm-resume: rejects missing --run-id", () => {
   }
 });
 
-test("fsm-resume: rejects missing --from-state", () => {
+test("fsm-resume: rejects missing --from-state and missing --journal", () => {
   const tmp = setupFixture();
   try {
     const result = runScript("fsm-resume.mjs", [
@@ -584,7 +584,13 @@ test("fsm-resume: rejects missing --from-state", () => {
       ...commonArgs(tmp),
     ]);
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /--from-state is required/);
+    // Post-A7, callers must pass either --from-state (rewind to a prior
+    // entered state) or --journal {discard|replay} (recover an incomplete
+    // commit). Either is acceptable; missing both is the error.
+    assert.match(
+      result.stderr,
+      /either --from-state or --journal <discard\|replay> is required/,
+    );
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -594,6 +600,179 @@ test("fsm-resume: rejects unknown argument", () => {
   const result = runScript("fsm-resume.mjs", ["--bogus"]);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /unknown argument/);
+});
+
+test("fsm-resume: rejects --journal without a value", () => {
+  // Edge case: `fsm-resume --journal` with no following action used to
+  // silently parse `journalAction = undefined` and then fall through to
+  // the generic "either --from-state or --journal ..." error, which
+  // misleads the user (they did pass --journal). The parser now
+  // requires a value for every flag.
+  const result = runScript("fsm-resume.mjs", [
+    "--run-id", "20260101-000000-1234567",
+    "--journal",
+  ]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--journal requires a value/);
+});
+
+test("fsm-resume: rejects --journal followed by another flag", () => {
+  // Same shape as the previous: if the value happens to look like
+  // another flag, treat it as a missing value rather than silently
+  // consuming it as the action.
+  const result = runScript("fsm-resume.mjs", [
+    "--run-id", "20260101-000000-1234567",
+    "--journal", "--from-state", "a",
+  ]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--journal requires a value/);
+});
+
+test("fsm-resume: --journal recovery emits malformed_run_id for a bad run-id", () => {
+  // parseRunId throws on anything not matching YYYYMMDD-HHMMSS-<7hex>.
+  // Operator recovery should surface this as a structured payload,
+  // NOT a stack trace from runDirPath.
+  const tmp = setupFixture();
+  try {
+    const result = runScript("fsm-resume.mjs", [
+      "--run-id", "not-a-valid-run-id",
+      "--journal", "discard",
+      "--storage-root", join(tmp, "store"),
+    ]);
+    assert.notEqual(result.status, 0);
+    const body = JSON.parse(result.stdout);
+    assert.equal(body.error, "malformed_run_id");
+    assert.equal(body.run_id, "not-a-valid-run-id");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("fsm-resume: --journal recovery returns run_not_found when the run dir does not exist", () => {
+  // An operator that mistypes a run-id (or points at the wrong
+  // storage root) should NOT get an ambiguous {ok:true,
+  // result:"no_journal_present"} payload — that masks the typo.
+  // Distinguish "wrong inputs" from "right inputs, nothing to do".
+  const tmp = setupFixture();
+  try {
+    const result = runScript("fsm-resume.mjs", [
+      "--run-id", "20260101-000000-deadbee",
+      "--journal", "discard",
+      "--storage-root", join(tmp, "store"),
+    ]);
+    assert.notEqual(result.status, 0);
+    const body = JSON.parse(result.stdout);
+    assert.equal(body.error, "run_not_found");
+    assert.equal(body.run_id, "20260101-000000-deadbee");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("fsm-resume: --journal discard works without --fsm-path (only --storage-root + --run-id needed)", () => {
+  // Per the recovery contract, --journal discard / --journal replay
+  // should require ONLY storageRoot + runId. The previous implementation
+  // ran resolveSettings unconditionally, which forces fsmPath, blocking
+  // recovery in setups without a .fsmrc.json + without --fsm-path.
+  const tmp = setupFixture();
+  try {
+    // Drive the run so a run dir exists.
+    const next = runScript("fsm-next.mjs", [
+      "--new-run",
+      "--repo", "ctxr-dev/fsm",
+      "--base-sha", "b",
+      "--head-sha", "h",
+      "--session-id", "test-session",
+      ...commonArgs(tmp),
+    ]);
+    assert.equal(next.status, 0);
+    const runId = JSON.parse(next.stdout).run_id;
+
+    // Plant a journal under the run dir.
+    const inspect = JSON.parse(
+      runScript("fsm-inspect.mjs", ["--run-id", runId, ...commonArgs(tmp)]).stdout,
+    );
+    const txnDir = join(inspect.run_dir_path, ".journal", "no-fsm-path-001");
+    mkdirSync(txnDir, { recursive: true });
+    writeFileSync(
+      join(txnDir, "journal.json"),
+      JSON.stringify({
+        txn_id: "no-fsm-path-001",
+        status: "pending",
+        staged_files: [],
+      }),
+    );
+
+    // Pass ONLY --run-id, --journal discard, and --storage-root — no
+    // --fsm-path. The recovery short-circuit must succeed.
+    const result = runScript("fsm-resume.mjs", [
+      "--run-id", runId,
+      "--journal", "discard",
+      "--storage-root", join(tmp, "store"),
+    ]);
+    assert.equal(result.status, 0, `expected success, got stderr=${result.stderr}`);
+    const body = JSON.parse(result.stdout);
+    assert.equal(body.journal_action, "discard");
+    assert.equal(body.discarded, true);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("fsm-resume: --journal discard works when the FSM YAML is missing", () => {
+  // Recovery only needs storageRoot + runId. An operator should be
+  // able to discard an incomplete commit even if the FSM YAML has
+  // since been renamed / deleted, which would otherwise make
+  // loadFsm() blow up before the recovery short-circuit is reached.
+  const tmp = setupFixture();
+  try {
+    // Start a run so a run dir + manifest exist.
+    const next = runScript("fsm-next.mjs", [
+      "--new-run",
+      "--repo", "ctxr-dev/fsm",
+      "--base-sha", "b",
+      "--head-sha", "h",
+      "--session-id", "test-session",
+      ...commonArgs(tmp),
+    ]);
+    assert.equal(next.status, 0, `fsm-next failed: ${next.stderr}`);
+    const runId = JSON.parse(next.stdout).run_id;
+
+    // Plant a journal directly under the run dir.
+    const inspect = JSON.parse(
+      runScript("fsm-inspect.mjs", [
+        "--run-id", runId,
+        ...commonArgs(tmp),
+      ]).stdout,
+    );
+    const txnDir = join(inspect.run_dir_path, ".journal", "planted-txn-001");
+    mkdirSync(txnDir, { recursive: true });
+    writeFileSync(
+      join(txnDir, "journal.json"),
+      JSON.stringify({
+        txn_id: "planted-txn-001",
+        status: "pending",
+        staged_files: [],
+      }),
+    );
+
+    // Now NUKE the FSM YAML so loadFsm() would throw if it ran.
+    rmSync(join(tmp, "fsm.yaml"), { force: true });
+
+    // Recovery still works because the short-circuit runs BEFORE
+    // loadFsm.
+    const discardResult = runScript("fsm-resume.mjs", [
+      "--run-id", runId,
+      "--journal", "discard",
+      ...commonArgs(tmp),
+    ]);
+    assert.equal(discardResult.status, 0, `discard failed: ${discardResult.stderr}`);
+    const body = JSON.parse(discardResult.stdout);
+    assert.equal(body.journal_action, "discard");
+    assert.equal(body.discarded, true);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 // ─── final sanity: the runner file is present in scripts/.

@@ -77,7 +77,7 @@ function posixRel(...segments) {
 //   }
 // On schema-violation in any iter file, the path appears in validation_errors
 // but aggregation still proceeds with the remaining valid files.
-export function aggregateLoopOutputs(runDir, state, { mergeField = "findings" } = {}) {
+export function aggregateLoopOutputs(runDir, state, { mergeField = "findings", transaction } = {}) {
   if (!state?.loop) {
     throw new Error("aggregateLoopOutputs: state is not a loop state");
   }
@@ -174,9 +174,25 @@ export function aggregateLoopOutputs(runDir, state, { mergeField = "findings" } 
   // join() so they use OS-native separators locally.
   const aggregatedRel = posixRel("workers", `${stateId}-aggregated.json`);
   const metaRel = posixRel("workers", `${stateId}-iteration-meta.json`);
-  mkdirSync(join(runDir, "workers"), { recursive: true });
-  atomicWriteJson(join(runDir, "workers", `${stateId}-aggregated.json`), { state: stateId, merge_field: mergeField, items: merged });
-  atomicWriteJson(join(runDir, "workers", `${stateId}-iteration-meta.json`), { state: stateId, iterations: iterationMeta });
+  const aggregatedBody = { state: stateId, merge_field: mergeField, items: merged };
+  const metaBody = { state: stateId, iterations: iterationMeta };
+  if (transaction) {
+    // Inside a withJournal transaction, route writes to the staged
+    // journal paths so the loop's terminate-and-aggregate sequence
+    // becomes part of the same atomic commit. The rename loop in
+    // withJournal moves them into place when the transaction
+    // finalises.
+    const aggregatedStaged = transaction.stage(aggregatedRel);
+    const metaStaged = transaction.stage(metaRel);
+    atomicWriteJson(aggregatedStaged, aggregatedBody);
+    atomicWriteJson(metaStaged, metaBody);
+    transaction.addStaged(aggregatedRel, aggregatedStaged);
+    transaction.addStaged(metaRel, metaStaged);
+  } else {
+    mkdirSync(join(runDir, "workers"), { recursive: true });
+    atomicWriteJson(join(runDir, "workers", `${stateId}-aggregated.json`), aggregatedBody);
+    atomicWriteJson(join(runDir, "workers", `${stateId}-iteration-meta.json`), metaBody);
+  }
 
   return {
     aggregated_path: aggregatedRel,
@@ -217,7 +233,7 @@ export function aggregateLoopOutputs(runDir, state, { mergeField = "findings" } 
 // The output file is written atomically (write-tmp + fsync + rename),
 // so a re-run on the same inputs produces the same bytes and there are
 // no .tmp leftovers.
-export function aggregateAcrossStates(runDir, { stateIds, mergeField = "findings" } = {}) {
+export function aggregateAcrossStates(runDir, { stateIds, mergeField = "findings", transaction } = {}) {
   if (!runDir || typeof runDir !== "string") {
     throw new TypeError("aggregateAcrossStates: runDir must be a non-empty string path");
   }
@@ -277,17 +293,24 @@ export function aggregateAcrossStates(runDir, { stateIds, mergeField = "findings
     // Non-array or missing: contributes zero items, but state is counted.
   }
 
-  const aggregatesDir = join(runDir, "manifest-aggregates");
-  mkdirSync(aggregatesDir, { recursive: true });
-  const aggregatedRel = join("manifest-aggregates", `${mergeField}.json`);
-  atomicWriteJson(join(runDir, aggregatedRel), {
+  const aggregatedRel = posixRel("manifest-aggregates", `${mergeField}.json`);
+  const body = {
     field: mergeField,
     from_states: [...stateIds],
     state_count: stateCount,
     missing_states: missingStates,
     merged_length: merged.length,
     items: merged,
-  });
+  };
+  if (transaction) {
+    const stagedPath = transaction.stage(aggregatedRel);
+    atomicWriteJson(stagedPath, body);
+    transaction.addStaged(aggregatedRel, stagedPath);
+  } else {
+    const aggregatesDir = join(runDir, "manifest-aggregates");
+    mkdirSync(aggregatesDir, { recursive: true });
+    atomicWriteJson(join(runDir, aggregatedRel), body);
+  }
 
   return {
     aggregated_path: aggregatedRel,

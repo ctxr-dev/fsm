@@ -20,6 +20,18 @@
 import { writeSync } from "node:fs";
 import { Buffer } from "node:buffer";
 
+// shellQuote wraps a value in POSIX single-quotes so it can be
+// concatenated into a copy-pasteable shell command even when it
+// contains spaces, $, backticks, or other special characters. Embedded
+// single quotes are handled with the standard `'\''` close-reopen
+// trick. Used by the CLI recovery hints in fsm-commit / fsm-next /
+// fsm-inspect / fsm-resume.
+export function shellQuote(value) {
+  if (value === undefined || value === null) return "''";
+  const s = String(value);
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
 export function emitJson(payload) {
   const text = `${JSON.stringify(payload, null, 2)}\n`;
   const buf = Buffer.from(text, "utf8");

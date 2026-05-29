@@ -458,8 +458,10 @@ export function initialiseManifest({
   return data;
 }
 
-export function updateManifest(runId, patch, { storageRoot, now = new Date() } = {}) {
-  const existing = readManifest(runId, { storageRoot });
+export function updateManifest(runId, patch, opts = {}) {
+  const { storageRoot, now = new Date(), transaction } = opts;
+  const storageOpts = { storageRoot, transaction };
+  const existing = readManifest(runId, storageOpts);
   if (!existing) {
     throw new Error(`updateManifest: no manifest at run-id "${runId}"`);
   }
@@ -468,7 +470,7 @@ export function updateManifest(runId, patch, { storageRoot, now = new Date() } =
     ...patch,
     last_update_at: now.toISOString(),
   };
-  writeManifest(runId, updated, { storageRoot });
+  writeManifest(runId, updated, storageOpts);
   return updated;
 }
 

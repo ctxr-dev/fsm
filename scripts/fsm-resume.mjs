@@ -32,10 +32,14 @@ import { join } from "node:path";
 import { emitJson } from "./lib/emit.mjs";
 import {
   acquireLock,
+  discardJournal,
+  discardOrphanedLock,
+  journalState,
   pruneTraceAfter,
   readLock,
   readManifest,
   readTrace,
+  replayJournal,
   runDirPath,
 } from "./lib/fsm-storage.mjs";
 import {
@@ -45,22 +49,46 @@ import {
   stateById,
   updateManifest,
 } from "./lib/fsm-engine.mjs";
-import { resolveSettings } from "./lib/fsm-config.mjs";
+import { resolveSettings, resolveStorageRoot } from "./lib/fsm-config.mjs";
 
 function parseArgs(argv) {
   const args = {};
+  // Helper: every flag below expects exactly one argument value. Reject
+  // a flag whose value is missing (end of argv) or another flag, so
+  // mistakes like `fsm-resume --journal` (no action) surface as a
+  // pointed parse error rather than the generic
+  // "either --from-state or --journal ..." fallback.
+  const takeValue = (flag, i) => {
+    const v = argv[i + 1];
+    if (v === undefined || (typeof v === "string" && v.startsWith("--"))) {
+      throw new Error(`${flag} requires a value`);
+    }
+    return v;
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--run-id") args.runId = argv[++i];
-    else if (arg === "--from-state") args.fromState = argv[++i];
-    else if (arg === "--session-id") args.sessionId = argv[++i];
-    else if (arg === "--fsm" || arg === "--fsm-name") args.fsmName = argv[++i];
-    else if (arg === "--fsm-path") args.fsmPath = argv[++i];
-    else if (arg === "--storage-root") args.storageRoot = argv[++i];
+    if (arg === "--run-id") args.runId = takeValue(arg, i++);
+    else if (arg === "--from-state") args.fromState = takeValue(arg, i++);
+    else if (arg === "--journal") args.journalAction = takeValue(arg, i++);
+    else if (arg === "--session-id") args.sessionId = takeValue(arg, i++);
+    else if (arg === "--fsm" || arg === "--fsm-name") args.fsmName = takeValue(arg, i++);
+    else if (arg === "--fsm-path") args.fsmPath = takeValue(arg, i++);
+    else if (arg === "--storage-root") args.storageRoot = takeValue(arg, i++);
     else throw new Error(`fsm-resume: unknown argument "${arg}"`);
   }
   if (!args.runId) throw new Error("--run-id is required");
-  if (!args.fromState) throw new Error("--from-state is required");
+  if (args.journalAction) {
+    if (!["discard", "replay"].includes(args.journalAction)) {
+      throw new Error(
+        `--journal must be "discard" or "replay", got "${args.journalAction}"`,
+      );
+    }
+    if (args.fromState) {
+      throw new Error("--journal and --from-state are mutually exclusive");
+    }
+  } else if (!args.fromState) {
+    throw new Error("either --from-state or --journal <discard|replay> is required");
+  }
   return args;
 }
 
@@ -81,11 +109,180 @@ try {
   fail(err.message, 2);
 }
 
+// --journal {discard|replay}: dedicated A7 recovery short-circuit.
+//
+// Runs BEFORE resolveSettings + loadFsm because recovery only needs
+// `storageRoot + runId`. resolveSettings requires fsmPath (CLI override
+// OR a .fsmrc.json entry), which would block recovery in setups
+// without config. Use the lightweight resolveStorageRoot helper to
+// honour --storage-root if passed, or fall back to .fsmrc.json's
+// storage_root. An operator should be able to discard or replay an
+// incomplete commit even when the FSM YAML has been moved / renamed /
+// deleted.
+if (parsed.journalAction) {
+  let recoveryStorageRoot;
+  try {
+    recoveryStorageRoot = resolveStorageRoot(parsed);
+  } catch (err) {
+    fail(err.message, 2);
+  }
+  doJournalRecovery(recoveryStorageRoot);
+}
+
 let settings;
 try {
   settings = resolveSettings(parsed);
 } catch (err) {
   fail(err.message, 2);
+}
+
+// Inspects <run_dir>/.journal/ and either rolls back the pending
+// transaction (discard) or finalises it idempotently (replay). Does NOT
+// touch the lock, the trace, or the manifest beyond what the recovery
+// op naturally produces (replay's rename loop finalises any staged
+// manifest.json the crash captured). Pre-existing journals from a
+// previous crashed fsm-commit are the only target.
+//
+// Runs BEFORE loadFsm + readManifest because recovery only needs
+// storageRoot + runId. An operator should be able to recover an
+// incomplete commit even when the FSM YAML has been moved/renamed or
+// the run's manifest somehow got truncated — both would make a regular
+// --from-state resume impossible, but a journal can still be
+// discarded or replayed bytewise.
+function doJournalRecovery(storageRoot) {
+  // runDirPath calls parseRunId, which throws on a malformed run-id.
+  // Surface that as a structured malformed_run_id payload rather
+  // than crashing the recovery CLI with a stack trace.
+  let recoveryRunDir;
+  try {
+    recoveryRunDir = runDirPath(parsed.runId, { storageRoot });
+  } catch (err) {
+    emit({
+      error: "malformed_run_id",
+      run_id: parsed.runId,
+      journal_action: parsed.journalAction,
+      detail: err.message,
+    });
+    process.exit(1);
+  }
+  // Distinguish "run dir does not exist" from "run dir exists but
+  // carries no journal". The previous unconditional `no_journal_present`
+  // misled operators into thinking recovery succeeded when they had
+  // simply mistyped the run-id or storage-root. Emit run_not_found
+  // (exit 1) for the missing-run-dir case so automation can tell
+  // them apart without needing to load the manifest (which we
+  // intentionally avoid in the recovery short-circuit).
+  if (!existsSync(recoveryRunDir)) {
+    emit({
+      error: "run_not_found",
+      run_id: parsed.runId,
+      journal_action: parsed.journalAction,
+    });
+    process.exit(1);
+  }
+  // journalState can throw if `.journal` is unreadable / a regular
+  // file. Recovery should still surface a usable error payload
+  // rather than crash with a stack trace.
+  let jstate;
+  try {
+    jstate = journalState(recoveryRunDir);
+  } catch (err) {
+    emit({
+      error: "journal_inspect_failed",
+      run_id: parsed.runId,
+      journal_action: parsed.journalAction,
+      detail: err.message,
+    });
+    process.exit(1);
+  }
+  if (!jstate.hasJournal) {
+    emit({
+      ok: true,
+      run_id: parsed.runId,
+      journal_action: parsed.journalAction,
+      result: "no_journal_present",
+    });
+    process.exit(0);
+  }
+  if (parsed.journalAction === "discard") {
+    let out;
+    try {
+      // Orphaned-lock branch: if journalState surfaced lock_only AND
+      // could not parse the lock payload's txn_id, calling
+      // discardJournal(null) would throw "txnId must be a non-empty
+      // string". Route to discardOrphanedLock instead, which clears
+      // the lock without requiring a txnId match.
+      if (jstate.lock_only && !jstate.txnId) {
+        out = discardOrphanedLock(recoveryRunDir);
+      } else {
+        out = discardJournal(recoveryRunDir, jstate.txnId);
+      }
+    } catch (err) {
+      emit({
+        error: "discard_failed",
+        run_id: parsed.runId,
+        txn_id: jstate.txnId,
+        detail: err.message,
+      });
+      process.exit(1);
+    }
+    // Emit only snake_case keys. Spreading `...out` would mix the
+    // helper's camelCase `txnId` into the payload alongside the
+    // explicit `txn_id` and confuse downstream consumers.
+    emit({
+      ok: true,
+      run_id: parsed.runId,
+      journal_action: "discard",
+      txn_id: jstate.txnId,
+      status_before: jstate.status,
+      discarded: out.discarded,
+      reason: out.reason ?? null,
+    });
+    process.exit(0);
+  }
+  // replay
+  if (jstate.status !== "ready_to_finalise") {
+    emit({
+      error: "replay_not_safe",
+      run_id: parsed.runId,
+      txn_id: jstate.txnId,
+      status: jstate.status,
+      hint:
+        "journal status must be ready_to_finalise to replay. " +
+        "`pending` means the producing fn never returned; " +
+        "`lock_only` means a crash left only the single-writer lock " +
+        "(no staged work to replay). In both cases use --journal discard.",
+    });
+    process.exit(1);
+  }
+  let out;
+  try {
+    out = replayJournal(recoveryRunDir, jstate.txnId);
+  } catch (err) {
+    // replayJournal's tightened checks (symlink containment,
+    // missing-source-AND-missing-dest, etc.) all throw. Surface as
+    // a structured CLI error so operators and automation can react
+    // instead of getting a stack trace.
+    emit({
+      error: "replay_failed",
+      run_id: parsed.runId,
+      txn_id: jstate.txnId,
+      detail: err.message,
+    });
+    process.exit(1);
+  }
+  // Emit only snake_case keys. Spreading `...out` would mix the
+  // helper's camelCase `txnId` into the payload alongside the
+  // explicit `txn_id`.
+  emit({
+    ok: true,
+    run_id: parsed.runId,
+    journal_action: "replay",
+    txn_id: jstate.txnId,
+    replayed: out.replayed,
+    finalised: out.finalised ?? [],
+  });
+  process.exit(0);
 }
 
 let fsm;

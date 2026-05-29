@@ -21,13 +21,16 @@
 
 import { readFileSync } from "node:fs";
 
-import { emitJson } from "./lib/emit.mjs";
+import { emitJson, shellQuote } from "./lib/emit.mjs";
 
 import {
   acquireLock,
   buildRunId,
   ensureRunDir,
+  journalState,
+  publicJournalProjection,
   readManifest,
+  runDirPath,
 } from "./lib/fsm-storage.mjs";
 import {
   buildBrief,
@@ -179,6 +182,38 @@ if (manifest.status !== "in_progress" && manifest.status !== "paused") {
     error: "run_not_resumable",
     run_id: runId,
     status: manifest.status,
+  });
+  process.exit(1);
+}
+// A7: refuse to advance if a previous commit left a journal on disk.
+// The journal contains the intent of the last (crashed) commit; the
+// user must explicitly recover via `fsm-resume --journal discard|replay`
+// before any new state work can be done.
+//
+// journalState can throw on a filesystem error or if `.journal` is a
+// regular file rather than a directory. Surface as a structured
+// payload (instead of a stack trace) so automation can react.
+const resumeRunDir = runDirPath(runId, { storageRoot: settings.storageRoot });
+let resumeJournal;
+try {
+  resumeJournal = journalState(resumeRunDir);
+} catch (err) {
+  emit({
+    error: "journal_inspect_failed",
+    run_id: runId,
+    detail: err.message,
+  });
+  process.exit(1);
+}
+if (resumeJournal.hasJournal) {
+  emit({
+    error: "incomplete_commit_detected",
+    run_id: runId,
+    journal: publicJournalProjection(resumeJournal),
+    recovery: {
+      discard: `fsm-resume --run-id ${shellQuote(runId)} --journal discard --storage-root ${shellQuote(settings.storageRoot)}`,
+      replay: `fsm-resume --run-id ${shellQuote(runId)} --journal replay --storage-root ${shellQuote(settings.storageRoot)}`,
+    },
   });
   process.exit(1);
 }
