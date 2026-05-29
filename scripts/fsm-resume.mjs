@@ -197,20 +197,50 @@ const entrySequence = entryRecord.data.sequence;
 const runDir = runDirPath(parsed.runId, { storageRoot: settings.storageRoot });
 const lockPath = join(runDir, "lock.json");
 if (existsSync(lockPath)) {
+  // Re-read manifest AND lock at takeover time so two concurrent
+  // resumers cannot both see a stale "paused / faulted" snapshot and
+  // each unlink the other's freshly-acquired lock. The combination
+  // protects against:
+  //  - manifest status flipped to in_progress between the initial
+  //    read at the top of this script and now;
+  //  - another resumer just acquired a fresh lock for itself (we'd
+  //    see a different session_id / expires_at and must refuse).
+  const freshManifest = readManifest(parsed.runId, { storageRoot: settings.storageRoot });
   const existing = readLock(parsed.runId, { storageRoot: settings.storageRoot });
   if (existing) {
     const now = Date.now();
     const expiresAt = Date.parse(existing.expires_at ?? "");
     const isStale = Number.isFinite(expiresAt) && expiresAt < now;
-    const isPassiveStatus =
-      manifest.status === "paused" || manifest.status === "faulted";
+    const fmStatus = freshManifest?.status ?? manifest.status;
+    const isPassiveStatus = fmStatus === "paused" || fmStatus === "faulted";
     if (isStale || isPassiveStatus) {
-      rmSync(lockPath, { force: true });
+      // Compare-and-swap: unlink ONLY if the lock on disk RIGHT NOW
+      // is the same lock we just inspected. If another resumer has
+      // already replaced it with their own fresh lock, the
+      // re-read here will differ and we refuse to clobber.
+      const afterRead = readLock(parsed.runId, { storageRoot: settings.storageRoot });
+      const sameLock =
+        afterRead &&
+        afterRead.session_id === existing.session_id &&
+        afterRead.expires_at === existing.expires_at;
+      if (sameLock) {
+        rmSync(lockPath, { force: true });
+      } else {
+        emit({
+          error: "run_locked",
+          run_id: parsed.runId,
+          run_status: fmStatus,
+          lock: afterRead ?? existing,
+          hint:
+            "another resume / writer raced ahead and replaced the lock; re-read state and retry if appropriate.",
+        });
+        process.exit(1);
+      }
     } else {
       emit({
         error: "run_locked",
         run_id: parsed.runId,
-        run_status: manifest.status,
+        run_status: fmStatus,
         lock: existing,
         hint:
           "resume refuses to take a non-stale lock from an in_progress run; pause the run or wait for the writer to release before retrying.",
