@@ -136,8 +136,6 @@ jobs:
 
       - name: Commit, push, and tag the version bump
         if: ${{ !inputs.dry_run }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           AFTER="${{ steps.bump.outputs.after }}"
