@@ -33,18 +33,18 @@
 //     making decisions the FSM should make).
 //
 //   no-orchestrator-llm-call
-//     Pattern: a token-shape scan that fires when the line contains
-//     a known LLM-tool dispatch name followed by an open paren. This
-//     is NOT a call-expression detector: a function declaration
+//     Pattern: a token-shape scan that fires when the line contains a
+//     known LLM-dispatch token. Two token shapes are matched:
+//       - bare property paths like `anthropic.messages` /
+//         `client.messages` (no trailing `(` required), so accessing
+//         the LLM client surface also counts.
+//       - call shapes like `messages.create(`, `Task(`, `Agent(`,
+//         `Skill(`, `Bash(`, `WebFetch(`, `WebSearch(`.
+//     This is NOT a call-expression detector: a function declaration
 //     (`function Task() { ... }`), object method definition
 //     (`{ Task() { ... } }`), or destructure (`{ Task } = ...`)
-//     followed by `Task(` on the same line will also match.
-//     Authors can suppress with `// fsm-lint:ignore` for legitimate
-//     occurrences.
-//       Anthropic SDK / clients: messages.create, completions.create,
-//         anthropic.messages, client.messages.
-//       Harness tool-shaped invocations: Task(, Agent(, Skill(,
-//         Bash(, WebFetch(, WebSearch(.
+//     followed by `Task(` on the same line will also match. Authors
+//     suppress legitimate occurrences with `// fsm-lint:ignore`.
 //     Why: the orchestrator shells out to fsm-next / fsm-commit; the
 //     LLM work happens inside the worker the FSM engine asks the
 //     harness to dispatch.
@@ -241,13 +241,21 @@ export function lintFile(filePath, source) {
 
   const readApiAlternation = READ_APIS.join("|");
   // Require the .fsm.yaml occurrence to be inside a quoted string
-  // literal so block comments or commented-out args (e.g.
-  // `readFileSync(/* ".fsm.yaml" */ x)`) do not fire. The argument
-  // expression up to the `.fsm.yaml` occurrence is matched lazily,
-  // then the suffix must end inside the SAME quote that opened it.
+  // literal: the argument expression up to the `.fsm.yaml` occurrence
+  // is matched lazily, then the suffix must end inside the SAME quote
+  // that opened it. Inline block comments inside the call
+  // (`readFileSync(/* ".fsm.yaml" */ x)`) ARE stripped before the
+  // regex runs (see scrub-inline-block-comments below), so a quoted
+  // `.fsm.yaml` literal that lives only inside a `/* ... */` segment
+  // is not matched.
   const readApiRegex = new RegExp(
     `\\b(?:${readApiAlternation})\\s*\\([^)\\n]*?(['"\`])[^'"\`\\n]*\\.fsm\\.yaml[^'"\`\\n]*\\1`,
   );
+  // Strip inline `/* ... */` segments from a single line for the
+  // per-line regexes. Stops at the first newline (block comments that
+  // span lines are handled by the inBlockComment state machine
+  // below).
+  const stripInlineBlockComments = (s) => s.replace(/\/\*[^\n]*?\*\//g, "");
 
   // Pre-compute the set of line numbers that fall STRICTLY INSIDE a
   // multi-line template literal so the per-line rules can skip them
@@ -340,10 +348,17 @@ export function lintFile(filePath, source) {
     // owns the template-literal case.
     if (templateLineSet.has(lineNumber)) continue;
 
+    // Strip any inline /* ... */ from the current line before the
+    // per-line regexes look at it, so a `.fsm.yaml` string literal
+    // sitting only inside a commented-out arg (`readFileSync(/* "x.fsm.yaml" */ y)`)
+    // is not matched. The inBlockComment state above handles the
+    // multi-line case; this handles a single-line inline block.
+    const codeOnly = stripInlineBlockComments(line);
+
     // Rule: no-direct-fsm-yaml-read. Match a known read API name
     // followed by `(`, with `.fsm.yaml` appearing somewhere on the
     // same line inside a string literal.
-    if (readApiRegex.test(line)) {
+    if (readApiRegex.test(codeOnly)) {
       diagnostics.push({
         file: filePath,
         line: lineNumber,
@@ -355,7 +370,7 @@ export function lintFile(filePath, source) {
 
     // Rule: no-orchestrator-llm-call.
     for (const pattern of LLM_CALL_PATTERNS) {
-      if (pattern.test(line)) {
+      if (pattern.test(codeOnly)) {
         diagnostics.push({
           file: filePath,
           line: lineNumber,

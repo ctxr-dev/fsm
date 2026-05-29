@@ -29,7 +29,7 @@ LLM work happens inside the worker the FSM engine dispatches. If the runner itse
 The linter flags calls to the known LLM-dispatch verbs:
 
 - Anthropic SDK shapes: `messages.create`, `completions.create`, `anthropic.messages`, `client.messages`.
-- Harness-tool-shaped invocations from JS: `Task(`, `Agent(`, `Skill(`, `Bash(`, `WebFetch(`, `WebSearch(`. Legitimate orchestrator dispatches that match these shapes (e.g. an `Agent(...)` worker spawn that IS the intended pattern) suppress with `// fsm-lint:ignore`.
+- Harness-tool-shaped invocations from JS: `Task(`, `Agent(`, `Skill(`, `Bash(`, `WebFetch(`, `WebSearch(`. These are flagged whenever they appear in a JS runner because runners are supposed to shell out to `fsm-next` / `fsm-commit` rather than dispatch tools themselves; the calling LLM does the dispatching in the orchestrator harness, NOT the runner. The rule has known false positives (e.g. a helper function or variable that coincidentally happens to be named `Agent`); suppress those with `// fsm-lint:ignore`.
 
 This rule has the most false-positive risk (see below).
 
