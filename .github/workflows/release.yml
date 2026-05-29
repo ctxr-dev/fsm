@@ -97,16 +97,23 @@ jobs:
           # (which would lose any attached assets and the original
           # publish timestamp).
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "Release ${TAG} exists; regenerating notes."
+            echo "Release ${TAG} exists; regenerating notes (draft=${{ inputs.draft }})."
             PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")"
             NOTES="$(gh api repos/${{ github.repository }}/releases/generate-notes \
               -f tag_name="${TAG}" \
               ${PREV:+-f previous_tag_name="${PREV}"} \
               --jq .body)"
             printf '%s\n' "${NOTES}" > /tmp/release-notes.md
+            # Honor inputs.draft on the re-run path too: gh release edit
+            # accepts --draft to (re)set draft status and --draft=false
+            # to publish a previously drafted release. Without this, the
+            # input description ("draft the release") was misleading on
+            # re-runs because gh release edit silently kept whatever
+            # state the release already had.
             gh release edit "${TAG}" \
               --notes-file /tmp/release-notes.md \
-              --verify-tag
+              --verify-tag \
+              --draft=${{ inputs.draft }}
             gh release view "${TAG}"
           else
             echo "Creating release ${TAG} ${DRAFT_FLAG:-(published)}."
