@@ -33,10 +33,14 @@
 //     making decisions the FSM should make).
 //
 //   no-orchestrator-llm-call
-//     Pattern: a call expression whose callee name matches one of
-//     the known LLM-tool dispatch verbs. The match is name-only (no
-//     payload inspection); a legitimate invocation suppresses with
-//     `// fsm-lint:ignore`.
+//     Pattern: a token-shape scan that fires when the line contains
+//     a known LLM-tool dispatch name followed by an open paren. This
+//     is NOT a call-expression detector: a function declaration
+//     (`function Task() { ... }`), object method definition
+//     (`{ Task() { ... } }`), or destructure (`{ Task } = ...`)
+//     followed by `Task(` on the same line will also match.
+//     Authors can suppress with `// fsm-lint:ignore` for legitimate
+//     occurrences.
 //       Anthropic SDK / clients: messages.create, completions.create,
 //         anthropic.messages, client.messages.
 //       Harness tool-shaped invocations: Task(, Agent(, Skill(,
@@ -289,10 +293,17 @@ export function lintFile(filePath, source) {
       inBlockComment = true;
     }
     // `inBlockComment` reflects the state AFTER this line; the
-    // current line is comment if it WAS in a block, opened one, or
-    // closes one.
+    // current line is fully comment if it WAS in a block (started on
+    // a prior line and continues / closes here) or opens a new
+    // multi-line block. A SINGLE-LINE block comment that closes on
+    // the same line (`/* x */ readFileSync("x.fsm.yaml")`) is NOT
+    // wholly comment; real code can follow `*/` on the same line and
+    // must still be analysed by the per-line rules.
+    const isSingleLineBlockComment =
+      trimmedForBc.startsWith("/*") && trimmedForBc.includes("*/");
     const lineIsBlockComment =
-      inBlockComment || isBlockClosingLine || trimmedForBc.startsWith("/*");
+      (inBlockComment || isBlockClosingLine || trimmedForBc.startsWith("/*")) &&
+      !isSingleLineBlockComment;
     // The fsm-lint:ignore marker is intentionally per-line for the
     // single-line rules (no-direct-fsm-yaml-read and
     // no-orchestrator-llm-call); previous-line suppression is
