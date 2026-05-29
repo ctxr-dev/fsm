@@ -170,6 +170,14 @@ function validateLoop(loop, prefix, errors) {
           `${prefix}.iteration_outputs_dir must not contain backslashes; use forward slashes`,
         );
       }
+      // Reject Windows drive-letter shapes (e.g. "C:/abs") and any
+      // ":" anywhere. `path.win32.join("workers", "C:/abs")` becomes
+      // an absolute path even though the leading char is not "/".
+      if (raw.includes(":")) {
+        errors.push(
+          `${prefix}.iteration_outputs_dir must not contain ":" (Windows drive letters or colon segments could escape workers/)`,
+        );
+      }
       const trimmed = raw.replace(/^\/+/, "").replace(/\/+$/, "");
       const parts = trimmed.split("/");
       if (
@@ -321,10 +329,13 @@ export function validateFsmStatic(doc, { fsmFilePath } = {}) {
       }
     }
   }
-  // Best-effort input/output flow check: each state's worker (or loop.worker)
-  // declares inputs[] that must be produced by some upstream state's outputs[].
-  // We do this as a name match — preconditions are free-form English so
-  // not analysed here; inputs are precise names.
+  // Best-effort input/output flow check: each state's worker (or
+  // loop.worker) declares inputs[] that must appear as the name of an
+  // output[] anywhere in the FSM. This is a name-set check, NOT a
+  // topological-upstream proof: a state that declares its inputs as
+  // outputs only produced downstream of itself will pass this gate
+  // and only fail at runtime in fsm-commit. Upstream-only checking is
+  // a future enhancement (would require a real DAG analysis).
   const allOutputs = new Set();
   for (const state of fsm.states) {
     for (const o of state?.outputs ?? []) {

@@ -144,13 +144,20 @@ export function sanitiseLoopOutputsDirSegment(raw, fallbackStateId) {
       `sanitiseLoopOutputsDirSegment: iteration_outputs_dir "${raw}" must not contain backslashes (use forward slashes)`,
     );
   }
-  // Reject leading "/" explicitly rather than silently normalising it
-  // away. The schema layer rejects absolute paths at FSM load time, and
-  // the runtime helper should match (otherwise "/abs/path" would walk
-  // through as "abs/path" and disagree with the schema diagnostic).
+  // Reject leading "/" AND Windows drive-letter / colon-bearing
+  // segments. `path.join("workers", "C:/abs")` produces "workers/C:/abs"
+  // on POSIX but ends up absolute under path.win32.join, so the guard
+  // has to cover both. Disallow any ":" anywhere in the segment to keep
+  // the rule portable (a legitimate ":" inside a directory name is
+  // exotic and not worth supporting at the cost of the safety bound).
   if (candidate.startsWith("/")) {
     throw new Error(
       `sanitiseLoopOutputsDirSegment: iteration_outputs_dir "${raw}" must be relative; absolute paths are not allowed`,
+    );
+  }
+  if (/^[A-Za-z]:[\\/]/.test(candidate) || candidate.includes(":")) {
+    throw new Error(
+      `sanitiseLoopOutputsDirSegment: iteration_outputs_dir "${raw}" must not contain ":" (Windows drive letters or colon segments could escape workers/)`,
     );
   }
   const trimmed = candidate.replace(/\/+$/, "");
