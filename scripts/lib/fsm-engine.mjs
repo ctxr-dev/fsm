@@ -87,7 +87,18 @@ export function runEnv(runId, opts = {}) {
 // Includes the state spec + resolved inputs + transitions + the worker
 // response_schema if present. The orchestrator never reads the FSM YAML;
 // the brief is the only contract.
-export function buildBrief({ doc, state, env, runId }) {
+//
+// For loop states (state.loop present), the brief carries a `loop` section
+// with the current iteration counter and the outputs_path the worker must
+// write to. The iteration counter is derived from existing "iter" trace
+// records for this state in this run; pass runId+opts so we can read the
+// trace from disk. Callers that don't supply opts (no storageRoot) get
+// iteration_n = 1 as a safe default for non-resume flows where the count
+// is already known by the caller.
+export function buildBrief({ doc, state, env, runId, opts = {} }) {
+  if (state.loop) {
+    return buildLoopBrief({ doc, state, env, runId, opts });
+  }
   const brief = {
     run_id: runId,
     fsm_id: doc.fsm.id,
@@ -99,6 +110,7 @@ export function buildBrief({ doc, state, env, runId }) {
     post_validations: state.post_validations ?? [],
     transitions: (state.transitions ?? []).map((t) => ({ to: t.to, when: t.when })),
     has_worker: Boolean(state.worker),
+    has_loop: false,
   };
   if (state.worker) {
     brief.worker = {
@@ -109,6 +121,83 @@ export function buildBrief({ doc, state, env, runId }) {
     };
   }
   return brief;
+}
+
+// buildLoopBrief composes the per-iteration brief for a loop state. The
+// orchestrator dispatches the worker with `worker.prompt_template` and is
+// expected to write the JSON output to `loop.outputs_path`. Subsequent
+// fsm-commit + fsm-next calls advance the iteration counter or terminate.
+export function buildLoopBrief({ doc, state, env, runId, opts = {} }) {
+  const loop = state.loop;
+  const max = loop.max_iterations ?? 30;
+  const dirSegment = (loop.iteration_outputs_dir ?? `${state.id}-iters/`).replace(/^\/+/, "").replace(/\/+$/, "");
+  const iterationN = countLoopIterations(runId, state.id, opts) + 1;
+  const outputsPath = `workers/${dirSegment}/iter-${iterationN}.json`;
+  const fakeStateForInputs = { worker: { inputs: loop.worker.inputs ?? [] } };
+  return {
+    run_id: runId,
+    fsm_id: doc.fsm.id,
+    state: state.id,
+    purpose: state.purpose,
+    preconditions: state.preconditions ?? [],
+    inputs: resolveInputs(fakeStateForInputs, env),
+    outputs_expected: state.outputs ?? [],
+    post_validations: state.post_validations ?? [],
+    transitions: (state.transitions ?? []).map((t) => ({ to: t.to, when: t.when })),
+    has_worker: true,
+    has_loop: true,
+    loop: {
+      iteration_n: iterationN,
+      max_iterations: max,
+      done_field: loop.done_field,
+      outputs_path: outputsPath,
+    },
+    worker: {
+      role: loop.worker.role,
+      prompt_template: loop.worker.prompt_template,
+      inputs: loop.worker.inputs ?? [],
+      response_schema: loop.worker.response_schema,
+    },
+  };
+}
+
+// countLoopIterations returns the number of "iter" phase trace records
+// recorded so far for the given state. Returns 0 when the run dir has no
+// trace yet. Tolerant: callers in unit-test contexts without opts get 0.
+export function countLoopIterations(runId, stateId, opts = {}) {
+  try {
+    const trace = readTrace(runId, opts);
+    let n = 0;
+    for (const record of trace) {
+      const payload = record.data ?? record;
+      if (payload?.phase === "iter" && payload?.state === stateId) {
+        n++;
+      }
+    }
+    return n;
+  } catch {
+    return 0;
+  }
+}
+
+// runLoopDecision decides whether a loop state should terminate given the
+// just-committed iteration output. Returns:
+//   { isLoop: false } for non-loop states.
+//   { isLoop: true, terminate: true, reason: "done_field" | "max_iterations", iteration_n }
+//   { isLoop: true, terminate: false, iteration_n }
+export function runLoopDecision(state, outputs, iterationN) {
+  const loop = state.loop;
+  if (!loop) return { isLoop: false };
+  const max = loop.max_iterations ?? 30;
+  const doneField = loop.done_field;
+  const done = Boolean(outputs?.[doneField]);
+  if (done) {
+    return { isLoop: true, terminate: true, reason: "done_field", iteration_n: iterationN };
+  }
+  if (iterationN >= max) {
+    return { isLoop: true, terminate: true, reason: "max_iterations", iteration_n: iterationN };
+  }
+  return { isLoop: true, terminate: false, iteration_n: iterationN };
 }
 
 function resolveInputs(state, env) {
@@ -198,12 +287,14 @@ export function runPostValidations(state) {
 
 // validateOutputs runs the worker.response_schema (if any) over the
 // supplied payload. Returns { valid, errors[] }. Inline states (no worker)
-// skip schema validation and return valid=true.
+// skip schema validation and return valid=true. For loop states the
+// schema lives at state.loop.worker.response_schema.
 export function validateOutputs(state, outputs) {
-  if (!state.worker?.response_schema) {
+  const schema = state.loop?.worker?.response_schema ?? state.worker?.response_schema;
+  if (!schema) {
     return { valid: true, errors: [] };
   }
-  return validateWorkerResponse(state.worker.response_schema, outputs);
+  return validateWorkerResponse(schema, outputs);
 }
 
 // initialiseManifest writes the very first manifest.json for a new run.

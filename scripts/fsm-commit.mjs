@@ -18,6 +18,7 @@ import { readFileSync } from "node:fs";
 
 import { emitJson } from "./lib/emit.mjs";
 import {
+  appendTraceFile,
   readLock,
   readManifest,
   releaseLock,
@@ -25,9 +26,11 @@ import {
 } from "./lib/fsm-storage.mjs";
 import {
   buildBrief,
+  countLoopIterations,
   loadFsm,
   resolveTransition,
   runEnv,
+  runLoopDecision,
   runPostValidations,
   stateById,
   updateManifest,
@@ -36,6 +39,7 @@ import {
   writeExitTrace,
   writeFaultTrace,
 } from "./lib/fsm-engine.mjs";
+import { aggregateLoopOutputs } from "./lib/fsm-aggregator.mjs";
 import { resolveSettings } from "./lib/fsm-config.mjs";
 
 function parseArgs(argv) {
@@ -153,10 +157,56 @@ if (!validationResult.valid) {
   process.exit(1);
 }
 
+// Loop-state branch: write the iter trace and either re-emit the next
+// loop brief (continue) or aggregate + fall through to the regular
+// exit-trace + transition path (terminate).
+let outputsForFlow = parsed.outputs;
+if (state.loop) {
+  const iterationN =
+    countLoopIterations(parsed.runId, state.id, { storageRoot: settings.storageRoot }) + 1;
+  appendTraceFile(
+    parsed.runId,
+    {
+      phase: "iter",
+      state: state.id,
+      data: { iteration_n: iterationN, outputs: parsed.outputs },
+    },
+    { storageRoot: settings.storageRoot },
+  );
+  const decision = runLoopDecision(state, parsed.outputs, iterationN);
+  if (!decision.terminate) {
+    const envSoFar = runEnv(parsed.runId, { storageRoot: settings.storageRoot });
+    const continueBrief = buildBrief({
+      doc: fsm.doc,
+      state,
+      env: envSoFar,
+      runId: parsed.runId,
+      opts: { storageRoot: settings.storageRoot },
+    });
+    emit({
+      ok: true,
+      loop_continued: true,
+      ...continueBrief,
+    });
+    process.exit(0);
+  }
+  // Terminating: aggregate iter outputs into one canonical record and use
+  // that as the loop state's outputs for the rest of the commit flow.
+  const runDir = runDirPath(parsed.runId, { storageRoot: settings.storageRoot });
+  const agg = aggregateLoopOutputs(runDir, state, { mergeField: "findings" });
+  outputsForFlow = {
+    [`aggregated_${state.id}`]: agg.aggregated_path,
+    iteration_meta_path: agg.iteration_meta_path,
+    total_iterations: agg.iteration_count,
+    merged_length: agg.merged_length,
+    terminated_by: decision.reason,
+  };
+}
+
 const postValidations = runPostValidations(state);
 
 const env = runEnv(parsed.runId, { storageRoot: settings.storageRoot });
-const envWithCommit = { ...env, ...parsed.outputs };
+const envWithCommit = { ...env, ...outputsForFlow };
 const { transition, evaluations } = resolveTransition(state, envWithCommit, {
   judgementPick: parsed.judgementPick,
 });
@@ -165,7 +215,7 @@ writeExitTrace(
   parsed.runId,
   {
     state,
-    outputs: parsed.outputs,
+    outputs: outputsForFlow,
     postValidations: postValidations.results,
     transitionEvals: evaluations,
     chosenTransition: transition?.to ?? null,
@@ -245,6 +295,12 @@ updateManifest(
   },
   { storageRoot: settings.storageRoot },
 );
-const brief = buildBrief({ doc: fsm.doc, state: nextState, env: envWithCommit, runId: parsed.runId });
+const brief = buildBrief({
+  doc: fsm.doc,
+  state: nextState,
+  env: envWithCommit,
+  runId: parsed.runId,
+  opts: { storageRoot: settings.storageRoot },
+});
 emit({ ok: true, advanced_from: state.id, ...brief });
 process.exit(0);

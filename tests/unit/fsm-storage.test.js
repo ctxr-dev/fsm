@@ -284,6 +284,22 @@ test("appendTraceFile: rejects invalid phase / empty state", () => {
   }
 });
 
+test("appendTraceFile: accepts the iter phase for loop iterations", () => {
+  const store = tmpStore();
+  const runId = "20260426-143045-1234567";
+  try {
+    const result = appendTraceFile(
+      runId,
+      { phase: "iter", state: "explore_loop", data: { iteration_n: 1, outputs: { done: false } } },
+      { storageRoot: store },
+    );
+    assert.equal(result.sequence, 1);
+    assert.match(result.fileName, /^0001-iter-explore_loop\.yaml$/);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
 // ─── listRecentRuns ────────────────────────────────────────────────────
 
 test("listRecentRuns: walks date-sharded folders and returns matching manifests", () => {

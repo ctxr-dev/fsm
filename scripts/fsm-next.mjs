@@ -141,7 +141,13 @@ if (parsed.newRun) {
     { current_state: entryState.id, next_state: null },
     { storageRoot: settings.storageRoot },
   );
-  const brief = buildBrief({ doc: fsm.doc, state: entryState, env, runId });
+  const brief = buildBrief({
+    doc: fsm.doc,
+    state: entryState,
+    env,
+    runId,
+    opts: { storageRoot: settings.storageRoot },
+  });
   emit({ ok: true, ...brief });
   process.exit(0);
 }
@@ -181,6 +187,12 @@ if (!lock.acquired) {
 const env = runEnv(runId, { storageRoot: settings.storageRoot });
 const stateId = manifest.current_state ?? fsm.doc.fsm.entry;
 const state = stateById(fsm.doc, stateId);
-const brief = buildBrief({ doc: fsm.doc, state, env, runId });
+const brief = buildBrief({
+  doc: fsm.doc,
+  state,
+  env,
+  runId,
+  opts: { storageRoot: settings.storageRoot },
+});
 emit({ ok: true, resumed: true, ...brief });
 process.exit(0);
