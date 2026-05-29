@@ -114,6 +114,16 @@ npm test
 
 The test suite covers the storage layer, predicate DSL, schema validators, static FSM validation, and the CLI runtime end-to-end.
 
+## Releasing
+
+Publishing to npm is **always manual** ([Principle 2: manual publish, sibling linking during dev](https://github.com/ctxr-dev/common-dev-principles)). CI runs lint, validate, and tests on every PR and main push; `tag-on-main.yml` auto-creates the matching `v<version>` tag when `package.json` `version` changes on `main`; but nothing publishes to npm without an explicit operator dispatch. To cut a release, dispatch `publish.yml` from the Actions UI on `main` with the desired `version_bump` (`patch` / `minor` / `major`) and `dry_run` toggle (default `true` runs `npm publish --dry-run` so the tarball can be inspected first):
+
+```bash
+gh workflow run publish.yml --ref main -f version_bump=patch -f dry_run=true
+```
+
+After `dry_run=false` succeeds, optionally dispatch `release.yml` to draft or publish GitHub release notes for the new tag.
+
 ## License
 
 MIT.
