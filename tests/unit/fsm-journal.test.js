@@ -17,6 +17,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { symlinkSync } from "node:fs";
+
 import {
   appendTraceFile,
   buildRunId,
@@ -413,6 +415,102 @@ test("withJournal: rejects fn returning a manual Promise", () => {
     );
   } finally {
     rmSync(store, { recursive: true, force: true });
+  }
+});
+
+// ─── appendTraceFile in-transaction return shape ────────────────────────
+
+test("appendTraceFile (transaction): returned path points at the staged file, final_path at its destination", () => {
+  const store = tmpStore();
+  try {
+    const { runId, runDir, opts } = makeRun(store);
+    let recorded;
+    withJournal(runDir, (txn) => {
+      recorded = appendTraceFile(
+        runId,
+        { phase: "exit", state: "a", data: { outputs: {} } },
+        { ...opts, transaction: txn },
+      );
+      // While the transaction is open, the file lives at staged path.
+      assert.equal(recorded.staged, true);
+      assert.ok(existsSync(recorded.path), "staged file should exist on disk");
+      assert.equal(existsSync(recorded.final_path), false, "final not in place yet");
+      assert.notEqual(recorded.path, recorded.final_path);
+    });
+    // After the journal finalises, the final path exists and the
+    // staged path is gone.
+    assert.equal(existsSync(recorded.path), false);
+    assert.ok(existsSync(recorded.final_path));
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+// ─── symlink-escape guards ──────────────────────────────────────────────
+
+test("withJournal: refuses to rename into a symlinked subdir that escapes runDir", () => {
+  const store = tmpStore();
+  // The escape target lives OUTSIDE the storage root so a successful
+  // rename would land bytes in `escape/`. With the guard, the rename is
+  // refused and the journal stays on disk.
+  const escapeRoot = mkdtempSync(join(tmpdir(), "fsm-journal-escape-"));
+  try {
+    const { runId, runDir, opts } = makeRun(store);
+    // Replace runDir/workers with a symlink pointing outside the run
+    // dir BEFORE the journal finalises.
+    rmSync(join(runDir, "workers"), { recursive: true, force: true });
+    mkdirSync(join(escapeRoot, "out"), { recursive: true });
+    symlinkSync(join(escapeRoot, "out"), join(runDir, "workers"));
+    assert.throws(
+      () =>
+        withJournal(runDir, (txn) => {
+          const stagedPath = txn.stage("workers/payload.json");
+          writeFileSync(stagedPath, "{}");
+          txn.addStaged("workers/payload.json", stagedPath);
+        }),
+      /resolves to .* which is outside/,
+    );
+    // The escape target should be empty (rename refused).
+    assert.deepEqual(readdirSync(join(escapeRoot, "out")), []);
+    // Journal stays on disk for inspection.
+    assert.equal(journalState(runDir).hasJournal, true);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+    rmSync(escapeRoot, { recursive: true, force: true });
+  }
+});
+
+test("replayJournal: refuses to rename into a symlinked subdir that escapes runDir", () => {
+  const store = tmpStore();
+  const escapeRoot = mkdtempSync(join(tmpdir(), "fsm-journal-escape-"));
+  try {
+    const { runId, runDir, opts } = makeRun(store);
+    // Plant a ready_to_finalise journal with one staged file in
+    // workers/. Then replace runDir/workers with a symlink to outside
+    // before calling replay.
+    const txnId = "symlink-escape-001";
+    const txnDir = join(runDir, ".journal", txnId);
+    mkdirSync(join(txnDir, "workers"), { recursive: true });
+    writeFileSync(join(txnDir, "workers", "payload.json"), "{}");
+    writeFileSync(
+      join(txnDir, "journal.json"),
+      JSON.stringify({
+        txn_id: txnId,
+        status: "ready_to_finalise",
+        staged_files: [{ relPath: "workers/payload.json" }],
+      }),
+    );
+    rmSync(join(runDir, "workers"), { recursive: true, force: true });
+    mkdirSync(join(escapeRoot, "out"), { recursive: true });
+    symlinkSync(join(escapeRoot, "out"), join(runDir, "workers"));
+    assert.throws(
+      () => replayJournal(runDir, txnId),
+      /resolves to .* which is outside/,
+    );
+    assert.deepEqual(readdirSync(join(escapeRoot, "out")), []);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+    rmSync(escapeRoot, { recursive: true, force: true });
   }
 });
 

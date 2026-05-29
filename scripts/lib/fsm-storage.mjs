@@ -23,6 +23,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmdirSync,
   rmSync,
@@ -32,7 +33,7 @@ import {
   fsyncSync,
   statSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep as pathSep } from "node:path";
 import { stringify as stringifyYaml, parse as parseYaml } from "yaml";
 
 const LOCK_TTL_MS_DEFAULT = 60 * 60 * 1000; // 1 hour
@@ -311,7 +312,17 @@ export function appendTraceFile(runId, { phase, state, data }, opts = {}) {
     const stagedPath = txn.stage(relPath);
     atomicWriteYaml(stagedPath, payload(seq));
     txn.addStaged(relPath, stagedPath);
-    return { sequence: seq, fileName, path: join(txn.runDir, relPath) };
+    // `path` always points at the bytes on disk right now: inside a
+    // transaction the file lives at the staged path until withJournal
+    // finalises. `final_path` is what it will become; `staged` flags
+    // the transition state so a caller can branch if needed.
+    return {
+      sequence: seq,
+      fileName,
+      path: stagedPath,
+      final_path: join(txn.runDir, relPath),
+      staged: true,
+    };
   }
   const dir = ensureRunDir(runId, opts);
   const seq = nextTraceSequence(runId, opts);
@@ -395,6 +406,35 @@ export function journalRoot(runDir) {
 // from a journal manifest during replayJournal — a crafted or corrupted
 // journal.json must not be able to rename staged files outside the run
 // directory.
+// assertWithin verifies that `targetDir`, after symlink resolution,
+// lies inside `parentDir`. Catches the symlink-escape class:
+// `assertSafeJournalRelPath` validates relPath segments string-side,
+// but a crafted journal directory containing a symlinked subdir (e.g.
+// `<txnDir>/fsm-trace -> /etc`) could still make `join(txnDir, relPath)`
+// resolve outside the journal root and let renameSync touch arbitrary
+// paths. We resolve real paths just before the rename and refuse if
+// the target escapes its parent.
+//
+// targetDir is created with mkdirSync(..., { recursive: true }) by the
+// caller before this check, so realpathSync will succeed on it.
+// parentDir is always either runDir or txnDir; both are known to exist
+// at this point.
+function assertWithin(targetDir, parentDir, context) {
+  const realTarget = realpathSync(targetDir);
+  const realParent = realpathSync(parentDir);
+  // Equal real paths are fine (target IS parent). Otherwise, the real
+  // target must start with `realParent + path.sep` so a sibling like
+  // "/runs/abc" does not satisfy a containment check for "/runs/ab".
+  if (
+    realTarget !== realParent &&
+    !realTarget.startsWith(realParent + pathSep)
+  ) {
+    throw new Error(
+      `${context}: refusing to operate on path "${targetDir}" — resolves to "${realTarget}" which is outside "${realParent}"`,
+    );
+  }
+}
+
 // assertSafeTxnId rejects any txnId that contains path separators,
 // traversal segments, colons, or backslashes, so a caller-supplied
 // value can never escape <journalRoot>. discardJournal and
@@ -566,7 +606,15 @@ export function replayJournal(runDir, txnId) {
       finalised.push({ relPath: entry.relPath, already: true });
       continue;
     }
+    // Symlink-escape guard: relPath segments are valid strings, but a
+    // symlinked subdir along the resolved path (e.g.
+    // `<txnDir>/fsm-trace -> /etc`) could still make join() resolve
+    // outside the journal root or run root. Verify the real path of
+    // both the staged source dir AND the final destination dir stays
+    // inside their respective parents before any rename.
+    assertWithin(dirname(stagedPath), txnDir, "replayJournal (stagedPath)");
     mkdirSync(dirname(finalPath), { recursive: true });
+    assertWithin(dirname(finalPath), runDir, "replayJournal (finalPath)");
     renameSync(stagedPath, finalPath);
     finalised.push({ relPath: entry.relPath, already: false });
   }
@@ -702,19 +750,29 @@ export function withJournal(runDir, fn) {
     10,
   );
   if (Number.isFinite(pauseMs) && pauseMs > 0) {
-    // Synchronous busy wait so SIGKILL during this window simulates a
-    // crash between "ready_to_finalise" and the rename loop. We do not
-    // use Atomics.wait/setTimeout because the integration test needs the
-    // pause to be observable as a wall-clock window.
-    const deadline = Date.now() + pauseMs;
-    while (Date.now() < deadline) {
-      // intentional busy wait
-    }
+    // Synchronous block so a SIGKILL during this window simulates a
+    // crash between "ready_to_finalise" and the rename loop. Uses
+    // Atomics.wait on a private SharedArrayBuffer for a real sleep
+    // (no CPU burn) instead of `while (Date.now() < deadline)`, which
+    // pegged a core for the duration whenever the env var was set —
+    // including accidentally in prod or CI. The wait condition is
+    // permanently false (we never store to view[0]) so the call
+    // returns "timed-out" after pauseMs every time.
+    const sab = new SharedArrayBuffer(4);
+    const view = new Int32Array(sab);
+    Atomics.wait(view, 0, 0, pauseMs);
   }
 
   for (const entry of stagedFiles) {
     const finalPath = join(runDir, entry.relPath);
     mkdirSync(dirname(finalPath), { recursive: true });
+    // Symlink-escape guard: if a subdir under runDir was replaced by a
+    // symlink between fn() returning and the rename loop (or by a
+    // malicious actor with write access), renameSync could write
+    // outside the run directory. Verify the resolved real path of
+    // dirname(finalPath) stays within realpathSync(runDir) before
+    // moving the staged file into place.
+    assertWithin(dirname(finalPath), runDir, "withJournal (finalPath)");
     renameSync(entry.stagedPath, finalPath);
   }
   rmSync(txnDir, { recursive: true, force: true });
