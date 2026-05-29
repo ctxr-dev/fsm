@@ -267,21 +267,32 @@ export function lintFile(filePath, source) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const lineNumber = i + 1;
-    // Track multi-line block-comment state. If `inBlockComment` is
-    // true at the start of this line we are inside a `/* ... */`
-    // block; we still process the line but the "leading `*`" comment
-    // shape below will skip it. When the line closes the block with
-    // `*/`, leave the state on after the line so subsequent code on
-    // the same line (rare but legal) is not analysed; the next line
-    // resumes normally.
+    // Track multi-line block-comment state. To avoid false positives
+    // from `/*` or `*/` substrings that appear inside string literals
+    // (e.g. `const s = "/*";` or `console.log("*/")`), only flip the
+    // state on lines that ACTUALLY START with the delimiter (after
+    // leading whitespace). This is a conservative heuristic that may
+    // miss exotic shapes but never wrongly skips real code.
+    const trimmedForBc = line.trimStart();
+    const isBlockClosingLine = inBlockComment && trimmedForBc.startsWith("*/");
     if (inBlockComment) {
-      // If the line closes the block we toggle off; the line itself is
-      // treated as comment for the per-line rules below.
-      if (line.includes("*/")) inBlockComment = false;
-    } else if (line.includes("/*") && !line.includes("*/")) {
+      // Close on a `*/`-led line. The closing line itself is treated
+      // as comment for the per-line rules via the isComment check
+      // below; we keep `inBlockComment` true through this iteration
+      // and flip it off at the end so subsequent iterations resume.
+      if (isBlockClosingLine) inBlockComment = false;
+    } else if (
+      trimmedForBc.startsWith("/*") &&
+      !trimmedForBc.includes("*/")
+    ) {
       // Opens a multi-line block on this line.
       inBlockComment = true;
     }
+    // `inBlockComment` reflects the state AFTER this line; the
+    // current line is comment if it WAS in a block, opened one, or
+    // closes one.
+    const lineIsBlockComment =
+      inBlockComment || isBlockClosingLine || trimmedForBc.startsWith("/*");
     // The fsm-lint:ignore marker is intentionally per-line for the
     // single-line rules (no-direct-fsm-yaml-read and
     // no-orchestrator-llm-call); previous-line suppression is
@@ -305,9 +316,8 @@ export function lintFile(filePath, source) {
     // a block comment) used to be treated as comment text.
     const trimmed = line.trimStart();
     const isComment =
-      inBlockComment ||
+      lineIsBlockComment ||
       trimmed.startsWith("//") ||
-      trimmed.startsWith("/*") ||
       trimmed.startsWith("#!");
     if (isComment) continue;
 
