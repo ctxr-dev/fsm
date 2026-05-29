@@ -101,6 +101,23 @@ if (!manifest) {
   process.exit(1);
 }
 
+// Resume is for runs that can legitimately be rewound: an `in_progress`
+// run the operator wants to pivot, a `paused` run waiting to be picked
+// back up, or a `faulted` run the operator wants to retry past the
+// fault. Refuse the other lifecycle states (`completed`, `abandoned`,
+// `superseded`, `stale`, anything else): rewinding them would silently
+// re-open a terminal record and lose the durable verdict.
+const RESUMABLE_STATUSES = new Set(["in_progress", "paused", "faulted"]);
+if (!RESUMABLE_STATUSES.has(manifest.status)) {
+  emit({
+    error: "run_not_resumable",
+    run_id: parsed.runId,
+    status: manifest.status,
+    resumable_statuses: [...RESUMABLE_STATUSES],
+  });
+  process.exit(1);
+}
+
 if (manifest.fsm_yaml_hash !== fsm.hash) {
   emit({
     error: "fsm_yaml_changed",
@@ -152,7 +169,16 @@ if (entriesForState.length === 0) {
   });
   process.exit(1);
 }
-const entryRecord = entriesForState[entriesForState.length - 1];
+// readTrace returns records sorted by filename TEXT, so once trace
+// sequences reach five digits (`10000-...`) `0009999-...` would sort
+// after `00010000-...` and the array's last element is no longer the
+// most recent entry. Pick the highest numeric sequence explicitly so
+// resume always prunes back to the latest entry trace for the state.
+const entryRecord = entriesForState.reduce((best, r) => {
+  const seq = Number.isFinite(r.data?.sequence) ? r.data.sequence : -Infinity;
+  const bestSeq = Number.isFinite(best.data?.sequence) ? best.data.sequence : -Infinity;
+  return seq > bestSeq ? r : best;
+}, entriesForState[0]);
 const entrySequence = entryRecord.data.sequence;
 
 // Release any prior lock regardless of holder, since resume is an explicit
