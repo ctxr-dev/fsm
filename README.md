@@ -114,6 +114,18 @@ npm test
 
 The test suite covers the storage layer, predicate DSL, schema validators, static FSM validation, and the CLI runtime end-to-end.
 
+## Releasing
+
+Publishing to npm is **always manual** ([Principle 2: manual publish, sibling linking during dev](https://github.com/ctxr-dev/common-dev-principles)). CI runs `npm run lint`, `npm test`, and an FSM-static-validation pass over any example YAMLs under `examples/` on every PR and main push; `tag-on-main.yml` auto-creates the matching `v<version>` tag when `package.json` `version` changes on `main`; but nothing publishes to npm without an explicit operator dispatch. To cut a release, dispatch `publish.yml` from the Actions UI on `main` with the desired `version_bump` (`patch` / `minor` / `major`) and `dry_run` toggle. The workflow runs `npm version <bump>` first (so the inspected tarball reflects the bumped version), then either `npm publish --dry-run` (when `dry_run=true`; the version bump is NOT committed/pushed in this case) or the real `npm publish` followed by an atomic branch + tag push (when `dry_run=false`):
+
+```bash
+gh workflow run publish.yml --ref main -f version_bump=patch -f dry_run=true
+```
+
+After `dry_run=false` succeeds, optionally dispatch `release.yml` to draft or publish GitHub release notes for the new tag.
+
+> **Operator setup.** `publish.yml` (both the `dry_run` step and the real publish) reads `NODE_AUTH_TOKEN` from the `NPM_TOKEN` repo secret. Configure the secret once under **Settings -> Secrets and variables -> Actions -> Repository secrets** before the first dispatch, otherwise the workflow will fail at `npm publish`.
+
 ## License
 
 MIT.

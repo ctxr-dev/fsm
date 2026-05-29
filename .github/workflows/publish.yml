@@ -1,0 +1,170 @@
+name: Publish to npm
+
+# Manual-only publish (Principle 2: manual publish, sibling linking
+# during dev). The operator dispatches this workflow from the Actions
+# UI when ready to release. There are NO push, tag, or schedule
+# triggers anywhere in this file; auto-publishing is intentionally
+# absent because it trades user control for convenience and is a
+# foot-gun for token compromise and unreviewed releases.
+#
+# Inputs:
+#   version_bump: patch | minor | major. The version is bumped on
+#     `main` via `npm version --no-git-tag-version --ignore-scripts`,
+#     committed, pushed back to `main`, and tagged `v<new-version>`.
+#   dry_run: when true (default), runs `npm publish --dry-run` and
+#     skips the real publish + version bump push. Lets the operator
+#     verify the tarball contents without spending a version number.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+      dry_run:
+        description: "Dry run (no npm publish, no version bump push)"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  id-token: write
+
+# Serialize publish dispatches so two concurrent runs can't race on
+# the same version bump or npm publish. A queued run picks up after
+# the earlier one finishes.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Refuse dispatch from non-main refs
+        # `workflow_dispatch` can be fired from the UI against any
+        # ref. Publishes always cut from main; refuse anything else
+        # loudly so the operator sees a FAILED run rather than a
+        # silently-skipped one.
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::publish.yml must be dispatched from main; got ${{ github.ref }}."
+          echo "::error::Switch the branch selector in the Actions UI to main and retry."
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Run checks
+        run: |
+          FAILED=0
+          for check in lint validate test; do
+            if node -e "process.exit((require('./package.json').scripts||{})['$check']?0:1)" 2>/dev/null; then
+              echo "::group::npm run $check"
+              if ! npm run "$check"; then
+                FAILED=1
+              fi
+              echo "::endgroup::"
+            else
+              echo "skipping $check (not declared in package.json)"
+            fi
+          done
+          exit $FAILED
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version
+        id: bump
+        run: |
+          set -euo pipefail
+          BEFORE=$(node -p "require('./package.json').version")
+          # --ignore-scripts: keep the bump bounded to version files
+          # only. None of the lifecycle scripts (preversion / version
+          # / postversion) are defined today, but a future addition
+          # would otherwise silently run in CI with write access.
+          npm version ${{ inputs.version_bump }} --no-git-tag-version --ignore-scripts
+          AFTER=$(node -p "require('./package.json').version")
+          if [ "$BEFORE" = "$AFTER" ]; then
+            echo "::error::npm version produced no change ($BEFORE == $AFTER)"
+            exit 1
+          fi
+          echo "before=${BEFORE}" >> "$GITHUB_OUTPUT"
+          echo "after=${AFTER}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${AFTER}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish (dry run)
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "::notice::dry_run=true; running 'npm publish --dry-run' and skipping version-bump push."
+          npm publish --access public --dry-run
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Skip publish if version already on npm (re-run recovery)
+        id: already_published
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          PKG="$(node -p "require('./package.json').name")"
+          AFTER="${{ steps.bump.outputs.after }}"
+          if npm view "${PKG}@${AFTER}" version >/dev/null 2>&1; then
+            echo "::notice::${PKG}@${AFTER} is already on npm; skipping publish step (re-run recovery)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npm
+        if: ${{ !inputs.dry_run && steps.already_published.outputs.skip != 'true' }}
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Commit, push, and tag the version bump
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          AFTER="${{ steps.bump.outputs.after }}"
+          TAG="${{ steps.bump.outputs.tag }}"
+          git add package.json
+          if [ -f package-lock.json ]; then
+            git add package-lock.json
+          fi
+          git commit -m "release: v${AFTER}"
+          git tag -a "${TAG}" -m "release ${TAG}"
+          # Push branch and tag atomically. Pushing them in two separate
+          # commands races with tag-on-main.yml, which is triggered by
+          # the branch push and creates the same v<version> tag from
+          # the package.json bump it just observed; if tag-on-main wins,
+          # this workflow's tag push fails (and the run is marked failed
+          # even though the publish would have succeeded). One push
+          # closes the window.
+          git push --atomic origin main "refs/tags/${TAG}"

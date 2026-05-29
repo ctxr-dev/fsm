@@ -1,0 +1,125 @@
+name: Release notes
+
+# Generate release notes for the current package.json version.
+# `workflow_dispatch`-only by design (Principle 2: manual publish,
+# sibling linking during dev). No publish step; this workflow only
+# composes notes and creates / updates a GitHub Release for the
+# current `v<version>` tag.
+#
+# Typical sequence:
+#   1. Operator dispatches `publish.yml` (bumps version, publishes
+#      to npm if not dry_run, pushes tag).
+#   2. Operator dispatches this workflow to draft / publish release
+#      notes for the new tag.
+#
+# This workflow does NOT bump the version, does NOT push to main,
+# and does NOT publish to npm. It only reads the current version
+# from `package.json` and operates on the matching `v<version>` tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      draft:
+        description: "Create as draft (true) or publish immediately (false)"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-notes
+  cancel-in-progress: false
+
+jobs:
+  notes:
+    name: Generate release notes for current package version
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Refuse non-main dispatches
+        # release.yml reads package.json from whatever ref it was
+        # dispatched against and then mutates the GitHub Release for the
+        # corresponding v<version> tag. Dispatching against a branch
+        # that happens to share the version string would silently
+        # overwrite the wrong release's notes; lock the workflow to
+        # main, matching the same guard publish.yml carries.
+        if: ${{ github.ref != 'refs/heads/main' }}
+        run: |
+          echo "::error::release.yml only supports dispatching against refs/heads/main; got ${{ github.ref }}."
+          echo "::error::Re-dispatch with ref=main, or update the workflow if you intend to release from a different branch."
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Read current package.json version
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag exists
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          if ! git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} does not exist locally. Dispatch publish.yml first (with dry_run=false) or push the tag manually."
+            exit 1
+          fi
+
+      - name: Generate or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          DRAFT_FLAG=""
+          if [ "${{ inputs.draft }}" = "true" ]; then
+            DRAFT_FLAG="--draft"
+          fi
+
+          # If a release already exists for this tag, regenerate notes
+          # by computing them via the GitHub API and updating the body
+          # in place. `gh release edit` has no --generate-notes flag, so
+          # `gh api repos/.../releases/generate-notes` is the canonical
+          # way to recompute the body without deleting the release
+          # (which would lose any attached assets and the original
+          # publish timestamp).
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} exists; regenerating notes (draft=${{ inputs.draft }})."
+            PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")"
+            NOTES="$(gh api repos/${{ github.repository }}/releases/generate-notes \
+              -f tag_name="${TAG}" \
+              ${PREV:+-f previous_tag_name="${PREV}"} \
+              --jq .body)"
+            printf '%s\n' "${NOTES}" > /tmp/release-notes.md
+            # Honor inputs.draft on the re-run path too: gh release edit
+            # accepts --draft to (re)set draft status and --draft=false
+            # to publish a previously drafted release. Without this, the
+            # input description ("draft the release") was misleading on
+            # re-runs because gh release edit silently kept whatever
+            # state the release already had.
+            gh release edit "${TAG}" \
+              --notes-file /tmp/release-notes.md \
+              --verify-tag \
+              --draft=${{ inputs.draft }}
+            gh release view "${TAG}"
+          else
+            echo "Creating release ${TAG} ${DRAFT_FLAG:-(published)}."
+            gh release create "${TAG}" \
+              --title "${TAG}" \
+              --generate-notes \
+              --verify-tag \
+              ${DRAFT_FLAG}
+          fi
