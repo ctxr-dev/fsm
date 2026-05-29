@@ -489,27 +489,38 @@ if (isDirectInvocation()) {
   // consumer that closes early (e.g. `fsm-lint-runner ... | head`)
   // Node would otherwise crash with `Error: write EPIPE`. The
   // diagnostics are advisory; a downstream reader closing the pipe
-  // mid-stream is a graceful exit, not a failure.
+  // mid-stream is a graceful exit, but it must NOT mask a non-zero
+  // verdict, so we forward process.exitCode (which the
+  // computeExitCode-then-emit pattern below has already set) rather
+  // than always exiting 0.
   process.stdout.on("error", (err) => {
-    if (err.code === "EPIPE") process.exit(0);
+    if (err.code === "EPIPE") process.exit(process.exitCode ?? 0);
     throw err;
   });
   process.stderr.on("error", (err) => {
-    if (err.code === "EPIPE") process.exit(0);
+    if (err.code === "EPIPE") process.exit(process.exitCode ?? 0);
     throw err;
   });
   const args = process.argv.slice(2);
   if (args.includes("--help") || args.includes("-h")) {
-    process.stdout.write(USAGE);
     process.exitCode = 0;
+    process.stdout.write(USAGE);
   } else if (args.length === 0) {
+    process.exitCode = 2;
     process.stderr.write(
       "fsm-lint-runner: at least one runner file path is required\n",
     );
     process.stderr.write(USAGE);
-    process.exitCode = 2;
   } else {
     const { diagnostics, missing, unreadable } = lintPaths(args);
+
+    // Compute and stamp process.exitCode BEFORE any write. If a
+    // downstream pipe closes mid-write (EPIPE) the EPIPE handler reads
+    // the already-set exitCode, so a verdict computed as "failed"
+    // does not silently become success.
+    const failed =
+      diagnostics.length > 0 || missing.length > 0 || unreadable.length > 0;
+    process.exitCode = failed ? 1 : 0;
 
     for (const m of missing) {
       process.stderr.write(`fsm-lint-runner: file not found: ${m}\n`);
@@ -523,9 +534,5 @@ if (isDirectInvocation()) {
     for (const d of diagnostics) {
       process.stdout.write(`${formatDiagnostic(d)}\n`);
     }
-
-    const failed =
-      diagnostics.length > 0 || missing.length > 0 || unreadable.length > 0;
-    process.exitCode = failed ? 1 : 0;
   }
 }
