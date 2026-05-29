@@ -71,7 +71,7 @@ import { readFileSync, existsSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const USAGE = `Usage: fsm-lint-runner [--help] <runner-file> [<runner-file> ...]
+const USAGE = `Usage: fsm-lint-runner [--help|-h] <runner-file> [<runner-file> ...]
 
 Advisory lint for orchestrator-shell skill runners. Reports any of:
   - direct reads of *.fsm.yaml from the runner
@@ -164,8 +164,16 @@ const SCHEMA_MARKERS = [
 // `a /b/g` vs `a / b / g`), but for the purpose of a lint heuristic
 // this set covers the common cases without ever mis-treating a real
 // `//` line comment as inside a regex.
+// `}` is intentionally NOT included: closing braces can legally
+// precede a division operator (e.g. `function f(){ return 1 } / 2 /
+// g`), and including them here would mis-treat the next `/` as
+// opening a regex literal, hiding a real `// fsm-lint:ignore` later
+// on the same line. The trade-off is that a real regex literal that
+// immediately follows a `}` (rare in idiomatic code) is not tracked;
+// that produces at worst a duplicate `//` match downstream, which is
+// less harmful than silent suppression failure.
 const REGEX_PREFIX_OPS = new Set([
-  "", "(", "[", "{", "}", ",", ";", ":", "?", "!", "&", "|", "=",
+  "", "(", "[", "{", ",", ";", ":", "?", "!", "&", "|", "=",
   "+", "-", "*", "/", "^", "~", "%", "<", ">",
 ]);
 
@@ -288,10 +296,12 @@ export function lintFile(filePath, source) {
     const trimmedForBc = line.trimStart();
     const isBlockClosingLine = inBlockComment && trimmedForBc.startsWith("*/");
     if (inBlockComment) {
-      // Close on a `*/`-led line. The closing line itself is treated
-      // as comment for the per-line rules via the isComment check
-      // below; we keep `inBlockComment` true through this iteration
-      // and flip it off at the end so subsequent iterations resume.
+      // Close on a `*/`-led line. We flip `inBlockComment` off
+      // immediately; the closing line is still treated as comment for
+      // the per-line rules via `lineIsBlockComment` below (which
+      // captures `isBlockClosingLine` independently), and trailing
+      // executable code after `*/` on the same line is analysed by
+      // the prefix-stripping path below.
       if (isBlockClosingLine) inBlockComment = false;
     } else if (
       trimmedForBc.startsWith("/*") &&
