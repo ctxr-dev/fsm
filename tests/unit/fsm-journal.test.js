@@ -12,12 +12,11 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
-import { symlinkSync } from "node:fs";
 
 import {
   appendTraceFile,
@@ -621,6 +620,67 @@ test("withJournal: refuses to rename into a symlinked subdir that escapes runDir
     assert.deepEqual(readdirSync(join(escapeRoot, "out")), []);
     // Journal stays on disk for inspection.
     assert.equal(journalState(runDir).hasJournal, true);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+    rmSync(escapeRoot, { recursive: true, force: true });
+  }
+});
+
+// ─── `.journal` root symlink rejection (containment) ────────────────────
+
+test("journalState: refuses when .journal itself is a symlink escaping runDir", () => {
+  const store = tmpStore();
+  const escapeRoot = mkdtempSync(join(tmpdir(), "fsm-journal-symlinked-root-"));
+  try {
+    const { runDir } = makeRun(store);
+    mkdirSync(join(escapeRoot, "fake-journal-root"), { recursive: true });
+    symlinkSync(join(escapeRoot, "fake-journal-root"), join(runDir, ".journal"));
+    assert.throws(() => journalState(runDir), /resolves to .* which is outside/);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+    rmSync(escapeRoot, { recursive: true, force: true });
+  }
+});
+
+test("discardJournal: refuses when .journal itself is a symlink escaping runDir", () => {
+  const store = tmpStore();
+  const escapeRoot = mkdtempSync(join(tmpdir(), "fsm-journal-symlinked-root-"));
+  try {
+    const { runDir } = makeRun(store);
+    mkdirSync(join(escapeRoot, "fake-journal-root", "some-txn"), { recursive: true });
+    symlinkSync(join(escapeRoot, "fake-journal-root"), join(runDir, ".journal"));
+    assert.throws(
+      () => discardJournal(runDir, "some-txn"),
+      /resolves to .* which is outside/,
+    );
+    // The escape target must still exist (no rmSync ran on it).
+    assert.ok(existsSync(join(escapeRoot, "fake-journal-root", "some-txn")));
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+    rmSync(escapeRoot, { recursive: true, force: true });
+  }
+});
+
+test("replayJournal: refuses when .journal itself is a symlink escaping runDir", () => {
+  const store = tmpStore();
+  const escapeRoot = mkdtempSync(join(tmpdir(), "fsm-journal-symlinked-root-"));
+  try {
+    const { runDir } = makeRun(store);
+    const escapeTxnDir = join(escapeRoot, "fake-journal-root", "evil-txn");
+    mkdirSync(escapeTxnDir, { recursive: true });
+    writeFileSync(
+      join(escapeTxnDir, "journal.json"),
+      JSON.stringify({
+        txn_id: "evil-txn",
+        status: "ready_to_finalise",
+        staged_files: [],
+      }),
+    );
+    symlinkSync(join(escapeRoot, "fake-journal-root"), join(runDir, ".journal"));
+    assert.throws(
+      () => replayJournal(runDir, "evil-txn"),
+      /resolves to .* which is outside/,
+    );
   } finally {
     rmSync(store, { recursive: true, force: true });
     rmSync(escapeRoot, { recursive: true, force: true });

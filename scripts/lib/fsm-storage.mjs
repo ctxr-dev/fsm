@@ -559,6 +559,11 @@ function writeJournalManifestSync(txnDir, data) {
 export function journalState(runDir) {
   const root = journalRoot(runDir);
   if (!existsSync(root)) return { hasJournal: false };
+  // Containment guard at the `.journal` root itself: if `.journal`
+  // was replaced with a symlink pointing outside runDir, every
+  // downstream readdirSync / readFileSync below would happily read
+  // from the escape target. Resolve and refuse before any reads.
+  assertWithin(root, runDir, "journalState");
   // Use Dirent.isDirectory() so a symlink under `.journal/` is NOT
   // treated as a txn dir. statSync follows symlinks, which would let
   // a planted symlink (e.g. `.journal/foo -> /etc`) get inspected as
@@ -592,13 +597,22 @@ export function journalState(runDir) {
 // — discarding loses the work — but the explicit choice is the user's.
 export function discardJournal(runDir, txnId) {
   assertSafeTxnId(txnId, "discardJournal");
-  const txnDir = join(journalRoot(runDir), txnId);
+  const root = journalRoot(runDir);
+  // Containment guard: if `.journal` itself is a symlink resolving
+  // outside runDir, rmSync(txnDir, { recursive: true }) would happily
+  // delete directories elsewhere on the filesystem. Verify the
+  // journal root stays inside runDir BEFORE constructing the txn
+  // path or touching disk.
+  if (existsSync(root)) {
+    assertWithin(root, runDir, "discardJournal");
+  }
+  const txnDir = join(root, txnId);
   if (!existsSync(txnDir)) {
     return { discarded: false, reason: "not_found" };
   }
   rmSync(txnDir, { recursive: true, force: true });
-  // Clean up empty journal root.
-  const root = journalRoot(runDir);
+  // Clean up empty journal root (root is the containment-checked
+  // journalRoot computed at the top of this function).
   if (existsSync(root) && readdirSync(root).length === 0) {
     try {
       rmdirSync(root);
@@ -614,7 +628,21 @@ export function discardJournal(runDir, txnId) {
 // source is treated as already-finalised.
 export function replayJournal(runDir, txnId) {
   assertSafeTxnId(txnId, "replayJournal");
-  const txnDir = join(journalRoot(runDir), txnId);
+  const root = journalRoot(runDir);
+  // Containment guard at the journal root. If `.journal` is a
+  // symlink resolving outside runDir, every readFileSync /
+  // renameSync below would happily operate on paths outside the run
+  // dir. Verify before any read.
+  if (existsSync(root)) {
+    assertWithin(root, runDir, "replayJournal");
+  }
+  const txnDir = join(root, txnId);
+  // Second containment guard at the txn directory: even with the
+  // root verified, an individual txn dir could itself be a symlink
+  // pointing elsewhere. Verify before reading its journal manifest.
+  if (existsSync(txnDir)) {
+    assertWithin(txnDir, root, "replayJournal (txnDir)");
+  }
   const manifest = readJournalManifestSync(txnDir);
   if (!manifest) {
     return { replayed: false, reason: "no_manifest" };
@@ -674,7 +702,8 @@ export function replayJournal(runDir, txnId) {
     finalised.push({ relPath: entry.relPath, already: false });
   }
   rmSync(txnDir, { recursive: true, force: true });
-  const root = journalRoot(runDir);
+  // root was computed and containment-checked at the top of this
+  // function; reuse it for the empty-journal cleanup.
   if (existsSync(root) && readdirSync(root).length === 0) {
     try {
       rmdirSync(root);
