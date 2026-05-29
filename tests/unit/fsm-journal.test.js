@@ -26,6 +26,7 @@ import {
   ensureRunDir,
   journalRoot,
   journalState,
+  publicJournalProjection,
   readManifest,
   replayJournal,
   runDirPath,
@@ -497,6 +498,83 @@ test("withJournal: refuses to rename into a symlinked subdir that escapes runDir
   } finally {
     rmSync(store, { recursive: true, force: true });
     rmSync(escapeRoot, { recursive: true, force: true });
+  }
+});
+
+// ─── publicJournalProjection stable shape ───────────────────────────────
+
+test("publicJournalProjection: returns present:true with a stable key set when a journal is present", () => {
+  const shape = publicJournalProjection({
+    hasJournal: true,
+    txnId: "txn-001",
+    status: "ready_to_finalise",
+    staged: [{ relPath: "manifest.json" }, "fsm-trace/0001-exit-a.yaml"],
+  });
+  assert.deepEqual(Object.keys(shape).sort(), ["present", "staged", "status", "txn_id"]);
+  assert.equal(shape.present, true);
+  assert.deepEqual(shape.staged, ["manifest.json", "fsm-trace/0001-exit-a.yaml"]);
+});
+
+test("publicJournalProjection: returns present:false when no journal", () => {
+  const shape = publicJournalProjection({ hasJournal: false });
+  assert.deepEqual(shape, { present: false });
+});
+
+// ─── journalState ignores symlinks under .journal ───────────────────────
+
+test("journalState: a symlink under .journal is NOT treated as a txn dir", () => {
+  const store = tmpStore();
+  const escapeRoot = mkdtempSync(join(tmpdir(), "fsm-journal-symlink-"));
+  try {
+    const { runDir } = makeRun(store);
+    // Plant a malicious journal-content file outside the run dir.
+    mkdirSync(join(escapeRoot, "fake"), { recursive: true });
+    writeFileSync(
+      join(escapeRoot, "fake", "journal.json"),
+      JSON.stringify({ txn_id: "evil", status: "ready_to_finalise", staged_files: [] }),
+    );
+    // Plant a symlink under .journal that points at the escape dir.
+    mkdirSync(journalRoot(runDir), { recursive: true });
+    symlinkSync(join(escapeRoot, "fake"), join(journalRoot(runDir), "symlink-txn"));
+    // journalState must NOT see the symlink as a txn dir.
+    const result = journalState(runDir);
+    assert.equal(result.hasJournal, false);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+    rmSync(escapeRoot, { recursive: true, force: true });
+  }
+});
+
+// ─── started_at preservation across pending → ready_to_finalise ─────────
+
+test("withJournal: pending manifest carries a started_at that is preserved on disk after fn throws", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    let observedStartedAt;
+    try {
+      withJournal(runDir, (txn) => {
+        // Read what was written for the pending manifest.
+        observedStartedAt = JSON.parse(
+          readFileSync(join(txn.txnDir, "journal.json"), "utf8"),
+        ).started_at;
+        throw new Error("crash-during-fn");
+      });
+    } catch {
+      // expected
+    }
+    const j = journalState(runDir);
+    assert.equal(j.hasJournal, true);
+    assert.equal(j.status, "pending");
+    // The disk-resident journal manifest still has the original
+    // started_at written before fn ran.
+    const onDisk = JSON.parse(
+      readFileSync(join(j.txnDir, "journal.json"), "utf8"),
+    );
+    assert.equal(onDisk.started_at, observedStartedAt);
+    assert.equal(onDisk.ready_at, undefined);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
   }
 });
 

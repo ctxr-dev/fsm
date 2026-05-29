@@ -521,7 +521,12 @@ export function publicJournalProjection(jstate) {
   const stagedNormalised = (jstate.staged || []).map((s) =>
     typeof s === "string" ? s : s.relPath,
   );
+  // Always carry the `present` discriminator so callers see one shape:
+  // `{ present: boolean, ... }`. Without it, present-vs-absent forks
+  // had different key sets, which is exactly the inconsistency this
+  // helper was meant to eliminate.
   return {
+    present: true,
     txn_id: jstate.txnId,
     status: jstate.status,
     staged: stagedNormalised,
@@ -548,14 +553,14 @@ function writeJournalManifestSync(txnDir, data) {
 export function journalState(runDir) {
   const root = journalRoot(runDir);
   if (!existsSync(root)) return { hasJournal: false };
-  const entries = readdirSync(root).filter((n) => {
-    const p = join(root, n);
-    try {
-      return statSync(p).isDirectory();
-    } catch {
-      return false;
-    }
-  });
+  // Use Dirent.isDirectory() so a symlink under `.journal/` is NOT
+  // treated as a txn dir. statSync follows symlinks, which would let
+  // a planted symlink (e.g. `.journal/foo -> /etc`) get inspected as
+  // if it were a valid transaction directory, with readJournalManifestSync
+  // then reading a journal.json from outside the run dir.
+  const entries = readdirSync(root, { withFileTypes: true })
+    .filter((dirent) => dirent.isDirectory())
+    .map((dirent) => dirent.name);
   if (entries.length === 0) return { hasJournal: false };
   // Most recent by name (txnId is timestamp-prefixed) is the active one.
   const txnIds = entries.sort();
@@ -772,12 +777,15 @@ export function withJournal(runDir, fn) {
   };
 
   // Write the pending manifest first so a crash during fn still leaves a
-  // discoverable journal.
+  // discoverable journal. started_at captures the wall-clock time the
+  // transaction opened; the ready_to_finalise rewrite preserves this
+  // value rather than overwriting it.
+  const startedAt = new Date().toISOString();
   writeJournalManifestSync(txnDir, {
     txn_id: txnId,
     status: "pending",
     run_dir: runDir,
-    started_at: new Date().toISOString(),
+    started_at: startedAt,
     staged_files: [],
   });
 
@@ -807,12 +815,16 @@ export function withJournal(runDir, fn) {
   }
 
   // Mark ready_to_finalise BEFORE the rename loop so a crash mid-rename
-  // can be safely replayed (idempotent).
+  // can be safely replayed (idempotent). Preserve the original
+  // started_at from the pending manifest (do NOT rewrite it: an
+  // operator reading the journal after the fact should be able to see
+  // the true transaction open time, with ready_at as the moment the
+  // finalisation began).
   writeJournalManifestSync(txnDir, {
     txn_id: txnId,
     status: "ready_to_finalise",
     run_dir: runDir,
-    started_at: new Date().toISOString(),
+    started_at: startedAt,
     ready_at: new Date().toISOString(),
     staged_files: stagedFiles.map((s) => ({ relPath: s.relPath })),
   });

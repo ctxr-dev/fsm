@@ -20,6 +20,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -223,6 +224,29 @@ test("atomic-tx: SIGKILL during finalise pause leaves journal; fsm-next refuses;
     assert.equal(inspect.journal.present, true);
     assert.equal(inspect.journal.status, "ready_to_finalise");
     assert.ok(inspect.journal.staged.length > 0);
+
+    // The on-disk journal manifest must carry BOTH started_at (set on
+    // the pending write before fn ran) AND ready_at (set on the
+    // ready_to_finalise rewrite, just after fn returned). They are
+    // distinct timestamps, never identical: started_at MUST predate
+    // ready_at, proving the rewrite does NOT clobber the original
+    // start time.
+    const journalManifestPath = (() => {
+      const found = findJournalDir(join(tmp, "store"));
+      // findJournalDir returns the .journal root; descend into the
+      // single txn dir to read its journal.json.
+      const txnDirs = readdirSync(found);
+      assert.equal(txnDirs.length, 1, "expected exactly one txn dir");
+      return join(found, txnDirs[0], "journal.json");
+    })();
+    const onDiskJournal = JSON.parse(readFileSync(journalManifestPath, "utf8"));
+    assert.equal(onDiskJournal.status, "ready_to_finalise");
+    assert.ok(onDiskJournal.started_at, "expected started_at");
+    assert.ok(onDiskJournal.ready_at, "expected ready_at");
+    assert.ok(
+      Date.parse(onDiskJournal.started_at) <= Date.parse(onDiskJournal.ready_at),
+      `started_at (${onDiskJournal.started_at}) must be <= ready_at (${onDiskJournal.ready_at})`,
+    );
 
     // fsm-next --resume refuses to advance.
     const nextRefused = runScript("fsm-next.mjs", [
