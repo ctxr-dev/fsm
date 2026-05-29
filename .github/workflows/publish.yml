@@ -148,5 +148,11 @@ jobs:
           fi
           git commit -m "release: v${AFTER}"
           git tag -a "${TAG}" -m "release ${TAG}"
-          git push origin main
-          git push origin "refs/tags/${TAG}"
+          # Push branch and tag atomically. Pushing them in two separate
+          # commands races with tag-on-main.yml, which is triggered by
+          # the branch push and creates the same v<version> tag from
+          # the package.json bump it just observed; if tag-on-main wins,
+          # this workflow's tag push fails (and the run is marked failed
+          # even though the publish would have succeeded). One push
+          # closes the window.
+          git push --atomic origin main "refs/tags/${TAG}"
