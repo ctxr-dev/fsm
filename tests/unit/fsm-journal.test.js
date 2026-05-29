@@ -343,6 +343,30 @@ test("transaction.stage: rejects backslashes (Windows traversal)", () => {
   }
 });
 
+test("discardJournal: rejects a txnId containing path separators", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    assert.throws(() => discardJournal(runDir, "../../oops"), /single safe filesystem segment/);
+    assert.throws(() => discardJournal(runDir, "foo/bar"), /single safe filesystem segment/);
+    assert.throws(() => discardJournal(runDir, ".."), /single safe filesystem segment/);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("replayJournal: rejects a txnId containing path separators", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    assert.throws(() => replayJournal(runDir, "../../escape"), /single safe filesystem segment/);
+    assert.throws(() => replayJournal(runDir, "foo\\bar"), /single safe filesystem segment/);
+    assert.throws(() => replayJournal(runDir, "C:foo"), /single safe filesystem segment/);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
 test("replayJournal: rejects relPaths with traversal from a crafted manifest", () => {
   const store = tmpStore();
   try {

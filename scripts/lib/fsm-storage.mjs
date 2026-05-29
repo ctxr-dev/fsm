@@ -395,6 +395,33 @@ export function journalRoot(runDir) {
 // from a journal manifest during replayJournal — a crafted or corrupted
 // journal.json must not be able to rename staged files outside the run
 // directory.
+// assertSafeTxnId rejects any txnId that contains path separators,
+// traversal segments, colons, or backslashes, so a caller-supplied
+// value can never escape <journalRoot>. discardJournal and
+// replayJournal each rmSync / renameSync against a path computed as
+// `join(journalRoot(runDir), txnId)`; without this guard, a crafted
+// txnId like "../../" would let those functions touch arbitrary paths
+// on disk. Internally-generated txn ids look like
+// "2026-05-29T18-30-45-123Z-abc123" — a single safe filesystem
+// segment.
+function assertSafeTxnId(txnId, context) {
+  if (typeof txnId !== "string" || txnId.length === 0) {
+    throw new Error(`${context}: txnId must be a non-empty string`);
+  }
+  if (
+    txnId === "." ||
+    txnId === ".." ||
+    txnId.includes("/") ||
+    txnId.includes("\\") ||
+    txnId.includes(":")
+  ) {
+    throw new Error(
+      `${context}: txnId "${txnId}" must be a single safe filesystem segment ` +
+        "(no '/', '\\\\', ':', '.' or '..')",
+    );
+  }
+}
+
 function assertSafeJournalRelPath(relPath, context) {
   if (typeof relPath !== "string" || relPath.length === 0) {
     throw new Error(`${context}: relPath must be a non-empty string`);
@@ -494,6 +521,7 @@ export function journalState(runDir) {
 // transaction is "ready_to_finalise", callers should usually replay instead
 // — discarding loses the work — but the explicit choice is the user's.
 export function discardJournal(runDir, txnId) {
+  assertSafeTxnId(txnId, "discardJournal");
   const txnDir = join(journalRoot(runDir), txnId);
   if (!existsSync(txnDir)) {
     return { discarded: false, reason: "not_found" };
@@ -515,6 +543,7 @@ export function discardJournal(runDir, txnId) {
 // staged file to its final location. Safe to re-run: a missing staged
 // source is treated as already-finalised.
 export function replayJournal(runDir, txnId) {
+  assertSafeTxnId(txnId, "replayJournal");
   const txnDir = join(journalRoot(runDir), txnId);
   const manifest = readJournalManifestSync(txnDir);
   if (!manifest) {
