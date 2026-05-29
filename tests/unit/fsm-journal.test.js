@@ -149,6 +149,63 @@ test("withJournal: throw inside fn leaves a pending journal on disk", () => {
   }
 });
 
+test("withJournal: O_EXCL tx.lock refuses a concurrent withJournal call", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    // Plant a tx.lock to simulate another process holding the
+    // single-writer lock. A new withJournal call must refuse.
+    const root = journalRoot(runDir);
+    mkdirSync(root, { recursive: true });
+    writeFileSync(
+      join(root, "tx.lock"),
+      JSON.stringify({ txn_id: "concurrent-other", pid: 99999 }),
+    );
+    let caught;
+    try {
+      withJournal(runDir, () => {});
+    } catch (err) {
+      caught = err;
+    }
+    assert.ok(caught, "expected withJournal to throw");
+    assert.equal(caught.code, "JOURNAL_PRESENT");
+    assert.equal(caught.journal.active_lock.txn_id, "concurrent-other");
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("discardJournal: removes the tx.lock so the next withJournal succeeds", () => {
+  const store = tmpStore();
+  try {
+    const { runId, runDir, opts } = makeRun(store);
+    // Provoke a crashed journal with the tx.lock still in place.
+    try {
+      withJournal(runDir, (txn) => {
+        writeManifest(
+          runId,
+          { run_id: runId, status: "in_progress", current_state: "b" },
+          { ...opts, transaction: txn },
+        );
+        throw new Error("crash");
+      });
+    } catch {
+      // expected
+    }
+    const j = journalState(runDir);
+    assert.equal(j.hasJournal, true);
+    // tx.lock is present.
+    assert.equal(existsSync(join(journalRoot(runDir), "tx.lock")), true);
+    // Discard removes BOTH the txn dir AND the tx.lock.
+    discardJournal(runDir, j.txnId);
+    assert.equal(existsSync(journalRoot(runDir)), false);
+    // A fresh withJournal can now run.
+    withJournal(runDir, () => {});
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
 test("withJournal: refuses to start while an unrecovered journal exists", () => {
   const store = tmpStore();
   try {

@@ -67,8 +67,21 @@ if (!manifest) {
 const lock = readLock(parsed.runId, { storageRoot });
 const trace = readTrace(parsed.runId, { storageRoot });
 const runDir = runDirPath(parsed.runId, { storageRoot });
-const jstate = journalState(runDir);
-const journal = jstate.hasJournal
+// journalState can throw if `.journal` is unreadable or is a regular
+// file rather than a directory. Inspect should still emit a usable
+// payload — surface the inspection failure under a structured
+// `journal.error` field, leave the rest of the output intact.
+let jstate;
+let journalInspectError;
+try {
+  jstate = journalState(runDir);
+} catch (err) {
+  jstate = { hasJournal: false };
+  journalInspectError = err.message;
+}
+const journal = journalInspectError
+  ? { present: false, error: journalInspectError }
+  : jstate.hasJournal
   ? {
       present: true,
       ...publicJournalProjection(jstate),

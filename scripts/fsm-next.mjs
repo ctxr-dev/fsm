@@ -189,8 +189,22 @@ if (manifest.status !== "in_progress" && manifest.status !== "paused") {
 // The journal contains the intent of the last (crashed) commit; the
 // user must explicitly recover via `fsm-resume --journal discard|replay`
 // before any new state work can be done.
+//
+// journalState can throw on a filesystem error or if `.journal` is a
+// regular file rather than a directory. Surface as a structured
+// payload (instead of a stack trace) so automation can react.
 const resumeRunDir = runDirPath(runId, { storageRoot: settings.storageRoot });
-const resumeJournal = journalState(resumeRunDir);
+let resumeJournal;
+try {
+  resumeJournal = journalState(resumeRunDir);
+} catch (err) {
+  emit({
+    error: "journal_inspect_failed",
+    run_id: runId,
+    detail: err.message,
+  });
+  process.exit(1);
+}
 if (resumeJournal.hasJournal) {
   emit({
     error: "incomplete_commit_detected",

@@ -234,8 +234,12 @@ test("atomic-tx: SIGKILL during finalise pause leaves journal; fsm-next refuses;
     const journalManifestPath = (() => {
       const found = findJournalDir(join(tmp, "store"));
       // findJournalDir returns the .journal root; descend into the
-      // single txn dir to read its journal.json.
-      const txnDirs = readdirSync(found);
+      // single txn dir to read its journal.json. Filter by Dirent
+      // because `.journal/` also contains the `tx.lock` file from
+      // A7's atomic-single-writer guard.
+      const txnDirs = readdirSync(found, { withFileTypes: true })
+        .filter((d) => d.isDirectory())
+        .map((d) => d.name);
       assert.equal(txnDirs.length, 1, "expected exactly one txn dir");
       return join(found, txnDirs[0], "journal.json");
     })();

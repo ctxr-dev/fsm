@@ -611,6 +611,11 @@ export function discardJournal(runDir, txnId) {
     return { discarded: false, reason: "not_found" };
   }
   rmSync(txnDir, { recursive: true, force: true });
+  // Recovery also clears the single-writer lock that withJournal
+  // would have left in place if the crash happened mid-transaction;
+  // without this the next fsm-commit would refuse with JOURNAL_PRESENT
+  // forever.
+  rmSync(join(root, "tx.lock"), { force: true });
   // Clean up empty journal root (root is the containment-checked
   // journalRoot computed at the top of this function).
   if (existsSync(root) && readdirSync(root).length === 0) {
@@ -702,6 +707,10 @@ export function replayJournal(runDir, txnId) {
     finalised.push({ relPath: entry.relPath, already: false });
   }
   rmSync(txnDir, { recursive: true, force: true });
+  // Recovery also clears the single-writer lock so the next
+  // withJournal isn't refused with JOURNAL_PRESENT after a successful
+  // replay (the lock would be a leftover from the crashed writer).
+  rmSync(join(root, "tx.lock"), { force: true });
   // root was computed and containment-checked at the top of this
   // function; reuse it for the empty-journal cleanup.
   if (existsSync(root) && readdirSync(root).length === 0) {
@@ -755,6 +764,64 @@ export function withJournal(runDir, fn) {
     runDir,
     "withJournal (txnDir ancestor)",
   );
+  // Ensure the journal root exists BEFORE acquiring the atomic lock
+  // (next), since the lock file lives inside it.
+  mkdirSync(root, { recursive: true });
+  assertWithin(root, runDir, "withJournal (journal root)");
+
+  // ATOMIC SINGLE-WRITER GUARD: O_EXCL on `<root>/tx.lock`. The
+  // earlier journalState refuse-block catches the case where a
+  // PREVIOUS withJournal crashed and left a txn dir on disk; the
+  // O_EXCL lock here catches the case where ANOTHER process is
+  // currently mid-withJournal on the same run. Without this, two
+  // processes could both observe hasJournal=false, both create
+  // distinct txn dirs, and both run rename loops that would trample
+  // each other's manifest.json and trace files. The lock holds for
+  // the whole transaction lifecycle and is removed only as part of
+  // success cleanup (or by discard/replay during recovery).
+  const txnLockPath = join(root, "tx.lock");
+  const lockPayload = JSON.stringify({
+    txn_id: txnId,
+    pid: process.pid,
+    started_at: new Date().toISOString(),
+  });
+  try {
+    const fd = openSync(txnLockPath, "wx", 0o644);
+    try {
+      writeFileSync(fd, lockPayload);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  } catch (err) {
+    if (err.code === "EEXIST") {
+      // Another transaction holds the lock. Surface the journal
+      // state we can read so the caller knows what's blocking.
+      let activeLock = null;
+      try {
+        activeLock = JSON.parse(readFileSync(txnLockPath, "utf8"));
+      } catch {
+        // Lock file unreadable; report what we can.
+      }
+      let observedState = { hasJournal: false };
+      try {
+        observedState = journalState(runDir);
+      } catch {
+        // Don't let an inspection failure mask the real lock-held cause.
+      }
+      const lockErr = new Error(
+        `withJournal: another transaction holds the lock (active=${activeLock ? activeLock.txn_id : "unknown"}); recover via fsm-resume --journal {discard|replay}`,
+      );
+      lockErr.code = "JOURNAL_PRESENT";
+      lockErr.journal = {
+        ...observedState,
+        active_lock: activeLock,
+      };
+      throw lockErr;
+    }
+    throw err;
+  }
+
   mkdirSync(txnDir, { recursive: true });
   // Post-mkdir check so a race that drops a symlink AT the journal
   // root between the pre-flight and now is still caught.
@@ -948,6 +1015,11 @@ export function withJournal(runDir, fn) {
     renameSync(entry.stagedPath, finalPath);
   }
   rmSync(txnDir, { recursive: true, force: true });
+  // Release the single-writer lock BEFORE attempting the root
+  // cleanup so the empty-dir check sees the journal root as truly
+  // empty (the lock file is the only thing left after the txn dir
+  // is gone).
+  rmSync(txnLockPath, { force: true });
   if (existsSync(root) && readdirSync(root).length === 0) {
     try {
       rmdirSync(root);

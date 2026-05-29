@@ -140,7 +140,22 @@ const runDir = runDirPath(parsed.runId, { storageRoot: settings.storageRoot });
 // A7: a previous commit may have crashed between "ready_to_finalise" and
 // the rename loop, leaving a journal on disk. Refuse to commit anything
 // new until the user recovers (fsm-resume --journal discard|replay).
-const existingJournal = journalState(runDir);
+//
+// journalState can throw if `.journal` exists but is unreadable (filesystem
+// error, permission issue, or `.journal` is a regular file rather than a
+// directory). Surface that as a structured payload instead of an
+// unhandled stack trace so automation can react.
+let existingJournal;
+try {
+  existingJournal = journalState(runDir);
+} catch (err) {
+  emit({
+    error: "journal_inspect_failed",
+    run_id: parsed.runId,
+    detail: err.message,
+  });
+  process.exit(1);
+}
 if (existingJournal.hasJournal) {
   emit({
     error: "incomplete_commit_detected",

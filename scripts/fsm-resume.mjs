@@ -165,7 +165,21 @@ function doJournalRecovery(storageRoot) {
     });
     process.exit(1);
   }
-  const jstate = journalState(recoveryRunDir);
+  // journalState can throw if `.journal` is unreadable / a regular
+  // file. Recovery should still surface a usable error payload
+  // rather than crash with a stack trace.
+  let jstate;
+  try {
+    jstate = journalState(recoveryRunDir);
+  } catch (err) {
+    emit({
+      error: "journal_inspect_failed",
+      run_id: parsed.runId,
+      journal_action: parsed.journalAction,
+      detail: err.message,
+    });
+    process.exit(1);
+  }
   if (!jstate.hasJournal) {
     emit({
       ok: true,
