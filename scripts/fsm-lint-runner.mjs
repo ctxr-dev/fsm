@@ -193,6 +193,19 @@ export function lintFile(filePath, source) {
     `\\b(?:${readApiAlternation})\\s*\\([^)\\n]*?(['"\`])[^'"\`\\n]*\\.fsm\\.yaml[^'"\`\\n]*\\1`,
   );
 
+  // Pre-compute the set of line numbers that fall inside a multi-line
+  // template literal so the per-line rules can skip them (those bodies
+  // are owned by no-inline-prompt-composition, and the YAML-read /
+  // LLM-call regexes should not fire on prompt-fixture prose).
+  const templateLineSet = new Set();
+  for (const tmpl of collectTemplateLiterals(source)) {
+    if (tmpl.endLine > tmpl.startLine) {
+      for (let n = tmpl.startLine; n <= tmpl.endLine; n++) {
+        templateLineSet.add(n);
+      }
+    }
+  }
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const lineNumber = i + 1;
@@ -212,17 +225,27 @@ export function lintFile(filePath, source) {
 
     // Skip lines that are clearly source comments -- both the read-API
     // and the LLM-call rules are about real code, not prose in the
-    // header banner. We detect a comment by the first non-space chars
-    // being `//`, `/*`, ` *` (block-comment middles), or `#!`
-    // (shebang only; a bare `#` would falsely skip valid ES class
-    // private members like `#client = ...`).
+    // header banner. We narrow to actual comment shapes: `//`, `/*`,
+    // ` * `, and `#!` (shebang). Bare leading `*` was previously
+    // treated as a comment too, but that also matched valid JS
+    // generator method definitions (e.g. `* foo() {}`), hiding real
+    // violations on the body line.
     const trimmed = line.trimStart();
     const isComment =
       trimmed.startsWith("//") ||
       trimmed.startsWith("/*") ||
-      trimmed.startsWith("*") ||
+      trimmed.startsWith("* ") ||
+      trimmed === "*" ||
       trimmed.startsWith("#!");
     if (isComment) continue;
+
+    // Skip lines that fall inside a multi-line template literal: the
+    // per-line YAML-read and LLM-call rules look at literal text, not
+    // executable code, and a multi-line prompt fixture can legitimately
+    // contain shapes like `readFileSync("x.fsm.yaml")` or `Task(` as
+    // documentation. The no-inline-prompt-composition rule already
+    // owns the template-literal case.
+    if (templateLineSet.has(lineNumber)) continue;
 
     // Rule: no-direct-fsm-yaml-read. Match a known read API name
     // followed by `(`, with `.fsm.yaml` appearing somewhere on the

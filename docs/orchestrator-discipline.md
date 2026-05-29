@@ -18,7 +18,7 @@ When the runner stays a shell, the FSM is the single source of truth for control
 
 The engine owns YAML parsing. A runner that `readFileSync`s the FSM YAML is either (a) duplicating logic the engine already does, or (b) making decisions the FSM should make. Both cases break the "FSM is the single source of truth" invariant.
 
-The linter flags any of `readFileSync`, `readFile`, `createReadStream`, `open`, `openSync` whose call argument on the same line contains the substring `.fsm.yaml`.
+The linter flags any of `readFileSync`, `readFile`, `createReadStream`, `open`, `openSync` whose call argument on the same line is a **quoted string literal** containing `.fsm.yaml` (single, double, or template-string quotes). Variable-based paths like `readFileSync(p)` where `p` resolves to a `.fsm.yaml` path at runtime are NOT detected; the heuristic is intentionally syntactic so it can run without parsing the source.
 
 ### 2. `no-orchestrator-llm-call`
 
