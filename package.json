@@ -35,7 +35,8 @@
     "fsm-commit": "scripts/fsm-commit.mjs",
     "fsm-inspect": "scripts/fsm-inspect.mjs",
     "fsm-validate-static": "scripts/fsm-validate-static.mjs",
-    "fsm-lint-runner": "scripts/fsm-lint-runner.mjs"
+    "fsm-lint-runner": "scripts/fsm-lint-runner.mjs",
+    "fsm-resume": "scripts/fsm-resume.mjs"
   },
   "files": [
     "scripts/",

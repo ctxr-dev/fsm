@@ -17,6 +17,7 @@ export {
   ensureRunDir,
   listRecentRuns,
   parseRunId,
+  pruneTraceAfter,
   readLock,
   readManifest,
   readTrace,
