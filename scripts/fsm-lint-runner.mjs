@@ -152,11 +152,26 @@ const SCHEMA_MARKERS = [
 // `console.log("fsm-lint:ignore")`. The scan walks the line tracking
 // string-literal state so a `//` inside a string (e.g. a URL like
 // "http://x") is NOT treated as a comment start.
+// Characters that, as the previous non-whitespace token, indicate the
+// next `/` opens a regex literal rather than a division operator.
+// Conservative set: punctuation that cannot end an expression, plus
+// the empty prefix (regex at start of line). Distinguishing regex
+// vs division in JavaScript is in general context-sensitive (e.g.
+// `a /b/g` vs `a / b / g`), but for the purpose of a lint heuristic
+// this set covers the common cases without ever mis-treating a real
+// `//` line comment as inside a regex.
+const REGEX_PREFIX_OPS = new Set([
+  "", "(", "[", "{", "}", ",", ";", ":", "?", "!", "&", "|", "=",
+  "+", "-", "*", "/", "^", "~", "%", "<", ">",
+]);
+
 function lineCommentHasIgnoreMarker(line) {
   if (typeof line !== "string" || !line.includes(IGNORE_MARKER)) return false;
   let i = 0;
   const len = line.length;
   let inString = null; // null | "'" | '"' | "`"
+  let inRegex = false;
+  let lastNonWs = "";
   while (i < len) {
     const ch = line[i];
     if (inString) {
@@ -170,8 +185,33 @@ function lineCommentHasIgnoreMarker(line) {
       i++;
       continue;
     }
+    if (inRegex) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === "[") {
+        // Walk a regex character class so that `/` inside `[...]` does
+        // not terminate the literal.
+        i++;
+        while (i < len && line[i] !== "]") {
+          if (line[i] === "\\") i++;
+          i++;
+        }
+        i++;
+        continue;
+      }
+      if (ch === "/") {
+        inRegex = false;
+        i++;
+        continue;
+      }
+      i++;
+      continue;
+    }
     if (ch === "'" || ch === '"' || ch === "`") {
       inString = ch;
+      lastNonWs = ch;
       i++;
       continue;
     }
@@ -179,6 +219,13 @@ function lineCommentHasIgnoreMarker(line) {
       // Real line comment starts here.
       return line.indexOf(IGNORE_MARKER, i) >= 0;
     }
+    if (ch === "/" && REGEX_PREFIX_OPS.has(lastNonWs)) {
+      // Treat as regex literal start; consume until matching `/`.
+      inRegex = true;
+      i++;
+      continue;
+    }
+    if (ch !== " " && ch !== "\t") lastNonWs = ch;
     i++;
   }
   return false;
@@ -216,9 +263,25 @@ export function lintFile(filePath, source) {
     }
   }
 
+  let inBlockComment = false;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const lineNumber = i + 1;
+    // Track multi-line block-comment state. If `inBlockComment` is
+    // true at the start of this line we are inside a `/* ... */`
+    // block; we still process the line but the "leading `*`" comment
+    // shape below will skip it. When the line closes the block with
+    // `*/`, leave the state on after the line so subsequent code on
+    // the same line (rare but legal) is not analysed; the next line
+    // resumes normally.
+    if (inBlockComment) {
+      // If the line closes the block we toggle off; the line itself is
+      // treated as comment for the per-line rules below.
+      if (line.includes("*/")) inBlockComment = false;
+    } else if (line.includes("/*") && !line.includes("*/")) {
+      // Opens a multi-line block on this line.
+      inBlockComment = true;
+    }
     // The fsm-lint:ignore marker is intentionally per-line for the
     // single-line rules (no-direct-fsm-yaml-read and
     // no-orchestrator-llm-call); previous-line suppression is
@@ -235,17 +298,16 @@ export function lintFile(filePath, source) {
 
     // Skip lines that are clearly source comments -- both the read-API
     // and the LLM-call rules are about real code, not prose in the
-    // header banner. We narrow to actual comment shapes: `//`, `/*`,
-    // ` * `, and `#!` (shebang). Bare leading `*` was previously
-    // treated as a comment too, but that also matched valid JS
-    // generator method definitions (e.g. `* foo() {}`), hiding real
-    // violations on the body line.
+    // header banner. Narrow to actual comment shapes: `//`, `/*`, and
+    // `#!` (shebang). Lines inside a multi-line `/* ... */` block are
+    // skipped via `inBlockComment` above, which avoids the false
+    // positive where `* foo()` (a generator method definition OUTSIDE
+    // a block comment) used to be treated as comment text.
     const trimmed = line.trimStart();
     const isComment =
+      inBlockComment ||
       trimmed.startsWith("//") ||
       trimmed.startsWith("/*") ||
-      trimmed.startsWith("* ") ||
-      trimmed === "*" ||
       trimmed.startsWith("#!");
     if (isComment) continue;
 
