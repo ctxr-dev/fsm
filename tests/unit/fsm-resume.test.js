@@ -628,6 +628,62 @@ test("fsm-resume: rejects --journal followed by another flag", () => {
   assert.match(result.stderr, /--journal requires a value/);
 });
 
+test("fsm-resume: --journal discard works when the FSM YAML is missing", () => {
+  // Recovery only needs storageRoot + runId. An operator should be
+  // able to discard an incomplete commit even if the FSM YAML has
+  // since been renamed / deleted, which would otherwise make
+  // loadFsm() blow up before the recovery short-circuit is reached.
+  const tmp = setupFixture();
+  try {
+    // Start a run so a run dir + manifest exist.
+    const next = runScript("fsm-next.mjs", [
+      "--new-run",
+      "--repo", "ctxr-dev/fsm",
+      "--base-sha", "b",
+      "--head-sha", "h",
+      "--session-id", "test-session",
+      ...commonArgs(tmp),
+    ]);
+    assert.equal(next.status, 0, `fsm-next failed: ${next.stderr}`);
+    const runId = JSON.parse(next.stdout).run_id;
+
+    // Plant a journal directly under the run dir.
+    const inspect = JSON.parse(
+      runScript("fsm-inspect.mjs", [
+        "--run-id", runId,
+        ...commonArgs(tmp),
+      ]).stdout,
+    );
+    const txnDir = join(inspect.run_dir_path, ".journal", "planted-txn-001");
+    mkdirSync(txnDir, { recursive: true });
+    writeFileSync(
+      join(txnDir, "journal.json"),
+      JSON.stringify({
+        txn_id: "planted-txn-001",
+        status: "pending",
+        staged_files: [],
+      }),
+    );
+
+    // Now NUKE the FSM YAML so loadFsm() would throw if it ran.
+    rmSync(join(tmp, "fsm.yaml"), { force: true });
+
+    // Recovery still works because the short-circuit runs BEFORE
+    // loadFsm.
+    const discardResult = runScript("fsm-resume.mjs", [
+      "--run-id", runId,
+      "--journal", "discard",
+      ...commonArgs(tmp),
+    ]);
+    assert.equal(discardResult.status, 0, `discard failed: ${discardResult.stderr}`);
+    const body = JSON.parse(discardResult.stdout);
+    assert.equal(body.journal_action, "discard");
+    assert.equal(body.discarded, true);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 // ─── final sanity: the runner file is present in scripts/.
 test("fsm-resume.mjs file is present in scripts/", () => {
   // Sanity: file exists at the canonical path.

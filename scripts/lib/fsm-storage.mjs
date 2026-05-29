@@ -690,7 +690,21 @@ export function withJournal(runDir, fn) {
   const txnId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomBytes(3).toString("hex")}`;
   const root = journalRoot(runDir);
   const txnDir = join(root, txnId);
+  // Symlink-escape pre-flight on the journal root itself: if
+  // `<runDir>/.journal` was replaced with a symlink to /tmp/elsewhere
+  // before we got here, mkdirSync(txnDir, {recursive:true}) would
+  // happily create the txn directory outside runDir. The walk in
+  // assertNearestExistingAncestorWithin stops at `.journal` if it
+  // exists (and rejects), or falls through to `runDir` (trusted).
+  assertNearestExistingAncestorWithin(
+    txnDir,
+    runDir,
+    "withJournal (txnDir ancestor)",
+  );
   mkdirSync(txnDir, { recursive: true });
+  // Post-mkdir check so a race that drops a symlink AT the journal
+  // root between the pre-flight and now is still caught.
+  assertWithin(txnDir, runDir, "withJournal (txnDir)");
 
   const stagedFiles = [];
 
@@ -706,10 +720,22 @@ export function withJournal(runDir, fn) {
       // symlink-escape class: if a subdir under `txnDir` (or `.journal`
       // itself) was swapped for a symlink, the directory we are about
       // to mkdirSync into and write into could resolve outside the
-      // journal root. Refuse to return a path whose resolved real
-      // dirname is not inside txnDir.
+      // journal root.
+      //
+      // Same pre-flight pattern as the finalisation rename loop:
+      //   1. assertNearestExistingAncestorWithin BEFORE mkdirSync so we
+      //      never create directories outside txnDir even on a deep
+      //      relPath whose existing ancestor is a symlink that escapes.
+      //   2. assertWithin AFTER mkdirSync to catch a race where a
+      //      symlink is dropped in between the pre-flight and the
+      //      caller using the returned path.
       assertSafeJournalRelPath(relPath, "transaction.stage");
       const stagedPath = join(txnDir, relPath);
+      assertNearestExistingAncestorWithin(
+        dirname(stagedPath),
+        txnDir,
+        "transaction.stage (ancestor)",
+      );
       mkdirSync(dirname(stagedPath), { recursive: true });
       assertWithin(dirname(stagedPath), txnDir, "transaction.stage");
       return stagedPath;

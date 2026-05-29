@@ -115,19 +115,6 @@ try {
   fail(err.message, 2);
 }
 
-let fsm;
-try {
-  fsm = loadFsm({ fsmPath: settings.fsmPath });
-} catch (err) {
-  fail(err.message, 1);
-}
-
-const manifest = readManifest(parsed.runId, { storageRoot: settings.storageRoot });
-if (!manifest) {
-  emit({ error: "run_not_found", run_id: parsed.runId });
-  process.exit(1);
-}
-
 // --journal {discard|replay}: dedicated A7 recovery short-circuit.
 // Inspects <run_dir>/.journal/ and either rolls back the pending
 // transaction (discard) or finalises it idempotently (replay). Does NOT
@@ -135,6 +122,13 @@ if (!manifest) {
 // op naturally produces (replay's rename loop finalises any staged
 // manifest.json the crash captured). Pre-existing journals from a
 // previous crashed fsm-commit are the only target.
+//
+// Runs BEFORE loadFsm + readManifest because recovery only needs
+// storageRoot + runId. An operator should be able to recover an
+// incomplete commit even when the FSM YAML has been moved/renamed or
+// the run's manifest somehow got truncated — both would make a regular
+// --from-state resume impossible, but a journal can still be
+// discarded or replayed bytewise.
 if (parsed.journalAction) {
   const recoveryRunDir = runDirPath(parsed.runId, { storageRoot: settings.storageRoot });
   const jstate = journalState(recoveryRunDir);
@@ -180,6 +174,19 @@ if (parsed.journalAction) {
     ...out,
   });
   process.exit(0);
+}
+
+let fsm;
+try {
+  fsm = loadFsm({ fsmPath: settings.fsmPath });
+} catch (err) {
+  fail(err.message, 1);
+}
+
+const manifest = readManifest(parsed.runId, { storageRoot: settings.storageRoot });
+if (!manifest) {
+  emit({ error: "run_not_found", run_id: parsed.runId });
+  process.exit(1);
 }
 
 // Resume is for runs that can legitimately be rewound: an `in_progress`
