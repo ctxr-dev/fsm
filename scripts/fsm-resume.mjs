@@ -150,6 +150,21 @@ try {
 // discarded or replayed bytewise.
 function doJournalRecovery(storageRoot) {
   const recoveryRunDir = runDirPath(parsed.runId, { storageRoot });
+  // Distinguish "run dir does not exist" from "run dir exists but
+  // carries no journal". The previous unconditional `no_journal_present`
+  // misled operators into thinking recovery succeeded when they had
+  // simply mistyped the run-id or storage-root. Emit run_not_found
+  // (exit 1) for the missing-run-dir case so automation can tell
+  // them apart without needing to load the manifest (which we
+  // intentionally avoid in the recovery short-circuit).
+  if (!existsSync(recoveryRunDir)) {
+    emit({
+      error: "run_not_found",
+      run_id: parsed.runId,
+      journal_action: parsed.journalAction,
+    });
+    process.exit(1);
+  }
   const jstate = journalState(recoveryRunDir);
   if (!jstate.hasJournal) {
     emit({

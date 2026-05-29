@@ -628,6 +628,27 @@ test("fsm-resume: rejects --journal followed by another flag", () => {
   assert.match(result.stderr, /--journal requires a value/);
 });
 
+test("fsm-resume: --journal recovery returns run_not_found when the run dir does not exist", () => {
+  // An operator that mistypes a run-id (or points at the wrong
+  // storage root) should NOT get an ambiguous {ok:true,
+  // result:"no_journal_present"} payload — that masks the typo.
+  // Distinguish "wrong inputs" from "right inputs, nothing to do".
+  const tmp = setupFixture();
+  try {
+    const result = runScript("fsm-resume.mjs", [
+      "--run-id", "20260101-000000-deadbee",
+      "--journal", "discard",
+      "--storage-root", join(tmp, "store"),
+    ]);
+    assert.notEqual(result.status, 0);
+    const body = JSON.parse(result.stdout);
+    assert.equal(body.error, "run_not_found");
+    assert.equal(body.run_id, "20260101-000000-deadbee");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("fsm-resume: --journal discard works without --fsm-path (only --storage-root + --run-id needed)", () => {
   // Per the recovery contract, --journal discard / --journal replay
   // should require ONLY storageRoot + runId. The previous implementation
