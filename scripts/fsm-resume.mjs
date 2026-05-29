@@ -198,6 +198,16 @@ const annotation = {
 const priorHistory = Array.isArray(manifest.resume_history)
   ? manifest.resume_history
   : [];
+
+// Recompute transitions_count from the retained trace. Each completed
+// state transition leaves an exit trace, so the post-prune exit-trace
+// count is the authoritative new transitions_count. Without this, the
+// manifest carries the pre-resume count which includes transitions
+// whose exit traces have just been removed.
+const retainedExitCount = readTrace(parsed.runId, {
+  storageRoot: settings.storageRoot,
+}).filter((r) => r.data?.phase === "exit").length;
+
 updateManifest(
   parsed.runId,
   {
@@ -205,6 +215,7 @@ updateManifest(
     current_state: parsed.fromState,
     next_state: null,
     resume_history: [...priorHistory, annotation],
+    transitions_count: retainedExitCount,
     ended_at: null,
   },
   { storageRoot: settings.storageRoot },
