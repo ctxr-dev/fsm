@@ -173,13 +173,17 @@ function doJournalRecovery(storageRoot) {
       });
       process.exit(1);
     }
+    // Emit only snake_case keys. Spreading `...out` would mix the
+    // helper's camelCase `txnId` into the payload alongside the
+    // explicit `txn_id` and confuse downstream consumers.
     emit({
       ok: true,
       run_id: parsed.runId,
       journal_action: "discard",
       txn_id: jstate.txnId,
       status_before: jstate.status,
-      ...out,
+      discarded: out.discarded,
+      reason: out.reason ?? null,
     });
     process.exit(0);
   }
@@ -211,12 +215,16 @@ function doJournalRecovery(storageRoot) {
     });
     process.exit(1);
   }
+  // Emit only snake_case keys. Spreading `...out` would mix the
+  // helper's camelCase `txnId` into the payload alongside the
+  // explicit `txn_id`.
   emit({
     ok: true,
     run_id: parsed.runId,
     journal_action: "replay",
     txn_id: jstate.txnId,
-    ...out,
+    replayed: out.replayed,
+    finalised: out.finalised ?? [],
   });
   process.exit(0);
 }
