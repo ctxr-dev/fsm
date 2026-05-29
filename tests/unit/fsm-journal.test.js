@@ -801,6 +801,31 @@ test("withJournal: refuses to rename into a symlinked subdir that escapes runDir
 
 // ─── `.journal` root symlink rejection (containment) ────────────────────
 
+test("journalState: refuses when .journal is a BROKEN symlink (no-follow detection)", () => {
+  // existsSync follows symlinks and returns false for a dangling
+  // link, which would have made journalState silently report
+  // hasJournal:false despite a real filesystem anomaly. With
+  // lstatSync-based detection the broken symlink is treated as
+  // present, and the containment guard then throws a structured
+  // error so the operator can fix the run dir.
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    // Create a symlink to a target that does not exist.
+    symlinkSync("/tmp/does-not-exist-xyz-123", join(runDir, ".journal"));
+    assert.throws(
+      () => journalState(runDir),
+      // Either the containment error (if assertWithin reaches realpathSync
+      // on a broken link, the realpathSync throws ENOENT — which is
+      // surfaced) or the containment-mismatch error. Both are
+      // structured failures, not a "no journal" false negative.
+      /resolves to|ENOENT/,
+    );
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
 test("journalState: refuses when .journal itself is a symlink escaping runDir", () => {
   const store = tmpStore();
   const escapeRoot = mkdtempSync(join(tmpdir(), "fsm-journal-symlinked-root-"));

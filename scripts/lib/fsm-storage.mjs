@@ -20,6 +20,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -425,6 +426,23 @@ export function journalRoot(runDir) {
 // caller before this check, so realpathSync will succeed on it.
 // parentDir is always either runDir or txnDir; both are known to exist
 // at this point.
+// lexistsSync returns true if `path` exists as a filesystem entry,
+// INCLUDING dangling symlinks. `existsSync` (and statSync without
+// throwIfNoEntry) silently follows symlinks, so a broken `.journal
+// -> /missing` symlink would slip through as "doesn't exist", and
+// the containment / no-journal-present paths would silently misclassify
+// the run. lstatSync without following surfaces the symlink itself,
+// so any error means "really doesn't exist".
+function lexistsSync(path) {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (err) {
+    if (err && err.code === "ENOENT") return false;
+    throw err;
+  }
+}
+
 function assertWithin(targetDir, parentDir, context) {
   const realTarget = realpathSync(targetDir);
   const realParent = realpathSync(parentDir);
@@ -449,13 +467,19 @@ function assertWithin(targetDir, parentDir, context) {
 // parentDir if an existing ancestor was a symlink. Calling this first
 // makes the operation fail with NO side effects when an ancestor escapes.
 function assertNearestExistingAncestorWithin(targetDir, parentDir, context) {
+  // Use lexistsSync (no-follow): a broken symlink IS an entry that
+  // would otherwise make existsSync return false, and the walk would
+  // skip past it. With lexistsSync, a broken `.journal -> /missing`
+  // symlink stops the walk and triggers assertWithin, which will
+  // throw a clear containment error rather than letting the caller's
+  // subsequent mkdirSync / realpathSync emit a confused ENOENT.
   let candidate = targetDir;
-  while (!existsSync(candidate)) {
+  while (!lexistsSync(candidate)) {
     const up = dirname(candidate);
     if (up === candidate) break;
     candidate = up;
   }
-  if (existsSync(candidate)) {
+  if (lexistsSync(candidate)) {
     assertWithin(candidate, parentDir, context);
   }
 }
@@ -558,7 +582,11 @@ function writeJournalManifestSync(txnDir, data) {
 // absent or empty.
 export function journalState(runDir) {
   const root = journalRoot(runDir);
-  if (!existsSync(root)) return { hasJournal: false };
+  // lexistsSync (no-follow) so a broken `.journal` symlink is
+  // surfaced as "present" — assertWithin will then throw a
+  // structured containment failure rather than silently returning
+  // hasJournal:false and letting fsm-commit advance.
+  if (!lexistsSync(root)) return { hasJournal: false };
   // Containment guard at the `.journal` root itself: if `.journal`
   // was replaced with a symlink pointing outside runDir, every
   // downstream readdirSync / readFileSync below would happily read
@@ -639,7 +667,10 @@ export function journalState(runDir) {
 // legitimate in-progress transaction.
 export function discardOrphanedLock(runDir) {
   const root = journalRoot(runDir);
-  if (!existsSync(root)) {
+  // lexistsSync so a broken `.journal` symlink trips assertWithin
+  // (rather than reporting not_found and leaving the bad state in
+  // place).
+  if (!lexistsSync(root)) {
     return { discarded: false, reason: "not_found" };
   }
   assertWithin(root, runDir, "discardOrphanedLock");
@@ -678,8 +709,10 @@ export function discardJournal(runDir, txnId) {
   // outside runDir, rmSync(txnDir, { recursive: true }) would happily
   // delete directories elsewhere on the filesystem. Verify the
   // journal root stays inside runDir BEFORE constructing the txn
-  // path or touching disk.
-  if (existsSync(root)) {
+  // path or touching disk. lexistsSync (no-follow) so a broken
+  // `.journal` symlink trips the containment check rather than
+  // skipping it.
+  if (lexistsSync(root)) {
     assertWithin(root, runDir, "discardJournal");
   }
   const txnDir = join(root, txnId);
@@ -745,8 +778,9 @@ export function replayJournal(runDir, txnId) {
   // Containment guard at the journal root. If `.journal` is a
   // symlink resolving outside runDir, every readFileSync /
   // renameSync below would happily operate on paths outside the run
-  // dir. Verify before any read.
-  if (existsSync(root)) {
+  // dir. Verify before any read. lexistsSync (no-follow) so a broken
+  // `.journal` symlink trips the containment check.
+  if (lexistsSync(root)) {
     assertWithin(root, runDir, "replayJournal");
   }
   const txnDir = join(root, txnId);
