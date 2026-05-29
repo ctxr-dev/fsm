@@ -147,8 +147,8 @@ if (existingJournal.hasJournal) {
     run_id: parsed.runId,
     journal: publicJournalProjection(existingJournal),
     recovery: {
-      discard: `fsm-resume --run-id ${parsed.runId} --journal discard`,
-      replay: `fsm-resume --run-id ${parsed.runId} --journal replay`,
+      discard: `fsm-resume --run-id ${parsed.runId} --journal discard --storage-root ${settings.storageRoot}`,
+      replay: `fsm-resume --run-id ${parsed.runId} --journal replay --storage-root ${settings.storageRoot}`,
     },
   });
   process.exit(1);
