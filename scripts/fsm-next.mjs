@@ -127,10 +127,16 @@ if (parsed.newRun) {
   });
   const entryState = stateById(fsm.doc, fsm.doc.fsm.entry);
   const env = { args: parsed.args ?? {} };
-  const inputs = entryState.worker?.inputs?.reduce((acc, name) => {
+  // A loop state declares its worker under state.loop.worker; reading
+  // only state.worker.inputs would silently drop `args` (and any other
+  // declared input) from the entry trace, which runEnv on resume reads
+  // back as `env.args`. Fall through to loop.worker.inputs if present.
+  const entryInputsDecl =
+    entryState.worker?.inputs ?? entryState.loop?.worker?.inputs ?? [];
+  const inputs = entryInputsDecl.reduce((acc, name) => {
     acc[name] = env[name];
     return acc;
-  }, {}) ?? {};
+  }, {});
   writeEntryTrace(
     runId,
     { state: entryState, inputs },
@@ -141,7 +147,13 @@ if (parsed.newRun) {
     { current_state: entryState.id, next_state: null },
     { storageRoot: settings.storageRoot },
   );
-  const brief = buildBrief({ doc: fsm.doc, state: entryState, env, runId });
+  const brief = buildBrief({
+    doc: fsm.doc,
+    state: entryState,
+    env,
+    runId,
+    opts: { storageRoot: settings.storageRoot },
+  });
   emit({ ok: true, ...brief });
   process.exit(0);
 }
@@ -181,6 +193,12 @@ if (!lock.acquired) {
 const env = runEnv(runId, { storageRoot: settings.storageRoot });
 const stateId = manifest.current_state ?? fsm.doc.fsm.entry;
 const state = stateById(fsm.doc, stateId);
-const brief = buildBrief({ doc: fsm.doc, state, env, runId });
+const brief = buildBrief({
+  doc: fsm.doc,
+  state,
+  env,
+  runId,
+  opts: { storageRoot: settings.storageRoot },
+});
 emit({ ok: true, resumed: true, ...brief });
 process.exit(0);

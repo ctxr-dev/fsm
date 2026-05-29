@@ -87,7 +87,18 @@ export function runEnv(runId, opts = {}) {
 // Includes the state spec + resolved inputs + transitions + the worker
 // response_schema if present. The orchestrator never reads the FSM YAML;
 // the brief is the only contract.
-export function buildBrief({ doc, state, env, runId }) {
+//
+// For loop states (state.loop present), the brief carries a `loop` section
+// with the current iteration counter and the outputs_path the worker must
+// write to. The iteration counter is derived from existing "iter" trace
+// records for this state in this run; pass runId+opts so we can read the
+// trace from disk. Callers that don't supply opts (no storageRoot) get
+// iteration_n = 1 as a safe default for non-resume flows where the count
+// is already known by the caller.
+export function buildBrief({ doc, state, env, runId, opts = {} }) {
+  if (state.loop) {
+    return buildLoopBrief({ doc, state, env, runId, opts });
+  }
   const brief = {
     run_id: runId,
     fsm_id: doc.fsm.id,
@@ -99,6 +110,7 @@ export function buildBrief({ doc, state, env, runId }) {
     post_validations: state.post_validations ?? [],
     transitions: (state.transitions ?? []).map((t) => ({ to: t.to, when: t.when })),
     has_worker: Boolean(state.worker),
+    has_loop: false,
   };
   if (state.worker) {
     brief.worker = {
@@ -109,6 +121,147 @@ export function buildBrief({ doc, state, env, runId }) {
     };
   }
   return brief;
+}
+
+// sanitiseLoopOutputsDirSegment normalises a loop state's
+// iteration_outputs_dir into a single relative subpath under workers/.
+// Schema validation rejects "/"-leading and ".." segments at FSM load
+// time, but the engine is also called from contexts that may not have
+// re-validated the doc (tests, dynamic FSMs). Re-running the checks here
+// keeps the runtime defensive: a malicious or stale state cannot escape
+// <run_dir>/workers/ via path traversal.
+export function sanitiseLoopOutputsDirSegment(raw, fallbackStateId) {
+  const candidate = raw && typeof raw === "string" && raw.length > 0
+    ? raw
+    : `${fallbackStateId}-iters/`;
+  // Backslashes are a path separator on Windows where `path.join`
+  // interprets them as such; allowing them through the POSIX-split
+  // check below would let `foo\..\bar` traverse out of workers/ on a
+  // Windows host. Reject the whole value up-front so the guard is
+  // platform-portable.
+  if (candidate.includes("\\")) {
+    throw new Error(
+      `sanitiseLoopOutputsDirSegment: iteration_outputs_dir "${raw}" must not contain backslashes (use forward slashes)`,
+    );
+  }
+  // Reject leading "/" AND Windows drive-letter / colon-bearing
+  // segments. `path.join("workers", "C:/abs")` produces "workers/C:/abs"
+  // on POSIX but ends up absolute under path.win32.join, so the guard
+  // has to cover both. Disallow any ":" anywhere in the segment to keep
+  // the rule portable (a legitimate ":" inside a directory name is
+  // exotic and not worth supporting at the cost of the safety bound).
+  if (candidate.startsWith("/")) {
+    throw new Error(
+      `sanitiseLoopOutputsDirSegment: iteration_outputs_dir "${raw}" must be relative; absolute paths are not allowed`,
+    );
+  }
+  if (/^[A-Za-z]:[\\/]/.test(candidate) || candidate.includes(":")) {
+    throw new Error(
+      `sanitiseLoopOutputsDirSegment: iteration_outputs_dir "${raw}" must not contain ":" (Windows drive letters or colon segments could escape workers/)`,
+    );
+  }
+  const trimmed = candidate.replace(/\/+$/, "");
+  if (trimmed.length === 0) {
+    throw new Error(
+      "sanitiseLoopOutputsDirSegment: iteration_outputs_dir collapses to empty after trimming slashes",
+    );
+  }
+  const parts = trimmed.split("/");
+  for (const part of parts) {
+    if (part === "" || part === "." || part === "..") {
+      throw new Error(
+        `sanitiseLoopOutputsDirSegment: iteration_outputs_dir "${raw}" contains an invalid segment ("${part}")`,
+      );
+    }
+  }
+  return trimmed;
+}
+
+// buildLoopBrief composes the per-iteration brief for a loop state. The
+// orchestrator dispatches the worker with `worker.prompt_template` and is
+// expected to write the JSON output to `loop.outputs_path`. Subsequent
+// fsm-commit + fsm-next calls advance the iteration counter or terminate.
+export function buildLoopBrief({ doc, state, env, runId, opts = {} }) {
+  const loop = state.loop;
+  const max = loop.max_iterations ?? 30;
+  const dirSegment = sanitiseLoopOutputsDirSegment(loop.iteration_outputs_dir, state.id);
+  const iterationN = countLoopIterations(runId, state.id, opts) + 1;
+  // outputs_path is part of the worker contract and is consumed across
+  // platforms; always emit POSIX forward slashes regardless of host OS.
+  const outputsPath = `workers/${dirSegment}/iter-${iterationN}.json`;
+  const fakeStateForInputs = { worker: { inputs: loop.worker.inputs ?? [] } };
+  return {
+    run_id: runId,
+    fsm_id: doc.fsm.id,
+    state: state.id,
+    purpose: state.purpose,
+    preconditions: state.preconditions ?? [],
+    inputs: resolveInputs(fakeStateForInputs, env),
+    outputs_expected: state.outputs ?? [],
+    post_validations: state.post_validations ?? [],
+    transitions: (state.transitions ?? []).map((t) => ({ to: t.to, when: t.when })),
+    has_worker: true,
+    has_loop: true,
+    loop: {
+      iteration_n: iterationN,
+      max_iterations: max,
+      done_field: loop.done_field,
+      outputs_path: outputsPath,
+    },
+    worker: {
+      role: loop.worker.role,
+      prompt_template: loop.worker.prompt_template,
+      inputs: loop.worker.inputs ?? [],
+      response_schema: loop.worker.response_schema,
+    },
+  };
+}
+
+// countLoopIterations returns the number of "iter" phase trace records
+// recorded so far for the given state. Returns 0 when the run dir has no
+// trace yet (or no opts.storageRoot is supplied, the test-fixture case).
+// Real readTrace failures (corruption, EIO, parse errors) MUST propagate
+// so buildLoopBrief cannot silently reset to iter-1 and overwrite an
+// existing iteration output file.
+export function countLoopIterations(runId, stateId, opts = {}) {
+  if (!opts || typeof opts.storageRoot !== "string" || opts.storageRoot.length === 0) {
+    return 0;
+  }
+  const trace = readTrace(runId, opts);
+  let n = 0;
+  for (const record of trace) {
+    const payload = record.data ?? record;
+    if (payload?.phase === "iter" && payload?.state === stateId) {
+      n++;
+    }
+  }
+  return n;
+}
+
+// runLoopDecision decides whether a loop state should terminate given the
+// just-committed iteration output. Returns:
+//   { isLoop: false } for non-loop states.
+//   { isLoop: true, terminate: true, reason: "done_field" | "max_iterations", iteration_n }
+//   { isLoop: true, terminate: false, iteration_n }
+export function runLoopDecision(state, outputs, iterationN) {
+  const loop = state.loop;
+  if (!loop) return { isLoop: false };
+  const max = loop.max_iterations ?? 30;
+  const doneField = loop.done_field;
+  // The schema requires the done field to be `boolean`; matching only
+  // the literal `true` here keeps the termination contract honest
+  // when a permissive worker schema or a caller that bypasses
+  // validation lets a non-boolean truthy value (e.g. `"false"`, `1`,
+  // `"yes"`) reach the engine. Anything other than literal `true` is
+  // treated as "continue".
+  const done = outputs?.[doneField] === true;
+  if (done) {
+    return { isLoop: true, terminate: true, reason: "done_field", iteration_n: iterationN };
+  }
+  if (iterationN >= max) {
+    return { isLoop: true, terminate: true, reason: "max_iterations", iteration_n: iterationN };
+  }
+  return { isLoop: true, terminate: false, iteration_n: iterationN };
 }
 
 function resolveInputs(state, env) {
@@ -198,12 +351,14 @@ export function runPostValidations(state) {
 
 // validateOutputs runs the worker.response_schema (if any) over the
 // supplied payload. Returns { valid, errors[] }. Inline states (no worker)
-// skip schema validation and return valid=true.
+// skip schema validation and return valid=true. For loop states the
+// schema lives at state.loop.worker.response_schema.
 export function validateOutputs(state, outputs) {
-  if (!state.worker?.response_schema) {
+  const schema = state.loop?.worker?.response_schema ?? state.worker?.response_schema;
+  if (!schema) {
     return { valid: true, errors: [] };
   }
-  return validateWorkerResponse(state.worker.response_schema, outputs);
+  return validateWorkerResponse(schema, outputs);
 }
 
 // initialiseManifest writes the very first manifest.json for a new run.

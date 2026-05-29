@@ -265,8 +265,8 @@ export function nextTraceSequence(runId, opts = {}) {
 }
 
 export function appendTraceFile(runId, { phase, state, data }, opts = {}) {
-  if (!["entry", "exit", "fault"].includes(phase)) {
-    throw new Error(`appendTraceFile: phase must be entry|exit|fault, got "${phase}"`);
+  if (!["entry", "exit", "fault", "iter"].includes(phase)) {
+    throw new Error(`appendTraceFile: phase must be entry|exit|fault|iter, got "${phase}"`);
   }
   if (!state || typeof state !== "string") {
     throw new Error("appendTraceFile: state must be a non-empty string");

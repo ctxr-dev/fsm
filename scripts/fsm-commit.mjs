@@ -18,6 +18,7 @@ import { readFileSync } from "node:fs";
 
 import { emitJson } from "./lib/emit.mjs";
 import {
+  appendTraceFile,
   readLock,
   readManifest,
   releaseLock,
@@ -25,9 +26,11 @@ import {
 } from "./lib/fsm-storage.mjs";
 import {
   buildBrief,
+  countLoopIterations,
   loadFsm,
   resolveTransition,
   runEnv,
+  runLoopDecision,
   runPostValidations,
   stateById,
   updateManifest,
@@ -36,6 +39,7 @@ import {
   writeExitTrace,
   writeFaultTrace,
 } from "./lib/fsm-engine.mjs";
+import { aggregateLoopOutputs } from "./lib/fsm-aggregator.mjs";
 import { resolveSettings } from "./lib/fsm-config.mjs";
 
 function parseArgs(argv) {
@@ -153,10 +157,74 @@ if (!validationResult.valid) {
   process.exit(1);
 }
 
+// Loop-state branch: write the iter trace and either re-emit the next
+// loop brief (continue) or aggregate + fall through to the regular
+// exit-trace + transition path (terminate).
+let outputsForFlow = parsed.outputs;
+if (state.loop) {
+  const iterationN =
+    countLoopIterations(parsed.runId, state.id, { storageRoot: settings.storageRoot }) + 1;
+  appendTraceFile(
+    parsed.runId,
+    {
+      phase: "iter",
+      state: state.id,
+      data: { iteration_n: iterationN, outputs: parsed.outputs },
+    },
+    { storageRoot: settings.storageRoot },
+  );
+  const decision = runLoopDecision(state, parsed.outputs, iterationN);
+  if (!decision.terminate) {
+    // Bump the manifest's last_update_at on every loop iteration so
+    // run-health and stale-run signals still tick over while the loop
+    // is making progress. current_state is reaffirmed defensively (it
+    // is unchanged for a continuing loop, but this keeps the patch
+    // self-explanatory and survives manifest schema drift).
+    updateManifest(
+      parsed.runId,
+      { current_state: state.id },
+      { storageRoot: settings.storageRoot },
+    );
+    const envSoFar = runEnv(parsed.runId, { storageRoot: settings.storageRoot });
+    const continueBrief = buildBrief({
+      doc: fsm.doc,
+      state,
+      env: envSoFar,
+      runId: parsed.runId,
+      opts: { storageRoot: settings.storageRoot },
+    });
+    emit({
+      ok: true,
+      loop_continued: true,
+      ...continueBrief,
+    });
+    process.exit(0);
+  }
+  // Terminating: aggregate iter outputs into one canonical record and use
+  // that as the loop state's outputs for the rest of the commit flow.
+  // `total_iterations` is the COMMITTED iteration count (taken from
+  // iterationN, the trace-driven counter), NOT agg.iteration_count
+  // which only counts iter-N.json files the aggregator could parse
+  // and schema-validate. Otherwise tolerated invalid iters would make
+  // the manifest's iteration count disagree with max_iterations
+  // bookkeeping and the trace.
+  const runDir = runDirPath(parsed.runId, { storageRoot: settings.storageRoot });
+  const agg = aggregateLoopOutputs(runDir, state, { mergeField: "findings" });
+  outputsForFlow = {
+    [`aggregated_${state.id}`]: agg.aggregated_path,
+    iteration_meta_path: agg.iteration_meta_path,
+    total_iterations: iterationN,
+    aggregated_iteration_count: agg.iteration_count,
+    aggregator_validation_errors: agg.validation_errors,
+    merged_length: agg.merged_length,
+    terminated_by: decision.reason,
+  };
+}
+
 const postValidations = runPostValidations(state);
 
 const env = runEnv(parsed.runId, { storageRoot: settings.storageRoot });
-const envWithCommit = { ...env, ...parsed.outputs };
+const envWithCommit = { ...env, ...outputsForFlow };
 const { transition, evaluations } = resolveTransition(state, envWithCommit, {
   judgementPick: parsed.judgementPick,
 });
@@ -165,7 +233,7 @@ writeExitTrace(
   parsed.runId,
   {
     state,
-    outputs: parsed.outputs,
+    outputs: outputsForFlow,
     postValidations: postValidations.results,
     transitionEvals: evaluations,
     chosenTransition: transition?.to ?? null,
@@ -227,10 +295,16 @@ if (!transition) {
 }
 
 const nextState = stateById(fsm.doc, transition.to);
-const nextInputs = nextState.worker?.inputs?.reduce((acc, name) => {
+// Loop states declare their worker under state.loop.worker; falling back
+// here keeps the entry trace's recorded inputs consistent with what
+// buildBrief will pass to the worker dispatch (otherwise the trace shows
+// no inputs for a loop-entry state, which is misleading on inspection).
+const nextInputsDecl =
+  nextState.worker?.inputs ?? nextState.loop?.worker?.inputs ?? [];
+const nextInputs = nextInputsDecl.reduce((acc, name) => {
   acc[name] = envWithCommit[name];
   return acc;
-}, {}) ?? {};
+}, {});
 writeEntryTrace(
   parsed.runId,
   { state: nextState, inputs: nextInputs },
@@ -245,6 +319,12 @@ updateManifest(
   },
   { storageRoot: settings.storageRoot },
 );
-const brief = buildBrief({ doc: fsm.doc, state: nextState, env: envWithCommit, runId: parsed.runId });
+const brief = buildBrief({
+  doc: fsm.doc,
+  state: nextState,
+  env: envWithCommit,
+  runId: parsed.runId,
+  opts: { storageRoot: settings.storageRoot },
+});
 emit({ ok: true, advanced_from: state.id, ...brief });
 process.exit(0);
