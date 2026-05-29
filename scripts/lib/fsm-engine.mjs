@@ -212,21 +212,23 @@ export function buildLoopBrief({ doc, state, env, runId, opts = {} }) {
 
 // countLoopIterations returns the number of "iter" phase trace records
 // recorded so far for the given state. Returns 0 when the run dir has no
-// trace yet. Tolerant: callers in unit-test contexts without opts get 0.
+// trace yet (or no opts.storageRoot is supplied, the test-fixture case).
+// Real readTrace failures (corruption, EIO, parse errors) MUST propagate
+// so buildLoopBrief cannot silently reset to iter-1 and overwrite an
+// existing iteration output file.
 export function countLoopIterations(runId, stateId, opts = {}) {
-  try {
-    const trace = readTrace(runId, opts);
-    let n = 0;
-    for (const record of trace) {
-      const payload = record.data ?? record;
-      if (payload?.phase === "iter" && payload?.state === stateId) {
-        n++;
-      }
-    }
-    return n;
-  } catch {
+  if (!opts || typeof opts.storageRoot !== "string" || opts.storageRoot.length === 0) {
     return 0;
   }
+  const trace = readTrace(runId, opts);
+  let n = 0;
+  for (const record of trace) {
+    const payload = record.data ?? record;
+    if (payload?.phase === "iter" && payload?.state === stateId) {
+      n++;
+    }
+  }
+  return n;
 }
 
 // runLoopDecision decides whether a loop state should terminate given the

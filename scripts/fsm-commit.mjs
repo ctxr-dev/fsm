@@ -202,12 +202,20 @@ if (state.loop) {
   }
   // Terminating: aggregate iter outputs into one canonical record and use
   // that as the loop state's outputs for the rest of the commit flow.
+  // `total_iterations` is the COMMITTED iteration count (taken from
+  // iterationN, the trace-driven counter), NOT agg.iteration_count
+  // which only counts iter-N.json files the aggregator could parse
+  // and schema-validate. Otherwise tolerated invalid iters would make
+  // the manifest's iteration count disagree with max_iterations
+  // bookkeeping and the trace.
   const runDir = runDirPath(parsed.runId, { storageRoot: settings.storageRoot });
   const agg = aggregateLoopOutputs(runDir, state, { mergeField: "findings" });
   outputsForFlow = {
     [`aggregated_${state.id}`]: agg.aggregated_path,
     iteration_meta_path: agg.iteration_meta_path,
-    total_iterations: agg.iteration_count,
+    total_iterations: iterationN,
+    aggregated_iteration_count: agg.iteration_count,
+    aggregator_validation_errors: agg.validation_errors,
     merged_length: agg.merged_length,
     terminated_by: decision.reason,
   };

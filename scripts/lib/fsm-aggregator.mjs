@@ -62,6 +62,16 @@ export function aggregateLoopOutputs(runDir, state, { mergeField = "findings" } 
   if (typeof state.id !== "string" || state.id.length === 0) {
     throw new TypeError("aggregateLoopOutputs: state.id must be a non-empty string");
   }
+  // Match the schema-layer constraint (snake_case lowercase + digits +
+  // underscore). state.id feeds directly into output filenames; a
+  // caller-supplied id like "../x" or "a/b" would either escape the
+  // workers/ subdir or split into nested dirs that nothing else
+  // expects. Validate once here so the public-surface call is safe.
+  if (!/^[a-z][a-z0-9_]*$/.test(state.id)) {
+    throw new TypeError(
+      `aggregateLoopOutputs: state.id must be snake_case (lowercase letters, digits, underscores), got "${state.id}"`,
+    );
+  }
   if (typeof mergeField !== "string" || mergeField.length === 0) {
     throw new TypeError("aggregateLoopOutputs: mergeField must be a non-empty string");
   }
