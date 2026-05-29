@@ -309,9 +309,19 @@ export function lintFile(filePath, source) {
     // must still be analysed by the per-line rules.
     const isSingleLineBlockComment =
       trimmedForBc.startsWith("/*") && trimmedForBc.includes("*/");
+    // The closing line of a multi-line block is treated as comment
+    // ONLY when nothing follows the terminator on the same line. If
+    // there is real code after `*/` (e.g. `*/ readFileSync(...)`),
+    // we still analyse the line; the stripBlockTail step below strips
+    // the leading `text */` prefix before the regexes see it.
+    const closerWithCode =
+      isBlockClosingLine && /\*\/\s*\S/.test(trimmedForBc.slice(trimmedForBc.indexOf("*/")));
     const lineIsBlockComment =
-      (inBlockComment || isBlockClosingLine || trimmedForBc.startsWith("/*")) &&
-      !isSingleLineBlockComment;
+      (
+        inBlockComment ||
+        (isBlockClosingLine && !closerWithCode) ||
+        trimmedForBc.startsWith("/*")
+      ) && !isSingleLineBlockComment;
     // The fsm-lint:ignore marker is intentionally per-line for the
     // single-line rules (no-direct-fsm-yaml-read and
     // no-orchestrator-llm-call); previous-line suppression is
@@ -351,9 +361,15 @@ export function lintFile(filePath, source) {
     // Strip any inline /* ... */ from the current line before the
     // per-line regexes look at it, so a `.fsm.yaml` string literal
     // sitting only inside a commented-out arg (`readFileSync(/* "x.fsm.yaml" */ y)`)
-    // is not matched. The inBlockComment state above handles the
-    // multi-line case; this handles a single-line inline block.
-    const codeOnly = stripInlineBlockComments(line);
+    // is not matched. If this line is the closer of a multi-line
+    // block (and contains real code after `*/`), additionally strip
+    // the leading `text */` prefix so the regexes only see the
+    // executable tail.
+    let scrubbed = line;
+    if (closerWithCode) {
+      scrubbed = scrubbed.slice(scrubbed.indexOf("*/") + 2);
+    }
+    const codeOnly = stripInlineBlockComments(scrubbed);
 
     // Rule: no-direct-fsm-yaml-read. Match a known read API name
     // followed by `(`, with `.fsm.yaml` appearing somewhere on the
