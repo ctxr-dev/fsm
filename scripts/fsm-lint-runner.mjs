@@ -67,6 +67,7 @@
 
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const USAGE = `Usage: fsm-lint-runner [--help] <runner-file> [<runner-file> ...]
 
@@ -84,8 +85,10 @@ offending line (or the line immediately before, for multi-line
 constructs).
 `;
 
-// Public entry points are exported so the test suite can drive the
-// linter without spawning a subprocess for every assertion.
+// Public entry points are exported so callers (other tools, or future
+// in-process tests) can drive the lint pipeline directly; the current
+// test suite still uses spawnSync against the CLI to also exercise the
+// argv / exit-code path that real consumers go through.
 
 export const RULES = {
   NO_DIRECT_FSM_YAML_READ: "no-direct-fsm-yaml-read",
@@ -116,6 +119,8 @@ const LLM_CALL_PATTERNS = [
   /\bclient\s*\.\s*messages\b/,
   /\bTask\s*\(/,
   /\bAgent\s*\(/,
+  /\bSkill\s*\(/,
+  /\bBash\s*\(/,
   /\bWebFetch\s*\(/,
   /\bWebSearch\s*\(/,
 ];
@@ -335,7 +340,11 @@ function isDirectInvocation() {
   if (!process.argv[1]) return false;
   try {
     const entry = resolve(process.argv[1]);
-    const self = new URL(import.meta.url).pathname;
+    // fileURLToPath decodes URL escapes (e.g. %20 for spaces) and
+    // produces an OS-native path on Windows, where `new URL(...).pathname`
+    // gives a leading-slash POSIX-style string that does not match
+    // `resolve(process.argv[1])`. Decode first; compare second.
+    const self = fileURLToPath(import.meta.url);
     return entry === self;
   } catch {
     return false;
