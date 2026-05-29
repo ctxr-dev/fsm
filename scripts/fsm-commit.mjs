@@ -13,16 +13,22 @@
 // Output: JSON brief for the next state on success, or
 // { status: "terminal", verdict, run_dir_path } at terminal.
 // Exit 0 on success, non-zero on schema/validation failure.
+//
+// A7 atomic-tx: every multi-file write sequence below runs inside
+// withJournal(). On crash, the journal stays on disk and either
+// fsm-resume --journal discard rolls back or --journal replay finalises.
 
 import { readFileSync } from "node:fs";
 
 import { emitJson } from "./lib/emit.mjs";
 import {
   appendTraceFile,
+  journalState,
   readLock,
   readManifest,
   releaseLock,
   runDirPath,
+  withJournal,
 } from "./lib/fsm-storage.mjs";
 import {
   buildBrief,
@@ -128,234 +134,322 @@ if (!stateId) {
 }
 
 const state = stateById(fsm.doc, stateId);
+const runDir = runDirPath(parsed.runId, { storageRoot: settings.storageRoot });
 
-const validationResult = validateOutputs(state, parsed.outputs);
-if (!validationResult.valid) {
-  writeFaultTrace(
-    parsed.runId,
-    {
-      state,
-      reason: "output_schema_violation",
-      details: validationResult.errors,
-    },
-    { storageRoot: settings.storageRoot },
-  );
-  updateManifest(
-    parsed.runId,
-    { status: "faulted", ended_at: new Date().toISOString() },
-    { storageRoot: settings.storageRoot },
-  );
-  releaseLock(parsed.runId, {
-    sessionId: settings.sessionId,
-    storageRoot: settings.storageRoot,
-  });
+// A7: a previous commit may have crashed between "ready_to_finalise" and
+// the rename loop, leaving a journal on disk. Refuse to commit anything
+// new until the user recovers (fsm-resume --journal discard|replay).
+const existingJournal = journalState(runDir);
+if (existingJournal.hasJournal) {
   emit({
-    error: "output_schema_violation",
-    state: state.id,
-    errors: validationResult.errors,
+    error: "incomplete_commit_detected",
+    run_id: parsed.runId,
+    journal: {
+      txn_id: existingJournal.txnId,
+      status: existingJournal.status,
+      staged: existingJournal.staged.map((s) => s.relPath),
+    },
+    recovery: {
+      discard: `fsm-resume --run-id ${parsed.runId} --journal discard`,
+      replay: `fsm-resume --run-id ${parsed.runId} --journal replay`,
+    },
   });
   process.exit(1);
 }
 
-// Loop-state branch: write the iter trace and either re-emit the next
-// loop brief (continue) or aggregate + fall through to the regular
-// exit-trace + transition path (terminate).
-let outputsForFlow = parsed.outputs;
-if (state.loop) {
-  const iterationN =
-    countLoopIterations(parsed.runId, state.id, { storageRoot: settings.storageRoot }) + 1;
-  appendTraceFile(
-    parsed.runId,
-    {
-      phase: "iter",
-      state: state.id,
-      data: { iteration_n: iterationN, outputs: parsed.outputs },
-    },
-    { storageRoot: settings.storageRoot },
-  );
-  const decision = runLoopDecision(state, parsed.outputs, iterationN);
-  if (!decision.terminate) {
-    // Bump the manifest's last_update_at on every loop iteration so
-    // run-health and stale-run signals still tick over while the loop
-    // is making progress. current_state is reaffirmed defensively (it
-    // is unchanged for a continuing loop, but this keeps the patch
-    // self-explanatory and survives manifest schema drift).
-    updateManifest(
-      parsed.runId,
-      { current_state: state.id },
-      { storageRoot: settings.storageRoot },
-    );
-    const envSoFar = runEnv(parsed.runId, { storageRoot: settings.storageRoot });
-    const continueBrief = buildBrief({
-      doc: fsm.doc,
-      state,
-      env: envSoFar,
-      runId: parsed.runId,
-      opts: { storageRoot: settings.storageRoot },
+// commitPlan holds the post-finalise actions decided inside the journal.
+// Each branch sets one shape:
+//   { kind: "loop_continued" } — re-emit current state's next-iter brief.
+//   { kind: "fault", releaseLock: true, payload, exitCode: 1 } — schema
+//        violation, post-validation failure, or no-transition fault.
+//   { kind: "terminal", releaseLock: true, payload } — run completed.
+//   { kind: "advance", nextStateId, envWithCommit } — advance to next.
+let commitPlan;
+
+try {
+  withJournal(runDir, (txn) => {
+    const txOpts = { storageRoot: settings.storageRoot, transaction: txn };
+
+    const validationResult = validateOutputs(state, parsed.outputs);
+    if (!validationResult.valid) {
+      writeFaultTrace(
+        parsed.runId,
+        {
+          state,
+          reason: "output_schema_violation",
+          details: validationResult.errors,
+        },
+        txOpts,
+      );
+      updateManifest(
+        parsed.runId,
+        { status: "faulted", ended_at: new Date().toISOString() },
+        txOpts,
+      );
+      commitPlan = {
+        kind: "fault",
+        releaseLock: true,
+        payload: {
+          error: "output_schema_violation",
+          state: state.id,
+          errors: validationResult.errors,
+        },
+        exitCode: 1,
+      };
+      return;
+    }
+
+    // Loop-state branch: write the iter trace and either re-emit the
+    // next loop brief (continue) or aggregate + fall through to the
+    // regular exit-trace + transition path (terminate).
+    let outputsForFlow = parsed.outputs;
+    if (state.loop) {
+      const iterationN =
+        countLoopIterations(parsed.runId, state.id, txOpts) + 1;
+      appendTraceFile(
+        parsed.runId,
+        {
+          phase: "iter",
+          state: state.id,
+          data: { iteration_n: iterationN, outputs: parsed.outputs },
+        },
+        txOpts,
+      );
+      const decision = runLoopDecision(state, parsed.outputs, iterationN);
+      if (!decision.terminate) {
+        // Bump the manifest's last_update_at on every loop iteration so
+        // run-health and stale-run signals still tick over while the
+        // loop is making progress. current_state is reaffirmed
+        // defensively (unchanged for a continuing loop, but keeps the
+        // patch self-explanatory and survives manifest schema drift).
+        updateManifest(
+          parsed.runId,
+          { current_state: state.id },
+          txOpts,
+        );
+        commitPlan = { kind: "loop_continued" };
+        return;
+      }
+      // Terminating: aggregate iter outputs into one canonical record
+      // and use that as the loop state's outputs for the rest of the
+      // commit flow. The aggregator writes through the journal so the
+      // aggregated.json + iteration-meta.json land in the same atomic
+      // step as the exit trace.
+      const agg = aggregateLoopOutputs(runDir, state, {
+        mergeField: "findings",
+        transaction: txn,
+      });
+      outputsForFlow = {
+        [`aggregated_${state.id}`]: agg.aggregated_path,
+        iteration_meta_path: agg.iteration_meta_path,
+        // total_iterations is the COMMITTED iteration count (taken from
+        // iterationN, the trace-driven counter), NOT agg.iteration_count
+        // which only counts iter-N.json files the aggregator could
+        // parse and schema-validate. Otherwise tolerated invalid iters
+        // would make the manifest's iteration count disagree with
+        // max_iterations bookkeeping and the trace.
+        total_iterations: iterationN,
+        aggregated_iteration_count: agg.iteration_count,
+        aggregator_validation_errors: agg.validation_errors,
+        merged_length: agg.merged_length,
+        terminated_by: decision.reason,
+      };
+    }
+
+    // Post-validations run against the freshly-committed outputs. For
+    // a terminating loop state, outputsForFlow is the aggregated record
+    // (the canonical post-loop output), so predicates that need to
+    // inspect the aggregate (`total_iterations`, etc.) see them; for a
+    // non-loop state outputsForFlow === parsed.outputs.
+    const postValidations = runPostValidations(state, outputsForFlow);
+    if (!postValidations.valid) {
+      writeFaultTrace(
+        parsed.runId,
+        {
+          state,
+          reason: "post_validation_failed",
+          details: { post_validations: postValidations.results },
+        },
+        txOpts,
+      );
+      updateManifest(
+        parsed.runId,
+        { status: "faulted", ended_at: new Date().toISOString() },
+        txOpts,
+      );
+      commitPlan = {
+        kind: "fault",
+        releaseLock: true,
+        payload: {
+          error: "post_validation_failed",
+          state: state.id,
+          post_validations: postValidations.results,
+        },
+        exitCode: 1,
+      };
+      return;
+    }
+
+    const env = runEnv(parsed.runId, { storageRoot: settings.storageRoot });
+    const envWithCommit = { ...env, ...outputsForFlow };
+    const { transition, evaluations } = resolveTransition(state, envWithCommit, {
+      judgementPick: parsed.judgementPick,
     });
-    emit({
-      ok: true,
-      loop_continued: true,
-      ...continueBrief,
-    });
-    process.exit(0);
-  }
-  // Terminating: aggregate iter outputs into one canonical record and use
-  // that as the loop state's outputs for the rest of the commit flow.
-  // `total_iterations` is the COMMITTED iteration count (taken from
-  // iterationN, the trace-driven counter), NOT agg.iteration_count
-  // which only counts iter-N.json files the aggregator could parse
-  // and schema-validate. Otherwise tolerated invalid iters would make
-  // the manifest's iteration count disagree with max_iterations
-  // bookkeeping and the trace.
-  const runDir = runDirPath(parsed.runId, { storageRoot: settings.storageRoot });
-  const agg = aggregateLoopOutputs(runDir, state, { mergeField: "findings" });
-  outputsForFlow = {
-    [`aggregated_${state.id}`]: agg.aggregated_path,
-    iteration_meta_path: agg.iteration_meta_path,
-    total_iterations: iterationN,
-    aggregated_iteration_count: agg.iteration_count,
-    aggregator_validation_errors: agg.validation_errors,
-    merged_length: agg.merged_length,
-    terminated_by: decision.reason,
-  };
-}
 
-// Post-validations run against the freshly-committed outputs. For a
-// terminating loop state, outputsForFlow is the aggregated record (the
-// canonical post-loop output), so predicates that need to inspect the
-// aggregate (`total_iterations`, etc.) see them; for a non-loop state
-// outputsForFlow === parsed.outputs.
-const postValidations = runPostValidations(state, outputsForFlow);
-if (!postValidations.valid) {
-  writeFaultTrace(
-    parsed.runId,
-    {
-      state,
-      reason: "post_validation_failed",
-      details: { post_validations: postValidations.results },
-    },
-    { storageRoot: settings.storageRoot },
-  );
-  updateManifest(
-    parsed.runId,
-    { status: "faulted", ended_at: new Date().toISOString() },
-    { storageRoot: settings.storageRoot },
-  );
-  releaseLock(parsed.runId, {
-    sessionId: settings.sessionId,
-    storageRoot: settings.storageRoot,
-  });
-  emit({
-    error: "post_validation_failed",
-    state: state.id,
-    post_validations: postValidations.results,
-  });
-  process.exit(1);
-}
-
-const env = runEnv(parsed.runId, { storageRoot: settings.storageRoot });
-const envWithCommit = { ...env, ...outputsForFlow };
-const { transition, evaluations } = resolveTransition(state, envWithCommit, {
-  judgementPick: parsed.judgementPick,
-});
-
-writeExitTrace(
-  parsed.runId,
-  {
-    state,
-    outputs: outputsForFlow,
-    postValidations: postValidations.results,
-    transitionEvals: evaluations,
-    chosenTransition: transition?.to ?? null,
-  },
-  { storageRoot: settings.storageRoot },
-);
-
-if (!transition) {
-  if ((state.transitions ?? []).length > 0) {
-    writeFaultTrace(
+    writeExitTrace(
       parsed.runId,
       {
         state,
-        reason: "no_transition_matched",
-        details: { evaluations },
+        outputs: outputsForFlow,
+        postValidations: postValidations.results,
+        transitionEvals: evaluations,
+        chosenTransition: transition?.to ?? null,
       },
-      { storageRoot: settings.storageRoot },
+      txOpts,
+    );
+
+    if (!transition) {
+      if ((state.transitions ?? []).length > 0) {
+        writeFaultTrace(
+          parsed.runId,
+          {
+            state,
+            reason: "no_transition_matched",
+            details: { evaluations },
+          },
+          txOpts,
+        );
+        updateManifest(
+          parsed.runId,
+          { status: "faulted", ended_at: new Date().toISOString() },
+          txOpts,
+        );
+        commitPlan = {
+          kind: "fault",
+          releaseLock: true,
+          payload: {
+            error: "no_transition_matched",
+            state: state.id,
+            evaluations,
+          },
+          exitCode: 1,
+        };
+        return;
+      }
+      updateManifest(
+        parsed.runId,
+        {
+          status: "completed",
+          current_state: state.id,
+          next_state: null,
+          ended_at: new Date().toISOString(),
+          verdict: envWithCommit.verdict ?? null,
+          transitions_count: (manifest.transitions_count ?? 0) + 1,
+        },
+        txOpts,
+      );
+      commitPlan = {
+        kind: "terminal",
+        releaseLock: true,
+        payload: {
+          ok: true,
+          status: "terminal",
+          state: state.id,
+          verdict: envWithCommit.verdict ?? null,
+          run_dir_path: runDir,
+        },
+      };
+      return;
+    }
+
+    const nextState = stateById(fsm.doc, transition.to);
+    // Loop states declare their worker under state.loop.worker; falling
+    // back here keeps the entry trace's recorded inputs consistent with
+    // what buildBrief will pass to the worker dispatch.
+    const nextInputsDecl =
+      nextState.worker?.inputs ?? nextState.loop?.worker?.inputs ?? [];
+    const nextInputs = nextInputsDecl.reduce((acc, name) => {
+      acc[name] = envWithCommit[name];
+      return acc;
+    }, {});
+    writeEntryTrace(
+      parsed.runId,
+      { state: nextState, inputs: nextInputs },
+      txOpts,
     );
     updateManifest(
       parsed.runId,
-      { status: "faulted", ended_at: new Date().toISOString() },
-      { storageRoot: settings.storageRoot },
+      {
+        current_state: nextState.id,
+        next_state: null,
+        transitions_count: (manifest.transitions_count ?? 0) + 1,
+      },
+      txOpts,
     );
-    releaseLock(parsed.runId, {
-      sessionId: settings.sessionId,
-      storageRoot: settings.storageRoot,
-    });
+    commitPlan = {
+      kind: "advance",
+      nextStateId: nextState.id,
+      envWithCommit,
+      advancedFrom: state.id,
+    };
+  });
+} catch (err) {
+  // If withJournal itself refused (e.g. a journal raced into existence
+  // between our pre-check and the start of the txn) surface it as a
+  // structured error rather than a stack trace.
+  if (err && err.code === "JOURNAL_PRESENT") {
     emit({
-      error: "no_transition_matched",
-      state: state.id,
-      evaluations,
+      error: "incomplete_commit_detected",
+      run_id: parsed.runId,
+      journal: err.journal,
     });
     process.exit(1);
   }
-  updateManifest(
-    parsed.runId,
-    {
-      status: "completed",
-      current_state: state.id,
-      next_state: null,
-      ended_at: new Date().toISOString(),
-      verdict: envWithCommit.verdict ?? null,
-      transitions_count: (manifest.transitions_count ?? 0) + 1,
-    },
-    { storageRoot: settings.storageRoot },
-  );
+  fail(err.message, 1);
+}
+
+// All journal writes have finalised. The post-finalise phase reads from
+// disk to compute emit-only payloads (briefs, etc.) and optionally
+// releases the lock. None of the work below is required for crash
+// recovery: the manifest already records the new state.
+
+if (commitPlan.releaseLock) {
   releaseLock(parsed.runId, {
     sessionId: settings.sessionId,
     storageRoot: settings.storageRoot,
   });
+}
+
+if (commitPlan.kind === "fault" || commitPlan.kind === "terminal") {
+  emit(commitPlan.payload);
+  process.exit(commitPlan.exitCode ?? 0);
+}
+
+if (commitPlan.kind === "loop_continued") {
+  const envSoFar = runEnv(parsed.runId, { storageRoot: settings.storageRoot });
+  const continueBrief = buildBrief({
+    doc: fsm.doc,
+    state,
+    env: envSoFar,
+    runId: parsed.runId,
+    opts: { storageRoot: settings.storageRoot },
+  });
   emit({
     ok: true,
-    status: "terminal",
-    state: state.id,
-    verdict: envWithCommit.verdict ?? null,
-    run_dir_path: runDirPath(parsed.runId, { storageRoot: settings.storageRoot }),
+    loop_continued: true,
+    ...continueBrief,
   });
   process.exit(0);
 }
 
-const nextState = stateById(fsm.doc, transition.to);
-// Loop states declare their worker under state.loop.worker; falling back
-// here keeps the entry trace's recorded inputs consistent with what
-// buildBrief will pass to the worker dispatch (otherwise the trace shows
-// no inputs for a loop-entry state, which is misleading on inspection).
-const nextInputsDecl =
-  nextState.worker?.inputs ?? nextState.loop?.worker?.inputs ?? [];
-const nextInputs = nextInputsDecl.reduce((acc, name) => {
-  acc[name] = envWithCommit[name];
-  return acc;
-}, {});
-writeEntryTrace(
-  parsed.runId,
-  { state: nextState, inputs: nextInputs },
-  { storageRoot: settings.storageRoot },
-);
-updateManifest(
-  parsed.runId,
-  {
-    current_state: nextState.id,
-    next_state: null,
-    transitions_count: (manifest.transitions_count ?? 0) + 1,
-  },
-  { storageRoot: settings.storageRoot },
-);
+// kind === "advance"
+const nextState = stateById(fsm.doc, commitPlan.nextStateId);
 const brief = buildBrief({
   doc: fsm.doc,
   state: nextState,
-  env: envWithCommit,
+  env: commitPlan.envWithCommit,
   runId: parsed.runId,
   opts: { storageRoot: settings.storageRoot },
 });
-emit({ ok: true, advanced_from: state.id, ...brief });
+emit({ ok: true, advanced_from: commitPlan.advancedFrom, ...brief });
 process.exit(0);

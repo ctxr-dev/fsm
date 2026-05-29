@@ -576,7 +576,7 @@ test("fsm-resume: rejects missing --run-id", () => {
   }
 });
 
-test("fsm-resume: rejects missing --from-state", () => {
+test("fsm-resume: rejects missing --from-state and missing --journal", () => {
   const tmp = setupFixture();
   try {
     const result = runScript("fsm-resume.mjs", [
@@ -584,7 +584,13 @@ test("fsm-resume: rejects missing --from-state", () => {
       ...commonArgs(tmp),
     ]);
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /--from-state is required/);
+    // Post-A7, callers must pass either --from-state (rewind to a prior
+    // entered state) or --journal {discard|replay} (recover an incomplete
+    // commit). Either is acceptable; missing both is the error.
+    assert.match(
+      result.stderr,
+      /either --from-state or --journal <discard\|replay> is required/,
+    );
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }

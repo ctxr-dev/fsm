@@ -27,7 +27,9 @@ import {
   acquireLock,
   buildRunId,
   ensureRunDir,
+  journalState,
   readManifest,
+  runDirPath,
 } from "./lib/fsm-storage.mjs";
 import {
   buildBrief,
@@ -179,6 +181,28 @@ if (manifest.status !== "in_progress" && manifest.status !== "paused") {
     error: "run_not_resumable",
     run_id: runId,
     status: manifest.status,
+  });
+  process.exit(1);
+}
+// A7: refuse to advance if a previous commit left a journal on disk.
+// The journal contains the intent of the last (crashed) commit; the
+// user must explicitly recover via `fsm-resume --journal discard|replay`
+// before any new state work can be done.
+const resumeRunDir = runDirPath(runId, { storageRoot: settings.storageRoot });
+const resumeJournal = journalState(resumeRunDir);
+if (resumeJournal.hasJournal) {
+  emit({
+    error: "incomplete_commit_detected",
+    run_id: runId,
+    journal: {
+      txn_id: resumeJournal.txnId,
+      status: resumeJournal.status,
+      staged: resumeJournal.staged.map((s) => s.relPath),
+    },
+    recovery: {
+      discard: `fsm-resume --run-id ${runId} --journal discard`,
+      replay: `fsm-resume --run-id ${runId} --journal replay`,
+    },
   });
   process.exit(1);
 }

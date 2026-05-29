@@ -24,6 +24,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   rmSync,
   writeFileSync,
   openSync,
@@ -31,10 +32,11 @@ import {
   fsyncSync,
   statSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { stringify as stringifyYaml, parse as parseYaml } from "yaml";
 
 const LOCK_TTL_MS_DEFAULT = 60 * 60 * 1000; // 1 hour
+const JOURNAL_DIR_NAME = ".journal";
 
 // ─── run-id ─────────────────────────────────────────────────────────────
 
@@ -159,12 +161,30 @@ export function atomicWriteYaml(path, data) {
 // ─── manifest.json ──────────────────────────────────────────────────────
 
 export function readManifest(runId, opts = {}) {
+  // When called inside a transaction, prefer the staged manifest if one
+  // has already been written this turn so successive updateManifest
+  // calls compose (read-merge-write) instead of clobbering each other.
+  const txn = opts.transaction;
+  if (txn && typeof txn.readStagedManifest === "function") {
+    const staged = txn.readStagedManifest();
+    if (staged) return staged;
+  }
   const path = join(runDirPath(runId, opts), "manifest.json");
   if (!existsSync(path)) return null;
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
 export function writeManifest(runId, data, opts = {}) {
+  const txn = opts.transaction;
+  if (txn) {
+    const relPath = "manifest.json";
+    const stagedPath = txn.stage(relPath);
+    atomicWriteJson(stagedPath, data);
+    if (!txn.staged.some((s) => s.relPath === relPath)) {
+      txn.addStaged(relPath, stagedPath);
+    }
+    return;
+  }
   const dir = ensureRunDir(runId, opts);
   atomicWriteJson(join(dir, "manifest.json"), data);
 }
@@ -271,19 +291,34 @@ export function appendTraceFile(runId, { phase, state, data }, opts = {}) {
   if (!state || typeof state !== "string") {
     throw new Error("appendTraceFile: state must be a non-empty string");
   }
-  const dir = ensureRunDir(runId, opts);
-  const seq = nextTraceSequence(runId, opts);
-  const seqStr = String(seq).padStart(4, "0");
-  const fileName = `${seqStr}-${phase}-${state}.yaml`;
-  const filePath = join(dir, "fsm-trace", fileName);
-  const payload = {
+  const txn = opts.transaction;
+  const payload = (seq) => ({
     phase,
     state,
     sequence: seq,
     timestamp: new Date().toISOString(),
     ...data,
-  };
-  atomicWriteYaml(filePath, payload);
+  });
+  if (txn) {
+    // Sequence accounting must include both on-disk traces and traces
+    // already staged in this transaction so a single commit that
+    // writes (entry-N, exit-N) gets sequential numbers even though
+    // neither file has been moved into place yet.
+    const seq = nextTraceSequence(runId, opts) + txn.stagedTraceCount();
+    const seqStr = String(seq).padStart(4, "0");
+    const fileName = `${seqStr}-${phase}-${state}.yaml`;
+    const relPath = `fsm-trace/${fileName}`;
+    const stagedPath = txn.stage(relPath);
+    atomicWriteYaml(stagedPath, payload(seq));
+    txn.addStaged(relPath, stagedPath);
+    return { sequence: seq, fileName, path: join(txn.runDir, relPath) };
+  }
+  const dir = ensureRunDir(runId, opts);
+  const seq = nextTraceSequence(runId, opts);
+  const seqStr = String(seq).padStart(4, "0");
+  const fileName = `${seqStr}-${phase}-${state}.yaml`;
+  const filePath = join(dir, "fsm-trace", fileName);
+  atomicWriteYaml(filePath, payload(seq));
   return { sequence: seq, fileName, path: filePath };
 }
 
@@ -325,6 +360,258 @@ export function pruneTraceAfter(runId, sequence, opts = {}) {
     rmSync(join(traceDir, entry.name), { force: true });
   }
   return { removed: candidates.length, files: candidates.map((c) => c.name) };
+}
+
+// ─── atomic-tx journal (A7) ─────────────────────────────────────────────
+//
+// withJournal(runDir, fn) is the journal-style transaction wrapper that
+// makes a multi-file fsm-commit a single atomic step. Inside `fn`, callers
+// stage writes to <runDir>/.journal/<txnId>/<mirror-of-relPath> instead of
+// the final location. After `fn` returns successfully:
+//   1. mark the journal manifest as "ready_to_finalise"
+//   2. rename each staged file from its journal path to its final path
+//   3. delete the journal directory
+//
+// If any step throws or the process is killed, the journal stays on disk
+// and recovery is explicit:
+//   - journalState(runDir) returns { hasJournal, status, txnId, staged }.
+//   - discardJournal(runDir, txnId) removes the journal (rollback).
+//   - replayJournal(runDir, txnId) idempotently finalises a journal whose
+//     status is "ready_to_finalise" — safe to call repeatedly.
+//
+// fsm-next refuses to advance while a journal is present; fsm-resume
+// exposes `--journal discard|replay` as the recovery path.
+
+export function journalRoot(runDir) {
+  return join(runDir, JOURNAL_DIR_NAME);
+}
+
+function readJournalManifestSync(txnDir) {
+  const path = join(txnDir, "journal.json");
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeJournalManifestSync(txnDir, data) {
+  atomicWriteJson(join(txnDir, "journal.json"), data);
+}
+
+// journalState inspects <runDir>/.journal/ and returns the most recent
+// transaction if any. Returns { hasJournal:false } when the directory is
+// absent or empty.
+export function journalState(runDir) {
+  const root = journalRoot(runDir);
+  if (!existsSync(root)) return { hasJournal: false };
+  const entries = readdirSync(root).filter((n) => {
+    const p = join(root, n);
+    try {
+      return statSync(p).isDirectory();
+    } catch {
+      return false;
+    }
+  });
+  if (entries.length === 0) return { hasJournal: false };
+  // Most recent by name (txnId is timestamp-prefixed) is the active one.
+  const txnIds = entries.sort();
+  const all = txnIds.map((id) => {
+    const txnDir = join(root, id);
+    const manifest = readJournalManifestSync(txnDir);
+    return { txnId: id, txnDir, manifest };
+  });
+  const active = all[all.length - 1];
+  return {
+    hasJournal: true,
+    txnId: active.txnId,
+    txnDir: active.txnDir,
+    status: active.manifest ? active.manifest.status : "unknown",
+    staged: active.manifest ? active.manifest.staged_files || [] : [],
+    runDir: active.manifest ? active.manifest.run_dir : runDir,
+    all,
+  };
+}
+
+// discardJournal removes a specific journal transaction directory. If the
+// transaction is "ready_to_finalise", callers should usually replay instead
+// — discarding loses the work — but the explicit choice is the user's.
+export function discardJournal(runDir, txnId) {
+  const txnDir = join(journalRoot(runDir), txnId);
+  if (!existsSync(txnDir)) {
+    return { discarded: false, reason: "not_found" };
+  }
+  rmSync(txnDir, { recursive: true, force: true });
+  // Clean up empty journal root.
+  const root = journalRoot(runDir);
+  if (existsSync(root) && readdirSync(root).length === 0) {
+    try {
+      rmdirSync(root);
+    } catch {
+      // Race on cleanup is harmless.
+    }
+  }
+  return { discarded: true, txnId };
+}
+
+// replayJournal finalises a "ready_to_finalise" journal by renaming each
+// staged file to its final location. Safe to re-run: a missing staged
+// source is treated as already-finalised.
+export function replayJournal(runDir, txnId) {
+  const txnDir = join(journalRoot(runDir), txnId);
+  const manifest = readJournalManifestSync(txnDir);
+  if (!manifest) {
+    return { replayed: false, reason: "no_manifest" };
+  }
+  if (manifest.status !== "ready_to_finalise") {
+    return { replayed: false, reason: `status_${manifest.status}` };
+  }
+  const finalised = [];
+  for (const entry of manifest.staged_files || []) {
+    const stagedPath = join(txnDir, entry.relPath);
+    const finalPath = join(runDir, entry.relPath);
+    if (!existsSync(stagedPath)) {
+      finalised.push({ relPath: entry.relPath, already: true });
+      continue;
+    }
+    mkdirSync(dirname(finalPath), { recursive: true });
+    renameSync(stagedPath, finalPath);
+    finalised.push({ relPath: entry.relPath, already: false });
+  }
+  rmSync(txnDir, { recursive: true, force: true });
+  const root = journalRoot(runDir);
+  if (existsSync(root) && readdirSync(root).length === 0) {
+    try {
+      rmdirSync(root);
+    } catch {
+      // Empty-dir cleanup race is harmless.
+    }
+  }
+  return { replayed: true, txnId, finalised };
+}
+
+// withJournal(runDir, fn): runs `fn(txn)` inside a journal transaction.
+// `fn` MUST route its file writes through the storage helpers with
+// `opts.transaction = txn` so writes land in the journal. After fn returns,
+// the journal is marked ready_to_finalise and the rename loop runs.
+// On any throw, the journal is left in place for explicit recovery.
+//
+// FSM_TEST_PAUSE_BEFORE_FINALISE=<ms> (env): synchronously sleep before
+// the rename loop. Lets integration tests SIGKILL the process at that
+// instant to simulate a crash between "fn returned" and "finalisation".
+export function withJournal(runDir, fn) {
+  if (!runDir || typeof runDir !== "string") {
+    throw new Error("withJournal: runDir is required");
+  }
+  if (typeof fn !== "function") {
+    throw new Error("withJournal: fn must be a function");
+  }
+  // Refuse to start a new transaction while an unrecovered journal exists.
+  const existing = journalState(runDir);
+  if (existing.hasJournal) {
+    const err = new Error(
+      `withJournal: refusing to start — existing journal txn=${existing.txnId} status=${existing.status}; recover via fsm-resume --journal {discard|replay}`,
+    );
+    err.code = "JOURNAL_PRESENT";
+    err.journal = existing;
+    throw err;
+  }
+
+  const txnId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomBytes(3).toString("hex")}`;
+  const root = journalRoot(runDir);
+  const txnDir = join(root, txnId);
+  mkdirSync(txnDir, { recursive: true });
+
+  const stagedFiles = [];
+
+  const txn = {
+    txnId,
+    runDir,
+    txnDir,
+    staged: stagedFiles,
+    stage(relPath) {
+      const stagedPath = join(txnDir, relPath);
+      mkdirSync(dirname(stagedPath), { recursive: true });
+      return stagedPath;
+    },
+    addStaged(relPath, stagedPath) {
+      stagedFiles.push({ relPath, stagedPath });
+    },
+    stagedTraceCount() {
+      return stagedFiles.filter((s) => s.relPath.startsWith("fsm-trace/"))
+        .length;
+    },
+    readStagedManifest() {
+      const entry = stagedFiles.find((s) => s.relPath === "manifest.json");
+      if (!entry) return null;
+      try {
+        return JSON.parse(readFileSync(entry.stagedPath, "utf8"));
+      } catch {
+        return null;
+      }
+    },
+  };
+
+  // Write the pending manifest first so a crash during fn still leaves a
+  // discoverable journal.
+  writeJournalManifestSync(txnDir, {
+    txn_id: txnId,
+    status: "pending",
+    run_dir: runDir,
+    started_at: new Date().toISOString(),
+    staged_files: [],
+  });
+
+  let result;
+  try {
+    result = fn(txn);
+  } catch (err) {
+    // Leave journal on disk for inspection / discard.
+    throw err;
+  }
+
+  // Mark ready_to_finalise BEFORE the rename loop so a crash mid-rename
+  // can be safely replayed (idempotent).
+  writeJournalManifestSync(txnDir, {
+    txn_id: txnId,
+    status: "ready_to_finalise",
+    run_dir: runDir,
+    started_at: new Date().toISOString(),
+    ready_at: new Date().toISOString(),
+    staged_files: stagedFiles.map((s) => ({ relPath: s.relPath })),
+  });
+
+  const pauseMs = Number.parseInt(
+    process.env.FSM_TEST_PAUSE_BEFORE_FINALISE || "0",
+    10,
+  );
+  if (Number.isFinite(pauseMs) && pauseMs > 0) {
+    // Synchronous busy wait so SIGKILL during this window simulates a
+    // crash between "ready_to_finalise" and the rename loop. We do not
+    // use Atomics.wait/setTimeout because the integration test needs the
+    // pause to be observable as a wall-clock window.
+    const deadline = Date.now() + pauseMs;
+    while (Date.now() < deadline) {
+      // intentional busy wait
+    }
+  }
+
+  for (const entry of stagedFiles) {
+    const finalPath = join(runDir, entry.relPath);
+    mkdirSync(dirname(finalPath), { recursive: true });
+    renameSync(entry.stagedPath, finalPath);
+  }
+  rmSync(txnDir, { recursive: true, force: true });
+  if (existsSync(root) && readdirSync(root).length === 0) {
+    try {
+      rmdirSync(root);
+    } catch {
+      // Empty-dir cleanup race is harmless.
+    }
+  }
+
+  return { result, txnId, staged: stagedFiles.map((s) => s.relPath) };
 }
 
 // ─── cross-run queries ──────────────────────────────────────────────────

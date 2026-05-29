@@ -10,6 +10,7 @@ import { resolve } from "node:path";
 
 import { emitJson } from "./lib/emit.mjs";
 import {
+  journalState,
   readLock,
   readManifest,
   readTrace,
@@ -92,13 +93,30 @@ if (!manifest) {
 
 const lock = readLock(parsed.runId, { storageRoot });
 const trace = readTrace(parsed.runId, { storageRoot });
+const runDir = runDirPath(parsed.runId, { storageRoot });
+const jstate = journalState(runDir);
+const journal = jstate.hasJournal
+  ? {
+      present: true,
+      txn_id: jstate.txnId,
+      status: jstate.status,
+      staged: jstate.staged.map((s) =>
+        typeof s === "string" ? s : s.relPath,
+      ),
+      recovery: {
+        discard: `fsm-resume --run-id ${parsed.runId} --journal discard`,
+        replay: `fsm-resume --run-id ${parsed.runId} --journal replay`,
+      },
+    }
+  : { present: false };
 
 emit({
   ok: true,
   run_id: parsed.runId,
-  run_dir_path: runDirPath(parsed.runId, { storageRoot }),
+  run_dir_path: runDir,
   manifest,
   lock,
+  journal,
   trace_count: trace.length,
   trace: trace.map((r) => ({
     file: r.fileName,

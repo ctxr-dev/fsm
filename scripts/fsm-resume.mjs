@@ -32,10 +32,13 @@ import { join } from "node:path";
 import { emitJson } from "./lib/emit.mjs";
 import {
   acquireLock,
+  discardJournal,
+  journalState,
   pruneTraceAfter,
   readLock,
   readManifest,
   readTrace,
+  replayJournal,
   runDirPath,
 } from "./lib/fsm-storage.mjs";
 import {
@@ -53,6 +56,7 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === "--run-id") args.runId = argv[++i];
     else if (arg === "--from-state") args.fromState = argv[++i];
+    else if (arg === "--journal") args.journalAction = argv[++i];
     else if (arg === "--session-id") args.sessionId = argv[++i];
     else if (arg === "--fsm" || arg === "--fsm-name") args.fsmName = argv[++i];
     else if (arg === "--fsm-path") args.fsmPath = argv[++i];
@@ -60,7 +64,18 @@ function parseArgs(argv) {
     else throw new Error(`fsm-resume: unknown argument "${arg}"`);
   }
   if (!args.runId) throw new Error("--run-id is required");
-  if (!args.fromState) throw new Error("--from-state is required");
+  if (args.journalAction) {
+    if (!["discard", "replay"].includes(args.journalAction)) {
+      throw new Error(
+        `--journal must be "discard" or "replay", got "${args.journalAction}"`,
+      );
+    }
+    if (args.fromState) {
+      throw new Error("--journal and --from-state are mutually exclusive");
+    }
+  } else if (!args.fromState) {
+    throw new Error("either --from-state or --journal <discard|replay> is required");
+  }
   return args;
 }
 
@@ -99,6 +114,60 @@ const manifest = readManifest(parsed.runId, { storageRoot: settings.storageRoot 
 if (!manifest) {
   emit({ error: "run_not_found", run_id: parsed.runId });
   process.exit(1);
+}
+
+// --journal {discard|replay}: dedicated A7 recovery short-circuit.
+// Inspects <run_dir>/.journal/ and either rolls back the pending
+// transaction (discard) or finalises it idempotently (replay). Does NOT
+// touch the lock, the trace, or the manifest beyond what the recovery
+// op naturally produces (replay's rename loop finalises any staged
+// manifest.json the crash captured). Pre-existing journals from a
+// previous crashed fsm-commit are the only target.
+if (parsed.journalAction) {
+  const recoveryRunDir = runDirPath(parsed.runId, { storageRoot: settings.storageRoot });
+  const jstate = journalState(recoveryRunDir);
+  if (!jstate.hasJournal) {
+    emit({
+      ok: true,
+      run_id: parsed.runId,
+      journal_action: parsed.journalAction,
+      result: "no_journal_present",
+    });
+    process.exit(0);
+  }
+  if (parsed.journalAction === "discard") {
+    const out = discardJournal(recoveryRunDir, jstate.txnId);
+    emit({
+      ok: true,
+      run_id: parsed.runId,
+      journal_action: "discard",
+      txn_id: jstate.txnId,
+      status_before: jstate.status,
+      ...out,
+    });
+    process.exit(0);
+  }
+  // replay
+  if (jstate.status !== "ready_to_finalise") {
+    emit({
+      error: "replay_not_safe",
+      run_id: parsed.runId,
+      txn_id: jstate.txnId,
+      status: jstate.status,
+      hint:
+        "journal status must be ready_to_finalise to replay; a pending journal means the producing fn never returned. Use --journal discard.",
+    });
+    process.exit(1);
+  }
+  const out = replayJournal(recoveryRunDir, jstate.txnId);
+  emit({
+    ok: true,
+    run_id: parsed.runId,
+    journal_action: "replay",
+    txn_id: jstate.txnId,
+    ...out,
+  });
+  process.exit(0);
 }
 
 // Resume is for runs that can legitimately be rewound: an `in_progress`
