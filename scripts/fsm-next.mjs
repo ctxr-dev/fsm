@@ -28,6 +28,7 @@ import {
   buildRunId,
   ensureRunDir,
   journalState,
+  publicJournalProjection,
   readManifest,
   runDirPath,
 } from "./lib/fsm-storage.mjs";
@@ -194,11 +195,7 @@ if (resumeJournal.hasJournal) {
   emit({
     error: "incomplete_commit_detected",
     run_id: runId,
-    journal: {
-      txn_id: resumeJournal.txnId,
-      status: resumeJournal.status,
-      staged: resumeJournal.staged.map((s) => s.relPath),
-    },
+    journal: publicJournalProjection(resumeJournal),
     recovery: {
       discard: `fsm-resume --run-id ${runId} --journal discard`,
       replay: `fsm-resume --run-id ${runId} --journal replay`,

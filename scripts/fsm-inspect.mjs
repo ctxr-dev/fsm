@@ -11,6 +11,7 @@ import { resolve } from "node:path";
 import { emitJson } from "./lib/emit.mjs";
 import {
   journalState,
+  publicJournalProjection,
   readLock,
   readManifest,
   readTrace,
@@ -98,11 +99,7 @@ const jstate = journalState(runDir);
 const journal = jstate.hasJournal
   ? {
       present: true,
-      txn_id: jstate.txnId,
-      status: jstate.status,
-      staged: jstate.staged.map((s) =>
-        typeof s === "string" ? s : s.relPath,
-      ),
+      ...publicJournalProjection(jstate),
       recovery: {
         discard: `fsm-resume --run-id ${parsed.runId} --journal discard`,
         replay: `fsm-resume --run-id ${parsed.runId} --journal replay`,

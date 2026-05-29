@@ -182,17 +182,22 @@ function killDuringPause(tmp, runId, pauseMs) {
     child.on("exit", (code, signal) => {
       resolve({ code, signal, stdout, stderr });
     });
-    // Give the child enough time to mark the journal ready_to_finalise
-    // and enter the pause busy-wait. The busy wait is synchronous so a
-    // SIGKILL during the window is guaranteed to land before the rename
-    // loop runs.
+    // Schedule SIGKILL near the END of the pause window — far enough
+    // back from the boundary that the rename loop hasn't started yet,
+    // but well past child startup / journal manifest write so the kill
+    // lands during the busy-wait. Picking the midpoint of the window
+    // was timing-sensitive on slow CI hosts (the child sometimes
+    // hadn't reached the pause yet, leaving a `pending` journal). The
+    // last-quarter target gives the child every preceding millisecond
+    // to get into the pause busy-wait.
+    const killAfterMs = Math.max(pauseMs - 250, Math.floor(pauseMs * 0.75));
     setTimeout(() => {
       try {
         child.kill("SIGKILL");
       } catch {
         // already exited
       }
-    }, Math.min(pauseMs - 500, pauseMs * 0.5));
+    }, killAfterMs);
   });
 }
 

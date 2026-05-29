@@ -293,6 +293,105 @@ test("replayJournal: finalises a ready_to_finalise journal idempotently", () => 
   }
 });
 
+// ─── path-traversal guards (security) ───────────────────────────────────
+
+test("transaction.stage: rejects absolute paths", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    assert.throws(
+      () =>
+        withJournal(runDir, (txn) => {
+          txn.stage("/etc/passwd");
+        }),
+      /must be relative/,
+    );
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("transaction.stage: rejects '..' segments", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    assert.throws(
+      () =>
+        withJournal(runDir, (txn) => {
+          txn.stage("../escape.json");
+        }),
+      /invalid segment/,
+    );
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("transaction.stage: rejects backslashes (Windows traversal)", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    assert.throws(
+      () =>
+        withJournal(runDir, (txn) => {
+          txn.stage("foo\\..\\bar");
+        }),
+      /must not contain backslashes/,
+    );
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("replayJournal: rejects relPaths with traversal from a crafted manifest", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    const txnId = "crafted-txn-001";
+    const txnDir = join(runDir, ".journal", txnId);
+    mkdirSync(txnDir, { recursive: true });
+    writeFileSync(
+      join(txnDir, "journal.json"),
+      JSON.stringify({
+        txn_id: txnId,
+        status: "ready_to_finalise",
+        staged_files: [{ relPath: "../../escape.json" }],
+      }),
+    );
+    assert.throws(() => replayJournal(runDir, txnId), /invalid segment/);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+// ─── thenable rejection (atomicity) ─────────────────────────────────────
+
+test("withJournal: rejects async fn (thenable return)", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    assert.throws(
+      () => withJournal(runDir, async () => {}),
+      /must be a synchronous function/,
+    );
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("withJournal: rejects fn returning a manual Promise", () => {
+  const store = tmpStore();
+  try {
+    const { runDir } = makeRun(store);
+    assert.throws(
+      () => withJournal(runDir, () => Promise.resolve("oops")),
+      /must be a synchronous function/,
+    );
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
 test("replayJournal: refuses to finalise a pending journal", () => {
   const store = tmpStore();
   try {

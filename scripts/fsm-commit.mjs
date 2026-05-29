@@ -24,6 +24,7 @@ import { emitJson } from "./lib/emit.mjs";
 import {
   appendTraceFile,
   journalState,
+  publicJournalProjection,
   readLock,
   readManifest,
   releaseLock,
@@ -144,11 +145,7 @@ if (existingJournal.hasJournal) {
   emit({
     error: "incomplete_commit_detected",
     run_id: parsed.runId,
-    journal: {
-      txn_id: existingJournal.txnId,
-      status: existingJournal.status,
-      staged: existingJournal.staged.map((s) => s.relPath),
-    },
+    journal: publicJournalProjection(existingJournal),
     recovery: {
       discard: `fsm-resume --run-id ${parsed.runId} --journal discard`,
       replay: `fsm-resume --run-id ${parsed.runId} --journal replay`,
@@ -398,10 +395,16 @@ try {
   // between our pre-check and the start of the txn) surface it as a
   // structured error rather than a stack trace.
   if (err && err.code === "JOURNAL_PRESENT") {
+    // Same stable shape as the pre-check above — the CLI error payload
+    // must not vary based on which code path detected the journal.
     emit({
       error: "incomplete_commit_detected",
       run_id: parsed.runId,
-      journal: err.journal,
+      journal: publicJournalProjection(err.journal),
+      recovery: {
+        discard: `fsm-resume --run-id ${parsed.runId} --journal discard`,
+        replay: `fsm-resume --run-id ${parsed.runId} --journal replay`,
+      },
     });
     process.exit(1);
   }

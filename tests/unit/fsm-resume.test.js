@@ -602,6 +602,32 @@ test("fsm-resume: rejects unknown argument", () => {
   assert.match(result.stderr, /unknown argument/);
 });
 
+test("fsm-resume: rejects --journal without a value", () => {
+  // Edge case: `fsm-resume --journal` with no following action used to
+  // silently parse `journalAction = undefined` and then fall through to
+  // the generic "either --from-state or --journal ..." error, which
+  // misleads the user (they did pass --journal). The parser now
+  // requires a value for every flag.
+  const result = runScript("fsm-resume.mjs", [
+    "--run-id", "20260101-000000-1234567",
+    "--journal",
+  ]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--journal requires a value/);
+});
+
+test("fsm-resume: rejects --journal followed by another flag", () => {
+  // Same shape as the previous: if the value happens to look like
+  // another flag, treat it as a missing value rather than silently
+  // consuming it as the action.
+  const result = runScript("fsm-resume.mjs", [
+    "--run-id", "20260101-000000-1234567",
+    "--journal", "--from-state", "a",
+  ]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--journal requires a value/);
+});
+
 // ─── final sanity: the runner file is present in scripts/.
 test("fsm-resume.mjs file is present in scripts/", () => {
   // Sanity: file exists at the canonical path.

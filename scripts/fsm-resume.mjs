@@ -52,15 +52,27 @@ import { resolveSettings } from "./lib/fsm-config.mjs";
 
 function parseArgs(argv) {
   const args = {};
+  // Helper: every flag below expects exactly one argument value. Reject
+  // a flag whose value is missing (end of argv) or another flag, so
+  // mistakes like `fsm-resume --journal` (no action) surface as a
+  // pointed parse error rather than the generic
+  // "either --from-state or --journal ..." fallback.
+  const takeValue = (flag, i) => {
+    const v = argv[i + 1];
+    if (v === undefined || (typeof v === "string" && v.startsWith("--"))) {
+      throw new Error(`${flag} requires a value`);
+    }
+    return v;
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--run-id") args.runId = argv[++i];
-    else if (arg === "--from-state") args.fromState = argv[++i];
-    else if (arg === "--journal") args.journalAction = argv[++i];
-    else if (arg === "--session-id") args.sessionId = argv[++i];
-    else if (arg === "--fsm" || arg === "--fsm-name") args.fsmName = argv[++i];
-    else if (arg === "--fsm-path") args.fsmPath = argv[++i];
-    else if (arg === "--storage-root") args.storageRoot = argv[++i];
+    if (arg === "--run-id") args.runId = takeValue(arg, i++);
+    else if (arg === "--from-state") args.fromState = takeValue(arg, i++);
+    else if (arg === "--journal") args.journalAction = takeValue(arg, i++);
+    else if (arg === "--session-id") args.sessionId = takeValue(arg, i++);
+    else if (arg === "--fsm" || arg === "--fsm-name") args.fsmName = takeValue(arg, i++);
+    else if (arg === "--fsm-path") args.fsmPath = takeValue(arg, i++);
+    else if (arg === "--storage-root") args.storageRoot = takeValue(arg, i++);
     else throw new Error(`fsm-resume: unknown argument "${arg}"`);
   }
   if (!args.runId) throw new Error("--run-id is required");

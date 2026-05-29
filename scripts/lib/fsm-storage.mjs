@@ -386,6 +386,62 @@ export function journalRoot(runDir) {
   return join(runDir, JOURNAL_DIR_NAME);
 }
 
+// assertSafeJournalRelPath rejects any relPath that could escape the
+// journal directory when joined against it. Same constraints we apply to
+// loop iteration_outputs_dir in fsm-engine: no absolute paths, no
+// backslashes, no ".." or "." segments, no ":" (Windows drive letters or
+// colon-bearing segments). This is the validation gate for the public
+// `transaction.stage()` API surface AND for relPath values read back
+// from a journal manifest during replayJournal — a crafted or corrupted
+// journal.json must not be able to rename staged files outside the run
+// directory.
+function assertSafeJournalRelPath(relPath, context) {
+  if (typeof relPath !== "string" || relPath.length === 0) {
+    throw new Error(`${context}: relPath must be a non-empty string`);
+  }
+  if (relPath.includes("\\")) {
+    throw new Error(
+      `${context}: relPath "${relPath}" must not contain backslashes (use forward slashes)`,
+    );
+  }
+  if (relPath.startsWith("/")) {
+    throw new Error(
+      `${context}: relPath "${relPath}" must be relative; absolute paths are not allowed`,
+    );
+  }
+  if (relPath.includes(":")) {
+    throw new Error(
+      `${context}: relPath "${relPath}" must not contain ":" (Windows drive letters or colon segments could escape the journal)`,
+    );
+  }
+  const parts = relPath.split("/");
+  for (const part of parts) {
+    if (part === "" || part === "." || part === "..") {
+      throw new Error(
+        `${context}: relPath "${relPath}" contains an invalid segment ("${part}")`,
+      );
+    }
+  }
+}
+
+// publicJournalProjection returns the stable error-payload shape that
+// fsm-commit / fsm-next / fsm-inspect emit when reporting a journal.
+// Filters out internal fields (txnDir, runDir, all[]) so the CLI surface
+// is the same shape regardless of whether the journal was observed via
+// journalState() up front or surfaced through a withJournal
+// JOURNAL_PRESENT error.
+export function publicJournalProjection(jstate) {
+  if (!jstate || !jstate.hasJournal) return { present: false };
+  const stagedNormalised = (jstate.staged || []).map((s) =>
+    typeof s === "string" ? s : s.relPath,
+  );
+  return {
+    txn_id: jstate.txnId,
+    status: jstate.status,
+    staged: stagedNormalised,
+  };
+}
+
 function readJournalManifestSync(txnDir) {
   const path = join(txnDir, "journal.json");
   if (!existsSync(path)) return null;
@@ -469,6 +525,12 @@ export function replayJournal(runDir, txnId) {
   }
   const finalised = [];
   for (const entry of manifest.staged_files || []) {
+    // Defensive: the journal manifest is a file on disk and can be
+    // corrupted, hand-edited, or maliciously crafted between the crash
+    // and recovery. Reject any relPath that could escape the run dir
+    // via absolute path, ".." traversal, backslashes, or drive letters
+    // before letting it into the rename loop.
+    assertSafeJournalRelPath(entry.relPath, "replayJournal");
     const stagedPath = join(txnDir, entry.relPath);
     const finalPath = join(runDir, entry.relPath);
     if (!existsSync(stagedPath)) {
@@ -531,11 +593,18 @@ export function withJournal(runDir, fn) {
     txnDir,
     staged: stagedFiles,
     stage(relPath) {
+      // stage() is the public surface for staging a write inside a
+      // transaction. Reject any relPath that could escape the txn dir
+      // here, so callers (including third-party storage helpers) cannot
+      // accidentally write outside <txnDir> by passing an absolute path
+      // or a ".."-bearing string.
+      assertSafeJournalRelPath(relPath, "transaction.stage");
       const stagedPath = join(txnDir, relPath);
       mkdirSync(dirname(stagedPath), { recursive: true });
       return stagedPath;
     },
     addStaged(relPath, stagedPath) {
+      assertSafeJournalRelPath(relPath, "transaction.addStaged");
       stagedFiles.push({ relPath, stagedPath });
     },
     stagedTraceCount() {
@@ -568,6 +637,23 @@ export function withJournal(runDir, fn) {
     result = fn(txn);
   } catch (err) {
     // Leave journal on disk for inspection / discard.
+    throw err;
+  }
+
+  // Reject async / thenable functions. withJournal finalises
+  // synchronously the instant fn returns; if fn is async, the awaited
+  // writes are still in-flight when the rename loop runs and the
+  // atomicity contract breaks. Caught here (after fn has already
+  // returned the Promise) the journal is still on disk, so the user
+  // can discard it; failing fast is much better than producing a
+  // partial commit.
+  if (result && typeof result.then === "function") {
+    const err = new Error(
+      "withJournal: fn must be a synchronous function — got a thenable / Promise. " +
+        "Stage all writes synchronously inside fn; the journal would otherwise finalise " +
+        "before async writes complete and break atomicity.",
+    );
+    err.code = "JOURNAL_FN_ASYNC";
     throw err;
   }
 
