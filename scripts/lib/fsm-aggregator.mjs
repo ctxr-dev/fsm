@@ -124,9 +124,21 @@ export function aggregateLoopOutputs(runDir, state, { mergeField = "findings" } 
   for (const { n, payload } of iters) {
     const arr = Array.isArray(payload?.[mergeField]) ? payload[mergeField] : [];
     for (const item of arr) merged.push(item);
-    const meta = { iteration_n: n };
+    // Use a null-prototype object so worker-controlled keys (e.g. a
+    // payload that intentionally or accidentally carries `__proto__`,
+    // `constructor`, or `prototype`) cannot mutate Object.prototype
+    // when copied in below. JSON.stringify on a null-prototype object
+    // serialises the same as a regular literal.
+    const meta = Object.assign(Object.create(null), { iteration_n: n });
     for (const key of Object.keys(payload ?? {})) {
       if (key === mergeField) continue;
+      // Defensive: skip the well-known prototype-pollution keys
+      // explicitly even with the null-prototype object, since some
+      // downstream consumers may later spread `meta` into a normal
+      // object literal.
+      if (key === "__proto__" || key === "constructor" || key === "prototype") {
+        continue;
+      }
       meta[key] = payload[key];
     }
     iterationMeta.push(meta);
