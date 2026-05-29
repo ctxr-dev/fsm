@@ -141,6 +141,18 @@ const SCHEMA_MARKERS = [
   /response_schema/,
 ];
 
+// Suppression is documented as `// fsm-lint:ignore`. Returning true only
+// when the marker lives in a `//` line comment prevents bypassing
+// diagnostics by embedding the literal string inside source like
+// `console.log("fsm-lint:ignore")`. The match looks for `//` followed
+// by any prefix and then the marker, scanned left to right.
+function lineCommentHasIgnoreMarker(line) {
+  if (typeof line !== "string" || !line.includes(IGNORE_MARKER)) return false;
+  const commentIdx = line.indexOf("//");
+  if (commentIdx < 0) return false;
+  return line.indexOf(IGNORE_MARKER, commentIdx) >= 0;
+}
+
 export function lintFile(filePath, source) {
   const diagnostics = [];
   const lines = source.split(/\r?\n/);
@@ -165,18 +177,22 @@ export function lintFile(filePath, source) {
     // marker can legitimately precede the literal it suppresses.
     // Applying previous-line suppression to per-line rules silently
     // hid the diagnostic immediately after any other ignored line.
-    if (line.includes(IGNORE_MARKER)) {
+    // Additionally: require the marker to live in a `//` line comment
+    // so the substring inside a string literal (e.g.
+    // `console.log("fsm-lint:ignore")`) cannot bypass diagnostics.
+    if (lineCommentHasIgnoreMarker(line)) {
       continue;
     }
 
     // Skip lines that are clearly source comments -- both the read-API
     // and the LLM-call rules are about real code, not prose in the
     // header banner. We detect a comment by the first non-space chars
-    // being `//`, `*`, or `#` (shebangs / shell). Block-comment middle
-    // lines start with ` *` which is also covered.
+    // being `//`, `/*`, `*`, or `#` (shebangs / shell). Block-comment
+    // openers / middles all start with `/*` or ` *`.
     const trimmed = line.trimStart();
     const isComment =
       trimmed.startsWith("//") ||
+      trimmed.startsWith("/*") ||
       trimmed.startsWith("*") ||
       trimmed.startsWith("#");
     if (isComment) continue;
@@ -229,8 +245,8 @@ export function lintFile(filePath, source) {
     const startLineText = lines[startIdx] ?? "";
     const prevLineText = prevIdx >= 0 ? lines[prevIdx] : "";
     if (
-      startLineText.includes(IGNORE_MARKER) ||
-      prevLineText.includes(IGNORE_MARKER)
+      lineCommentHasIgnoreMarker(startLineText) ||
+      lineCommentHasIgnoreMarker(prevLineText)
     ) {
       continue;
     }
@@ -280,7 +296,13 @@ function collectTemplateLiterals(source) {
     if (ch === "'") {
       i++;
       while (i < len && source[i] !== "'") {
-        if (source[i] === "\\") i++;
+        if (source[i] === "\\") {
+          // Account for the escaped character: when it is a newline
+          // (line-continuation), the line counter must still tick.
+          if (source[i + 1] === "\n") line++;
+          i += 2;
+          continue;
+        }
         if (source[i] === "\n") line++;
         i++;
       }
@@ -291,7 +313,11 @@ function collectTemplateLiterals(source) {
     if (ch === '"') {
       i++;
       while (i < len && source[i] !== '"') {
-        if (source[i] === "\\") i++;
+        if (source[i] === "\\") {
+          if (source[i + 1] === "\n") line++;
+          i += 2;
+          continue;
+        }
         if (source[i] === "\n") line++;
         i++;
       }
@@ -305,6 +331,12 @@ function collectTemplateLiterals(source) {
       i++;
       while (i < len && source[i] !== "`") {
         if (source[i] === "\\") {
+          // Account for backslash-newline (line-continuation) inside a
+          // template body: stepping past the pair without ticking
+          // `line` shifted endLine in the diagnostic, blaming the
+          // wrong source line. Tick when we step over a literal
+          // newline as part of the escape pair.
+          if (source[i + 1] === "\n") line++;
           i += 2;
           continue;
         }
