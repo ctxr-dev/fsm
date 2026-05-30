@@ -139,7 +139,7 @@ Skills and agents that depend on `ctxr-fsm` should follow the bootstrap discipli
 uv run ctxr-fsm ensure --json
 ```
 
-`ensure` is idempotent and fast (<500ms when everything is already up). On a cold project it: creates `.ctxr-fsm/fsm.db`, runs migrations, installs principles into CLAUDE.md/AGENTS.md/.cursor/rules, registers `ctxr-fsm` as an MCP server in the active client's config, boots the supervisor (MCP + FastAPI + UI). Parse the JSON output to get `mcp_http_url` for the HTTP-SSE fallback path. Per-client reload semantics (Claude Code vs Codex vs Cursor) are documented in [BOOTSTRAP.md](BOOTSTRAP.md). A `--check` flag does the same probe read-only.
+`ensure` is idempotent and fast (<500ms when everything is already up). On a cold project it: creates `.ctxr-fsm/fsm.db`, runs migrations, installs principles into CLAUDE.md/AGENTS.md/.cursor/rules, registers `ctxr-fsm` as an MCP server in the active client's config, boots the supervisor (MCP + FastAPI + UI). Parse the JSON output to get `subsystems.mcp.http_url` for the HTTP-SSE fallback path (the `subsystems` object also exposes `api.http_url`, `api.docs_url`, and `<name>.healthz_url` for each subsystem). Per-client reload semantics (Claude Code vs Codex vs Cursor) are documented in [BOOTSTRAP.md](BOOTSTRAP.md). A `--check` flag does the same probe read-only.
 
 ### Run the MCP server standalone (for Claude Code stdio integration)
 
