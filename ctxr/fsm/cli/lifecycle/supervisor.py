@@ -482,8 +482,29 @@ async def _boot_subsystem(
         env = None
         inherit = False
     elif name == "ui":
+        # The UI is a Vite dev server that lives in the fsm package's own
+        # ``ui/`` subtree. Consumer projects (any project that pip / uv
+        # installed ctxr-fsm) DON'T have a ``ui/`` subdir, and trying to
+        # spawn there would crash the entire supervisor with
+        # FileNotFoundError, taking mcp + api down with it. We skip the
+        # UI spawn with a one-line stderr advisory when no ui/ tree is
+        # present at the project root; the supervisor continues with
+        # just mcp + api, and the operator gets a clear pointer at the
+        # underlying reason. (Released the singleton lock + freed the
+        # port; callers see the same "subsystem absent" return shape as
+        # the reuse path.)
+        ui_cwd = project_root / "ui"
+        if not ui_cwd.is_dir():
+            _log(
+                f"[ctxr-fsm supervisor] ui skipped: no {ui_cwd} found at this "
+                "project root (expected for consumer projects that install "
+                "ctxr-fsm rather than develop it). Use `--mode mcp-only` to "
+                "silence this advisory."
+            )
+            release_singleton(acq, project_root=project_root)
+            return None, port, None, True
         cmd = _ui_cmd(port=port)
-        cwd = project_root / "ui"
+        cwd = ui_cwd
         env = os.environ.copy()
         # The Vite config reads VITE_API_PORT at startup to wire the
         # /api/v1 proxy target; passing the actual api port keeps the
