@@ -131,13 +131,25 @@ The supervisor:
 
 Browse the UI at `http://localhost:5173`, the FastAPI docs at `http://localhost:<api_port>/docs` (port from `ctxr-fsm doctor`), and connect an MCP client to `http://localhost:<mcp_port>/sse`.
 
+### Bootstrap from a skill or agent (universal entry point)
+
+Skills and agents that depend on `ctxr-fsm` should follow the bootstrap discipline in [BOOTSTRAP.md](BOOTSTRAP.md) (mirror of [`ctxr/fsm/memory/bootstrap.md`](ctxr/fsm/memory/bootstrap.md)). The TL;DR is one command:
+
+```bash
+uv run ctxr-fsm ensure --json
+```
+
+`ensure` is idempotent and fast (<500ms when everything is already up). On a cold project it: creates `.ctxr-fsm/fsm.db`, runs migrations, installs principles into CLAUDE.md/AGENTS.md/.cursor/rules, registers `ctxr-fsm` as an MCP server in the active client's config, boots the supervisor (MCP + FastAPI + UI). Parse the JSON output to get `mcp_http_url` for the HTTP-SSE fallback path. Per-client reload semantics (Claude Code vs Codex vs Cursor) are documented in [BOOTSTRAP.md](BOOTSTRAP.md). A `--check` flag does the same probe read-only.
+
 ### Run the MCP server standalone (for Claude Code stdio integration)
+
+When you want JUST the MCP child (no FastAPI, no UI), `ctxr-fsm ensure --mode mcp-only --json` is the supervisor-managed path. For a raw standalone process (debugging, one-off connection):
 
 ```bash
 uv run ctxr-fsm mcp --db ./.ctxr-fsm/fsm.db
 ```
 
-This blocks on stdio; pair it with a Claude Code (or other MCP client) session configured to launch the binary on demand. See docs/mcp-tools.md.
+This blocks on stdio; pair it with a Claude Code (or other MCP client) session configured to launch the binary on demand. The `.mcp.json` entry that `ctxr-fsm install-mcp` writes calls this same binary in stdio mode and lets it discover the DB by walking up from the inherited cwd to find `.ctxr-fsm/`. See docs/mcp-tools.md.
 
 ### Contribution loop
 
