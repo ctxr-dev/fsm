@@ -136,6 +136,28 @@ if [[ "${RULE5_HITS}" -gt 0 ]]; then
   HITS=$((HITS + RULE5_HITS))
 fi
 
+# --- Rule 6: argparse / click in CLI surface --------------------------
+# Every CLI command in ctxr-fsm is a typer subcommand. Other parsers
+# fragment the CLI shape; bespoke pretty-print primitives fragment the
+# human surface. The ``rich`` integration ships with typer — that's the
+# ONLY pretty-print primitive we allow. Justify a genuine exception
+# (extremely rare) with the trailing ``# audit-strings: justified``
+# marker. Added in W14j alongside the typer-everywhere rule in
+# docs/coding-standards.md.
+RULE6=""
+for pattern in '^import argparse' '^from argparse' '^import click' '^from click'; do
+  hits=$(grep -rn "${pattern}" "${SRC_DIR}/cli" 2>/dev/null | _filter_justified || true)
+  if [[ -n "${hits}" ]]; then
+    RULE6="${RULE6}${hits}\n"
+  fi
+done
+RULE6_HITS=$(echo -ne "${RULE6}" | grep -c '^' || true)
+if [[ "${RULE6_HITS}" -gt 0 ]]; then
+  echo "--- audit-strings: rule6 (argparse/click forbidden in cli/)"
+  echo -ne "${RULE6}" | _report "rule6-non-typer-parser" "$(cat)"
+  HITS=$((HITS + RULE6_HITS))
+fi
+
 if [[ "${HITS}" -gt 0 ]]; then
   echo ""
   echo "audit-strings: ${HITS} finding(s); see W14i for the audit rationale."

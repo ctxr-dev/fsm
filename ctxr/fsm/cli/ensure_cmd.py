@@ -59,6 +59,7 @@ from ctxr.fsm.cli._clients import (
     McpConfigStatus,
 )
 from ctxr.fsm.cli._common import json_or_pretty
+from ctxr.fsm.cli._render import print_subsystem_table
 from ctxr.fsm.cli.init_cmd import run_init
 from ctxr.fsm.cli.install_mcp_cmd import run_install_mcp
 from ctxr.fsm.cli.install_memory_cmd import run_install_memory
@@ -723,6 +724,15 @@ def ensure(
             "stdout is not a TTY, pretty otherwise."
         ),
     ),
+    no_table: bool = typer.Option(
+        False,
+        "--no-table",
+        help=(
+            "Skip the Rich subsystem URL table in TTY non-JSON mode. "
+            "The actions-summary dict still prints. JSON mode is "
+            "unaffected."
+        ),
+    ),
 ) -> None:
     """Ensure the project is fully bootstrapped + the supervisor is up.
 
@@ -749,6 +759,34 @@ def ensure(
         timeout=timeout,
     )
     json_or_pretty(summary, effective_json)
+
+    # W14j: in TTY non-JSON mode, follow the actions-summary dict
+    # with the Rich subsystem table so a human running ``ensure``
+    # interactively sees the URLs they almost certainly came here for
+    # (FastAPI + Swagger + UI + MCP). ``--no-table`` opts out for the
+    # rare caller that wants pretty output WITHOUT the table; JSON
+    # mode is unaffected (machine consumers stay byte-identical).
+    #
+    # The table is rendered from the ensure summary's own
+    # ``subsystems`` block (rather than re-reading ``active-mcp.json``)
+    # so the ``status`` column reflects the ``ready`` / ``reused`` /
+    # ``spawned`` decision ensure just made — that's the operator's
+    # mental model of "what happened" and matches the JSON shape the
+    # same call returned. When the block is empty (``--check`` against
+    # a cold project, or a failed spawn) the table is suppressed since
+    # there is nothing to show.
+    if not effective_json and not no_table:
+        try:
+            tty = sys.stdout.isatty()
+        except (AttributeError, OSError):
+            tty = False
+        if tty:
+            root = _resolve_project_root(project_root)
+            subsystems_block = summary.get("subsystems") or {}
+            if isinstance(subsystems_block, dict) and subsystems_block:
+                print_subsystem_table(
+                    {"subsystems": subsystems_block}, project_root=root
+                )
 
     # Exit non-zero on a failed / degraded run, or on --check that
     # surfaced any ``missing_*`` status, so wrapping scripts can react.

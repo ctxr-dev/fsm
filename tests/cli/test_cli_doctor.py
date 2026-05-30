@@ -44,15 +44,27 @@ def _init_project(db_path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # Pretty (default) output
+#
+# As of W14j the pretty surface is a Rich Panel (DB summary) + the
+# shared subsystem table. The earlier free-form ``rich.print`` of the
+# full report dict is gone — operators who need the table-row /
+# PRAGMA / journal_txns sections script against the unchanged
+# ``--json`` shape. The three tests below pin the *new* surface so a
+# regression that drops the panel or the table trips loudly; the
+# parallel ``test_doctor_table_replaces_old_pretty_print.py`` file
+# pins the negative half (the old format is GONE).
 # ---------------------------------------------------------------------------
 
 
-def test_doctor_after_init_prints_db_path() -> None:
-    """The pretty output must include the resolved DB path verbatim.
+def test_doctor_pretty_prints_db_path_in_panel() -> None:
+    """The Rich panel header must include the resolved DB path.
 
     Operators rely on this line to confirm which file the report
     describes — especially when juggling multiple project DBs through
-    ``$CTXR_FSM_DB``.
+    ``$CTXR_FSM_DB``. The path is portable-rendered (relative-to-cwd
+    or ``~``-prefixed when possible), so the assertion compares
+    against either the resolved absolute path OR the file name —
+    whichever the renderer chose for this tempdir layout.
     """
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "fsm.db"
@@ -61,18 +73,22 @@ def test_doctor_after_init_prints_db_path() -> None:
         result = runner.invoke(app, ["doctor", "--db", str(db_path)])
 
         assert result.exit_code == 0, result.stderr
-        # ``Path.resolve`` (used inside resolve_db_path) may add a /private prefix
-        # on macOS temp dirs, so check against the resolved string the CLI itself
-        # would compute rather than the raw tempdir input.
-        assert str(db_path.resolve()) in result.stdout
+        # The panel header is always present.
+        assert "ctxr-fsm doctor" in result.stdout
+        assert "DB" in result.stdout
+        # Either the absolute path (when not under cwd) or the basename
+        # (when relative rendering kicked in) appears in the panel body.
+        stdout = result.stdout
+        assert str(db_path.resolve()) in stdout or "fsm.db" in stdout
 
 
-def test_doctor_after_init_prints_pragma_values() -> None:
-    """The pretty output must surface the PRAGMAs that determine correctness.
+def test_doctor_pretty_prints_alembic_revision_in_panel() -> None:
+    """The panel must show the alembic revision so operators see migration state.
 
-    The connect-time listener applies ``WAL``, ``foreign_keys=ON`` and
-    friends; doctor surfaces them so an operator can confirm the
-    listener actually ran on this DB.
+    Replaces the old "PRAGMAs visible in pretty output" expectation:
+    PRAGMA debugging is a JSON-mode concern (operators script against
+    it); the pretty surface only needs the one-line "schema is
+    current at revision <X>" signal.
     """
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "fsm.db"
@@ -81,25 +97,22 @@ def test_doctor_after_init_prints_pragma_values() -> None:
         result = runner.invoke(app, ["doctor", "--db", str(db_path)])
 
         assert result.exit_code == 0, result.stderr
-        # Each PRAGMA we configure at connect time must be visible in the
-        # rendered output. ``rich.print`` renders the dict literally, so a
-        # plain substring check on the key name is sufficient.
-        for pragma in ("journal_mode", "busy_timeout", "foreign_keys", "synchronous"):
-            assert pragma in result.stdout, f"missing pragma {pragma!r} in: {result.stdout}"
-        # The applied values should also appear (WAL for journal_mode, the
-        # busy-timeout integer, etc.). We assert on the most diagnostic two:
-        # WAL flips a default, and foreign_keys=ON is the one SQLite ships
-        # OFF by default.
-        assert "wal" in result.stdout.lower()
+        assert "Revision" in result.stdout
+        # The W2 migration revision label is part of the migrations
+        # directory's filename — pin to the prefix the migration ships
+        # with so a future migration revision still satisfies the
+        # assertion (the prefix changes between revisions).
+        assert "0001" in result.stdout
 
 
-def test_doctor_after_init_lists_tables_with_row_counts() -> None:
-    """Doctor must list user tables alongside their row counts.
+def test_doctor_pretty_renders_subsystem_table_header() -> None:
+    """Doctor's pretty output must render the W14j subsystem table.
 
-    After ``init`` the schema is populated but empty, so every reported
-    count should be ``0`` and the ``alembic_version`` bookkeeping table
-    should be present (it holds the migration revision and is the only
-    table guaranteed to be non-empty post-init).
+    Replaces the old "lists every user table with row counts"
+    expectation. Operators who need the table-name dump script
+    against ``--json`` (still unchanged); the pretty surface answers
+    the higher-frequency "where are my subsystems" question with the
+    Rich table.
     """
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "fsm.db"
@@ -108,12 +121,17 @@ def test_doctor_after_init_lists_tables_with_row_counts() -> None:
         result = runner.invoke(app, ["doctor", "--db", str(db_path)])
 
         assert result.exit_code == 0, result.stderr
-        # alembic_version is the bookkeeping table; if it's missing the
-        # migration didn't run, which would invalidate every other check.
-        assert "alembic_version" in result.stdout
-        # The core domain tables created by the W2 migration must appear.
-        for table in ("fsm_specs", "runs", "states"):
-            assert table in result.stdout, f"missing table {table!r} in: {result.stdout}"
+        # Subsystem table header + the leading Project row are always
+        # rendered (rows for individual subsystems depend on whether a
+        # supervisor has booted in this fixture; we only pin the
+        # invariant skeleton here).
+        assert "ctxr-fsm subsystems" in result.stdout
+        assert "Subsystem" in result.stdout
+        assert "URL" in result.stdout
+        assert "Swagger" in result.stdout
+        assert "Health" in result.stdout
+        assert "PID" in result.stdout
+        assert "Project" in result.stdout
 
 
 # ---------------------------------------------------------------------------

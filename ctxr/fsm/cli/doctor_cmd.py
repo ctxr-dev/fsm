@@ -55,6 +55,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from rich.console import Console
+from rich.panel import Panel
 from sqlalchemy import func, select, text
 
 from ctxr.fsm.cli._common import (
@@ -64,6 +66,7 @@ from ctxr.fsm.cli._common import (
     open_project_for_cli,
     resolve_db_path,
 )
+from ctxr.fsm.cli._render import _portable_project_repr, render_subsystem_table
 from ctxr.fsm.cli.lifecycle.primitives import (
     _probe_healthz,
     pid_is_alive,
@@ -253,6 +256,120 @@ def _supervisor_report(project_root: Path) -> dict[str, Any]:
     }
 
 
+def _active_mcp_for_table(
+    *, supervisor: dict[str, Any]
+) -> dict[str, Any]:
+    """Translate the doctor's supervisor report into the table input shape.
+
+    The renderer consumes the W14c discovery-document shape
+    (``{"subsystems": {<name>: {"http_url", "healthz_url", "pid",
+    "status"?}}, ...}``). The doctor's per-subsystem report already
+    carries those fields under different keys (``probe_url`` instead
+    of ``http_url``, an explicit ``healthz`` body, plus ``pid_alive``).
+    This helper bridges the two shapes so the renderer stays pure
+    (one input contract, no per-caller adapters).
+
+    Precedence for each block:
+
+    1. The live W14c discovery document if the supervisor wrote one
+       (``supervisor["active_mcp"]["subsystems"][name]``) — that
+       carries the canonical URLs the supervisor advertised. We layer
+       a status word on top derived from the doctor's own probe so
+       the colour reflects what doctor just observed (e.g. ``ready``
+       vs ``unreachable``) rather than the supervisor's last write.
+    2. The doctor's own pid/probe report when no discovery document
+       is present (cold supervisor; old project tree). The URL is
+       reconstructed from the recorded probe URL so the table is
+       still useful — only the ``docs_url`` derivation will trigger
+       (api row only).
+    """
+    active_doc = supervisor.get("active_mcp")
+    discovery_subs: dict[str, Any] = {}
+    if isinstance(active_doc, dict):
+        raw = active_doc.get("subsystems")
+        if isinstance(raw, dict):
+            discovery_subs = raw
+
+    doctor_subs_raw = supervisor.get("subsystems") or {}
+    doctor_subs = doctor_subs_raw if isinstance(doctor_subs_raw, dict) else {}
+
+    merged: dict[str, dict[str, Any]] = {}
+    for name in ("mcp", "api", "ui"):
+        report = doctor_subs.get(name)
+        if not isinstance(report, dict):
+            continue
+        pid_alive = bool(report.get("pid_alive"))
+        healthz_body = report.get("healthz")
+        # Decision tree for the status word:
+        # * pid down → ``missing``
+        # * pid up + healthz ok → ``ready``
+        # * pid up + healthz None for a subsystem that *should* probe
+        #   → ``unreachable``
+        # * UI (no /healthz) with a live pid → ``ready`` (the
+        #   supervisor's own contract — see the lifecycle module).
+        if not pid_alive:
+            status = "missing"
+        elif name == "ui" or healthz_body is not None:
+            status = "ready"
+        else:
+            status = "unreachable"
+
+        # Start from the discovery block if we have one — those
+        # fields are the supervisor's own publication. Fall back to
+        # the doctor's probe URL for the cold-supervisor case.
+        discovery_block = discovery_subs.get(name)
+        if isinstance(discovery_block, dict):
+            block = dict(discovery_block)
+        else:
+            probe_url = report.get("probe_url")
+            block = {
+                "http_url": probe_url if isinstance(probe_url, str) else "",
+                "healthz_url": (
+                    f"{probe_url.rstrip('/')}/healthz"
+                    if isinstance(probe_url, str) and probe_url and name != "ui"
+                    else None
+                ),
+                "pid": report.get("pid"),
+            }
+        block["status"] = status
+        merged[name] = block
+    return {"subsystems": merged}
+
+
+def _print_pretty_report(
+    *,
+    db_path: Path,
+    revision: str | None,
+    supervisor: dict[str, Any],
+    supervisor_root: Path,
+) -> None:
+    """Render the W14j Rich panel + subsystem table to stdout.
+
+    The panel is a two-line summary (DB path + alembic revision) so
+    the operator's first read confirms which DB this report describes
+    and that migrations are current. The table below sources its
+    rows from :func:`_active_mcp_for_table` so the column shape is
+    byte-identical to ``ctxr-fsm ensure`` and the supervisor banner.
+    """
+    console = Console()
+    db_repr = _portable_project_repr(db_path)
+    revision_line = revision or "(no alembic_version row)"
+    panel = Panel.fit(
+        f"[bold]DB[/bold]       {db_repr}\n"
+        f"[bold]Revision[/bold] {revision_line}",
+        title="ctxr-fsm doctor",
+        title_align="left",
+        border_style="cyan",
+    )
+    console.print(panel)
+    console.print(
+        render_subsystem_table(
+            _active_mcp_for_table(supervisor=supervisor),
+            project_root=supervisor_root,
+        )
+    )
+
+
 def doctor(
     db: Path | None = DB_OPTION,
     json_mode: bool = JSON_OPTION,
@@ -302,4 +419,21 @@ def doctor(
         "locks": {"count": locks},
         "supervisor": supervisor,
     }
-    json_or_pretty(report, json_mode)
+    if json_mode:
+        # JSON path is the wire contract every script depends on; we
+        # MUST emit the same shape every previous doctor invocation did.
+        json_or_pretty(report, json_mode)
+        return
+
+    # W14j: human-facing pretty-print is a Rich Panel (DB summary) +
+    # the shared subsystem table. This REPLACES the old free-form
+    # ``rich.print`` of the report dict — the dict-dump was useful
+    # for the early-W7 debugging window but is noisy now that the
+    # supervisor surface is the operator's first read. ``--json``
+    # callers still get the full report (see the early-return above).
+    _print_pretty_report(
+        db_path=db_path,
+        revision=revision,
+        supervisor=supervisor,
+        supervisor_root=supervisor_root,
+    )

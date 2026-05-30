@@ -79,6 +79,7 @@ import anyio
 import httpx
 from watchfiles import awatch
 
+from ctxr.fsm.cli._render import print_subsystem_table
 from ctxr.fsm.cli.lifecycle.primitives import (
     PidLock,
     ReusedSubsystem,
@@ -86,6 +87,7 @@ from ctxr.fsm.cli.lifecycle.primitives import (
     now_iso_ms,
     pick_port,
     pid_file_for,
+    read_active_mcp_file,
     read_pid_file,
     recall_port,
     release_singleton,
@@ -796,6 +798,33 @@ def _publish_active_mcp_file(
     remember_active_mcp_file(payload, project_root=project_root)
 
 
+def _augment_active_with_status(active: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of the W14c discovery doc with ``status='ready'`` per subsystem.
+
+    The discovery file itself never persists a ``status`` field (the
+    file describes "what the supervisor published", not "what the
+    last probe said"), but the W14j renderer's colour mapping is keyed
+    on ``status``. At supervisor boot time, by definition, every
+    subsystem in the file just passed its healthz / liveness check —
+    so injecting ``ready`` here produces a green-coloured first-boot
+    table without lying about the source-of-truth shape of the file.
+    """
+    subsystems = active.get("subsystems") or {}
+    if not isinstance(subsystems, dict):
+        return active
+    new_subs: dict[str, Any] = {}
+    for name, block in subsystems.items():
+        if isinstance(block, dict):
+            new_block = dict(block)
+            new_block.setdefault("status", "ready")
+            new_subs[name] = new_block
+        else:
+            new_subs[name] = block
+    augmented = dict(active)
+    augmented["subsystems"] = new_subs
+    return augmented
+
+
 def _publish_active_mcp_file_from_disk(*, project_root: Path) -> None:
     """Re-publish ``active-mcp.json`` after a reload, reading ports from disk.
 
@@ -929,6 +958,29 @@ async def run_supervisor(
                     f"ui=http://localhost:{ports['ui']}" if ports["ui"] else "ui=skipped"
                 )
             _log("[ctxr-fsm supervisor] booted: " + ", ".join(banner_bits))
+
+            # W14j: once every required healthz has passed (the publish
+            # gate above already enforces ``mcp_healthz_ok``), print the
+            # shared subsystem table to stdout exactly once so an
+            # operator running ``ctxr-fsm serve`` sees the FastAPI /
+            # Swagger / UI / MCP URLs at the moment the dashboard is
+            # actually reachable. NOT on every reload — the reload loop
+            # below re-publishes ``active-mcp.json`` from disk but does
+            # NOT re-print the table; one line per change in the
+            # operator's terminal is plenty. NOT on every healthz probe
+            # — that would spam the surface.
+            if mcp_healthz_ok and ports["mcp"] is not None:
+                active = read_active_mcp_file(project_root)
+                if active is not None:
+                    # ``print_subsystem_table`` writes to a fresh
+                    # ``rich.console.Console`` (i.e. stdout). The
+                    # supervisor's own log lines go to stderr, so the
+                    # operator sees the table on stdout and the
+                    # ``[ctxr-fsm supervisor] ...`` chatter on stderr
+                    # — two independent streams, easy to pipe
+                    # separately for downstream tooling.
+                    _augmented = _augment_active_with_status(active)
+                    print_subsystem_table(_augmented, project_root=project_root)
 
             # Dev-mode reload loop. Sibling task; cancellation of the
             # group tears it down with the rest. anyio's
