@@ -1,21 +1,32 @@
-"""Integration tests for ``--check`` detecting bootstrap.md drift.
+"""Integration tests for ``--check`` detecting bootstrap drift.
 
-W14e contract: ``ctxr-fsm install-memory --check`` MUST flag drift on
-the staged ``.ctxr-fsm/memory/bootstrap.md`` copy in the same way it
-flags drift on the principles file. Bootstrap.md ships without a
-frontmatter version (it's a procedural doc, not a versioned policy),
-so drift detection uses a content-hash comparison: any change to the
-package source or the staged copy must produce a non-zero exit.
+W14e contract (updated):
 
-These tests verify two end-to-end flows:
+* For **Claude**, bootstrap.md is staged separately under
+  ``.ctxr-fsm/memory/`` and drift is hash-detected directly on that
+  staged file (``bootstrap_status: ok | out-of-date | not-installed``).
+* For **Codex** and **Cursor**, the bootstrap content is inlined into
+  the principles adapter file. There is no separate staged bootstrap
+  to hash, so ``bootstrap_status`` is the static sentinel
+  ``"inlined"`` for those clients. Drift in the bootstrap CONTENT for
+  codex / cursor surfaces as principles-version drift: changing
+  bootstrap.md and regenerating the adapters bumps the adapter file's
+  bytes, which the existing principles version comparison catches.
 
-* After install, mutate the staged bootstrap copy in place; ``--check``
-  flags ``bootstrap_status: "out-of-date"`` and exits 1. Re-running
-  install fixes the drift (the staged copy is re-materialised).
-* Monkey-patch the package's bootstrap source to a different blob;
-  ``--check`` flags drift the same way (the staged copy now differs
-  from the new package content). Re-running install picks up the
-  monkey-patched content.
+These tests verify:
+
+* Claude: mutating the staged bootstrap copy flags
+  ``bootstrap_status: out-of-date``. Bumping the package source via
+  monkeypatch also flags drift on Claude.
+* Codex / Cursor: bootstrap drift surfaces via the principles
+  adapter file diverging from the installed marker block (or the
+  cursor rule file's bytes diverging from the package). We simulate
+  by editing the installed AGENTS.md/.mdc marker block to a stale
+  version and verify the principles axis flags it.
+* Absent install (no client has been initialised): principles is
+  ``missing`` for the host that exists; Claude's bootstrap_status is
+  ``not-installed``; codex / cursor's bootstrap_status is
+  ``inlined``.
 """
 
 from __future__ import annotations
@@ -82,27 +93,33 @@ def _run_check(target: Path) -> tuple[int, dict]:
     return result.exit_code, json.loads(result.stdout)
 
 
+def _row_for(payload: dict, client: str) -> dict:
+    """Pull the per-client row out of a ``--check`` JSON payload."""
+
+    for row in payload["results"]:
+        if row["client"] == client:
+            return row
+    raise AssertionError(f"no row for {client!r} in {payload}")
+
+
 # ---------------------------------------------------------------------------
-# Tests
+# Claude-specific: staged-file drift
 # ---------------------------------------------------------------------------
 
 
-def test_check_flags_staged_bootstrap_mutation(tmp_target: Path) -> None:
-    """Mutate the staged bootstrap copy; ``--check`` reports drift; reinstall fixes it."""
+def test_check_flags_claude_staged_bootstrap_mutation(tmp_target: Path) -> None:
+    """Mutate Claude's staged bootstrap copy; ``--check`` reports drift; reinstall fixes it."""
 
-    # Set up Claude as the host (any client will do for this test).
     (tmp_target / "CLAUDE.md").write_text("", encoding="utf-8")
     _install_auto(tmp_target)
 
     staged = _staged_bootstrap(tmp_target)
     assert staged.is_file()
 
-    # Baseline: a clean install reports ``bootstrap_status: "ok"`` for
-    # every detected client.
+    # Baseline: a clean install reports ``bootstrap_status: "ok"``.
     exit_code, payload = _run_check(tmp_target)
     assert exit_code == 0, payload
-    for row in payload["results"]:
-        assert row["bootstrap_status"] == "ok", row
+    assert _row_for(payload, "claude")["bootstrap_status"] == "ok"
 
     # Mutate the staged file (simulating accidental local edits or
     # tooling drift).
@@ -110,22 +127,20 @@ def test_check_flags_staged_bootstrap_mutation(tmp_target: Path) -> None:
 
     exit_code, payload = _run_check(tmp_target)
     assert exit_code == 1, payload
-    for row in payload["results"]:
-        assert row["bootstrap_status"] == "out-of-date", row
+    assert _row_for(payload, "claude")["bootstrap_status"] == "out-of-date"
 
     # Re-running install rewrites the staged copy back to the package
     # source.
     _install_auto(tmp_target)
     exit_code, payload = _run_check(tmp_target)
     assert exit_code == 0, payload
-    for row in payload["results"]:
-        assert row["bootstrap_status"] == "ok", row
+    assert _row_for(payload, "claude")["bootstrap_status"] == "ok"
 
 
-def test_check_flags_package_bootstrap_bump(
+def test_check_flags_claude_package_bootstrap_bump(
     tmp_target: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A bumped package bootstrap source flags drift on the staged copy."""
+    """A bumped package bootstrap source flags drift on Claude's staged copy."""
 
     (tmp_target / "CLAUDE.md").write_text("", encoding="utf-8")
     _install_auto(tmp_target)
@@ -148,35 +163,138 @@ def test_check_flags_package_bootstrap_bump(
     )
 
     # The staged copy (made from the REAL package source) now lags
-    # the patched "package" source — exit 1 + bootstrap_status flagged.
+    # the patched "package" source — exit 1 + bootstrap_status flagged
+    # on the Claude row.
     exit_code, payload = _run_check(tmp_target)
     assert exit_code == 1, payload
-    for row in payload["results"]:
-        assert row["bootstrap_status"] == "out-of-date", row
+    assert _row_for(payload, "claude")["bootstrap_status"] == "out-of-date"
 
     # Re-running install (with the monkey-patched source still in
     # effect) materialises the bumped content.
     _install_auto(tmp_target)
     exit_code, payload = _run_check(tmp_target)
     assert exit_code == 0, payload
-    for row in payload["results"]:
-        assert row["bootstrap_status"] == "ok", row
+    assert _row_for(payload, "claude")["bootstrap_status"] == "ok"
     assert _staged_bootstrap(tmp_target).read_text(encoding="utf-8").endswith(
         "<!-- v2 -->\n"
     )
 
 
-def test_check_reports_not_installed_when_bootstrap_absent(
+# ---------------------------------------------------------------------------
+# Codex / Cursor: bootstrap_status is always "inlined"
+# ---------------------------------------------------------------------------
+
+
+def test_check_reports_inlined_for_codex_and_cursor(tmp_target: Path) -> None:
+    """A clean codex / cursor install reports ``bootstrap_status: "inlined"``."""
+
+    (tmp_target / "CLAUDE.md").write_text("", encoding="utf-8")
+    (tmp_target / "AGENTS.md").write_text("", encoding="utf-8")
+    (tmp_target / ".cursor" / "rules").mkdir(parents=True)
+    _install_auto(tmp_target)
+
+    exit_code, payload = _run_check(tmp_target)
+    assert exit_code == 0, payload
+    assert _row_for(payload, "codex")["bootstrap_status"] == "inlined"
+    assert _row_for(payload, "cursor")["bootstrap_status"] == "inlined"
+
+
+def test_check_flags_codex_principles_drift_when_adapter_bumps(
     tmp_target: Path,
 ) -> None:
-    """If bootstrap.md was never staged, ``--check`` reports it as not-installed."""
+    """Editing AGENTS.md's marker version flags principles-axis drift for codex.
 
-    # Create only the principles host file; never run install. The
-    # principles axis will be ``missing``, and the bootstrap axis
-    # ``not-installed``. Either condition alone is enough to fail.
+    For codex, bootstrap content drift surfaces as principles-version
+    drift (since the adapter regeneration bumps the file when
+    bootstrap.md changes). We simulate "the adapter was bumped but
+    the install is stale" by hand-editing the version in AGENTS.md's
+    marker block and asserting ``status: out-of-date``.
+    """
+
+    (tmp_target / "AGENTS.md").write_text("", encoding="utf-8")
+    _install_auto(tmp_target)
+
+    agents = tmp_target / "AGENTS.md"
+    original = agents.read_text(encoding="utf-8")
+    # Replace the pinned version with a clearly-stale one. The marker
+    # line looks like ``<!-- ctxr-fsm:begin v=0.2.0 -->``; we don't
+    # rely on the exact version string in the test, just on the
+    # ``v=`` attribute.
+    bumped = original.replace(
+        "<!-- ctxr-fsm:begin v=", "<!-- ctxr-fsm:begin v=0.0.0-stale-x-", 1
+    )
+    assert bumped != original, "marker substitution did not match"
+    agents.write_text(bumped, encoding="utf-8")
+
+    exit_code, payload = _run_check(tmp_target)
+    assert exit_code == 1, payload
+    assert _row_for(payload, "codex")["status"] == "out-of-date"
+    # bootstrap_status stays ``"inlined"`` — for codex it's the
+    # principles axis that catches the drift.
+    assert _row_for(payload, "codex")["bootstrap_status"] == "inlined"
+
+
+def test_check_flags_cursor_principles_drift_when_rule_file_bumps(
+    tmp_target: Path,
+) -> None:
+    """Mutating the cursor .mdc rule file flags principles-axis drift for cursor.
+
+    Cursor's rule file IS the principles adapter (no marker block to
+    parse — frontmatter version), so editing it to bump the version
+    string drifts the principles axis. Bootstrap content drift would
+    show up the same way (regenerated adapter -> bumped bytes).
+    """
+
+    (tmp_target / ".cursor" / "rules").mkdir(parents=True)
+    _install_auto(tmp_target)
+
+    rule = tmp_target / ".cursor" / "rules" / "ctxr-fsm.mdc"
+    original = rule.read_text(encoding="utf-8")
+    bumped = original.replace("version: 0.2.0", "version: 0.0.0-stale", 1)
+    assert bumped != original, "version substitution did not match"
+    rule.write_text(bumped, encoding="utf-8")
+
+    exit_code, payload = _run_check(tmp_target)
+    assert exit_code == 1, payload
+    assert _row_for(payload, "cursor")["status"] == "out-of-date"
+    assert _row_for(payload, "cursor")["bootstrap_status"] == "inlined"
+
+
+# ---------------------------------------------------------------------------
+# Absent install
+# ---------------------------------------------------------------------------
+
+
+def test_check_reports_not_installed_when_bootstrap_absent_for_claude(
+    tmp_target: Path,
+) -> None:
+    """No install: Claude flags principles ``missing`` AND bootstrap ``not-installed``."""
+
     (tmp_target / "CLAUDE.md").write_text("", encoding="utf-8")
 
     exit_code, payload = _run_check(tmp_target)
     assert exit_code == 1, payload
-    for row in payload["results"]:
-        assert row["bootstrap_status"] == "not-installed", row
+    claude = _row_for(payload, "claude")
+    assert claude["bootstrap_status"] == "not-installed"
+
+
+def test_check_reports_inlined_for_codex_when_principles_missing(
+    tmp_target: Path,
+) -> None:
+    """No install: codex flags principles ``missing`` but bootstrap_status is ``inlined``.
+
+    The bootstrap content for codex always rides inside the
+    principles adapter (or is absent entirely along with it). We
+    never report ``not-installed`` for a code path that has nothing
+    to install — that would be a misleading "you're missing the
+    bootstrap file" message when the real issue is principles aren't
+    installed at all.
+    """
+
+    (tmp_target / "AGENTS.md").write_text("", encoding="utf-8")
+
+    exit_code, payload = _run_check(tmp_target)
+    assert exit_code == 1, payload
+    codex = _row_for(payload, "codex")
+    assert codex["status"] == "missing"
+    assert codex["bootstrap_status"] == "inlined"

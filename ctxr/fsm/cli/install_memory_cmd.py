@@ -12,19 +12,26 @@ wires it into the consumer project's standard AI-client memory:
 
 * **Codex / OpenAI Agents SDK** (``AGENTS.md``) — Codex does NOT support
   the ``@<path>`` import idiom, so the full body of the principles file
-  is inlined between fence markers at the END of ``AGENTS.md``.
+  is inlined between fence markers at the END of ``AGENTS.md``. The
+  codex-flavoured principles adapter ALSO inlines the bootstrap body
+  inside Principle 0 (see ``tools/generate_memory_adapters.py``), so no
+  separate ``.ctxr-fsm/memory/bootstrap.md`` is staged for Codex.
 
 * **Cursor** (``.cursor/rules/ctxr-fsm.mdc``) — Cursor's rule files are
   standalone, so we write the principles file directly with no marker
-  block. The rule filename itself is the namespace.
+  block. The rule filename itself is the namespace. Like Codex, the
+  cursor adapter inlines the bootstrap body, so no separate staged
+  bootstrap.md is needed.
 
-For EVERY client we additionally stage ``bootstrap.md`` under
+For Claude ONLY we additionally stage ``bootstrap.md`` under
 ``./.ctxr-fsm/memory/bootstrap.md`` so Principle 0's
 ``@.ctxr-fsm/memory/bootstrap.md`` reference inside principles.md
-resolves to a real file on disk. (Claude's transitive ``@`` follow
-needs the file; Codex/Cursor inline the principles body and the
-reference is just text, but the file still has to exist for an
-operator to open when following the pointer.)
+resolves to a real file on disk via Claude's transitive ``@`` follow.
+Codex and Cursor don't follow the ``@`` import at all, so the bootstrap
+content is delivered to those clients by being INLINED into the
+principles adapter file at generation time — staging the bootstrap
+file separately for them would be pointless (their LLMs can't reach it
+via the ``@`` syntax).
 
 Idempotence
 -----------
@@ -122,13 +129,14 @@ _MARKER_BLOCK_RE: re.Pattern[str] = re.compile(
 _CLAUDE_LINKED_PATH: Path = Path(".ctxr-fsm") / "memory" / "principles.claude.md"
 
 # Relative path inside the target project where we materialise the
-# bootstrap doc. Principle 0 inside principles.md references this path
-# via ``@.ctxr-fsm/memory/bootstrap.md``, so EVERY client install must
-# put the file here (not just the Claude path that natively resolves
-# the ``@<path>`` syntax). For Codex/Cursor the principles body is
-# inlined and the reference is just text, but the file still needs to
-# exist for the principles' instruction to be actionable when an
-# operator follows the @ pointer manually.
+# bootstrap doc. Principle 0 inside principles.md (the Claude flavour)
+# references this path via ``@.ctxr-fsm/memory/bootstrap.md`` so
+# Claude's transitive ``@`` import can find the file. This staging
+# applies to the CLAUDE install path only; Codex and Cursor inline
+# the bootstrap body inside their principles adapter file (see
+# ``tools/generate_memory_adapters.py``) because their LLMs do not
+# follow ``@`` imports, so a staged copy under this path would be
+# unreachable for them.
 _BOOTSTRAP_LINKED_PATH: Path = (
     Path(".ctxr-fsm") / "memory" / BOOTSTRAP_FILENAME
 )
@@ -523,11 +531,12 @@ class _InstallResult:
     installed_version: str | None
     link_mode: str | None  # "symlink" | "copy" | None
     # ``bootstrap_link_mode`` records how ``.ctxr-fsm/memory/bootstrap.md``
-    # was staged for this client (symlink / copy / None when dry-run
-    # skipped the materialisation). The bootstrap doc is staged for
-    # EVERY client so Principle 0's ``@.ctxr-fsm/memory/bootstrap.md``
-    # reference resolves regardless of which client hosts the
-    # principles body — see _materialise_bootstrap_doc.
+    # was staged for this client (symlink / copy / None). The
+    # bootstrap doc is staged ONLY for Claude — its ``@`` import in
+    # Principle 0 needs a real file on disk. Codex and Cursor inline
+    # the bootstrap body inside their principles adapter (see
+    # ``tools/generate_memory_adapters.py``) and report ``None``
+    # here because no separate file is materialised.
     bootstrap_link_mode: str | None = None
     note: str = ""
 
@@ -548,9 +557,11 @@ def _install_claude(
     0 inside principles.md references ``@.ctxr-fsm/memory/bootstrap.md``
     in turn, so a separate ``@`` import for the bootstrap doc in the
     marker block would be redundant — Claude's transitive import
-    resolves it through the principles file. We still stage
-    bootstrap.md alongside the principles file so that import has
-    something to resolve to.
+    resolves it through the principles file. We stage bootstrap.md
+    alongside the principles file so that import has something to
+    resolve to. Bootstrap-file staging is CLAUDE-ONLY: Codex and
+    Cursor inline the bootstrap body into their principles adapter
+    instead because their LLMs do not follow ``@`` imports.
     """
     if dry_run:
         # In dry-run mode we don't materialise either symlink — just show
@@ -622,11 +633,21 @@ def _install_codex(
     """Idempotent install for Codex: inline the principles into AGENTS.md.
 
     Codex doesn't natively follow Claude's ``@<path>`` import syntax,
-    so the principles body is inlined directly. We still stage
-    bootstrap.md under ``.ctxr-fsm/memory/`` so an operator (or
-    follow-up tooling) who reads Principle 0's ``@`` reference can
-    open the file at the expected project-relative path.
+    so the principles body is inlined directly. The codex flavour of
+    the principles adapter ALREADY inlines the bootstrap body inside
+    Principle 0 (see ``tools/generate_memory_adapters.py``), so this
+    install path does NOT stage a separate ``bootstrap.md`` under
+    ``.ctxr-fsm/memory/`` — Codex's LLM cannot reach it through an
+    ``@`` import anyway. ``bootstrap_link_mode`` is therefore always
+    ``None`` for codex: drift detection for the bootstrap content
+    happens via the principles-adapter version comparison instead.
+
+    ``target`` and ``no_symlink`` are accepted for signature
+    parity with the other ``_install_*`` helpers (the call site in
+    :func:`run_install_memory` dispatches uniformly) but are unused
+    for Codex.
     """
+    del target, no_symlink  # unused — see docstring
     package_text = package_file.read_text(encoding="utf-8")
     existing_text = host_file.read_text(encoding="utf-8") if host_file.is_file() else ""
 
@@ -645,11 +666,9 @@ def _install_codex(
             if existing_text
             else None,
             link_mode=None,
-            bootstrap_link_mode="copy" if no_symlink else "symlink",
+            bootstrap_link_mode=None,
             note=_diff_preview(existing_text, new_text),
         )
-
-    _, bootstrap_link_mode = _materialise_bootstrap_doc(target, no_symlink=no_symlink)
 
     if new_text == existing_text and host_file.is_file():
         return _InstallResult(
@@ -659,7 +678,7 @@ def _install_codex(
             package_version=package_version,
             installed_version=package_version,
             link_mode=None,
-            bootstrap_link_mode=bootstrap_link_mode,
+            bootstrap_link_mode=None,
         )
 
     host_file.parent.mkdir(parents=True, exist_ok=True)
@@ -671,7 +690,7 @@ def _install_codex(
         package_version=package_version,
         installed_version=package_version,
         link_mode=None,
-        bootstrap_link_mode=bootstrap_link_mode,
+        bootstrap_link_mode=None,
     )
 
 
@@ -687,12 +706,19 @@ def _install_cursor(
     """Idempotent install for Cursor: write the standalone .mdc rule file.
 
     Cursor rule files live under ``.cursor/rules/`` and are evaluated
-    standalone (no marker / no inlined-import contract). We still stage
-    bootstrap.md alongside the in-project ``.ctxr-fsm/memory/`` copy
-    so Principle 0's ``@.ctxr-fsm/memory/bootstrap.md`` reference is
-    actionable for any human or tool that follows it from the rule
-    body.
+    standalone (no marker / no inlined-import contract). Bootstrap
+    content is inlined into the .cursor rule file via the codex /
+    cursor adapter (see ``tools/generate_memory_adapters.py``); we
+    don't stage a separate ``bootstrap.md`` here because Cursor
+    doesn't follow ``@`` imports. ``bootstrap_link_mode`` is always
+    ``None`` for cursor: drift in the bootstrap content surfaces via
+    the cursor adapter's content hash (the rule file itself is the
+    source of truth).
+
+    ``target`` and ``no_symlink`` are accepted for signature parity
+    with the other ``_install_*`` helpers but are unused for Cursor.
     """
+    del target, no_symlink  # unused — see docstring
     package_bytes = package_file.read_bytes()
     existing_bytes = host_file.read_bytes() if host_file.is_file() else b""
 
@@ -709,11 +735,9 @@ def _install_cursor(
             package_version=package_version,
             installed_version=installed_version,
             link_mode=None,
-            bootstrap_link_mode="copy" if no_symlink else "symlink",
+            bootstrap_link_mode=None,
             note=f"would write {len(package_bytes)} bytes to {host_file}",
         )
-
-    _, bootstrap_link_mode = _materialise_bootstrap_doc(target, no_symlink=no_symlink)
 
     if existing_bytes == package_bytes:
         return _InstallResult(
@@ -723,7 +747,7 @@ def _install_cursor(
             package_version=package_version,
             installed_version=package_version,
             link_mode=None,
-            bootstrap_link_mode=bootstrap_link_mode,
+            bootstrap_link_mode=None,
         )
 
     host_file.parent.mkdir(parents=True, exist_ok=True)
@@ -735,7 +759,7 @@ def _install_cursor(
         package_version=package_version,
         installed_version=package_version,
         link_mode=None,
-        bootstrap_link_mode=bootstrap_link_mode,
+        bootstrap_link_mode=None,
     )
 
 
@@ -766,11 +790,21 @@ class _CheckRow:
     ``status`` and ``installed_version`` describe the principles file's
     drift status (parsed from the marker block's ``v=`` attribute or
     the cursor rule frontmatter). ``bootstrap_status`` describes the
-    drift status of the staged ``.ctxr-fsm/memory/bootstrap.md`` copy
-    against the package source — bootstrap.md has no frontmatter
-    version, so we compare content hashes instead. A client is
-    considered out-of-date overall when EITHER axis is out of date or
-    missing.
+    drift status of the bootstrap content for THIS client:
+
+    * For Claude, the staged ``.ctxr-fsm/memory/bootstrap.md`` copy is
+      hash-compared against the package source — bootstrap.md has no
+      frontmatter version, so we compare content hashes.
+    * For Codex and Cursor, the bootstrap content lives inlined inside
+      the principles adapter file. Drift in that content shows up as
+      drift in the principles version (the adapter regenerates when
+      bootstrap.md changes, bumping the principles file's bytes), so
+      ``bootstrap_status`` is the static sentinel ``"inlined"`` —
+      "checked elsewhere, not staged as a separate file".
+
+    A client is considered out-of-date overall when EITHER axis is
+    out of date or missing (where applicable — ``"inlined"`` is
+    never a failure on its own).
     """
 
     client: str
@@ -778,7 +812,9 @@ class _CheckRow:
     package_version: str | None
     installed_version: str | None
     status: str  # "ok" | "out-of-date" | "missing" | "not-installed"
-    bootstrap_status: str = "not-installed"  # "ok" | "out-of-date" | "missing" | "not-installed"
+    bootstrap_status: str = (
+        "not-installed"
+    )  # "ok" | "out-of-date" | "missing" | "not-installed" | "inlined"
 
 
 def _sha256_file(path: Path) -> str:
@@ -797,7 +833,10 @@ def _check_bootstrap_status(
     comparison doesn't apply. We hash the staged file's bytes and
     compare against the package source's hash, which is exactly what
     drift detection needs: any change to either file shows up as a
-    hash mismatch.
+    hash mismatch. Applies ONLY to clients that stage bootstrap.md
+    (i.e. Claude); codex/cursor consume the bootstrap content through
+    the inlined block in their principles adapter and don't have a
+    staged file to compare against.
 
     Returns:
         ``"ok"`` — staged file exists and content matches the package.
@@ -822,13 +861,18 @@ def _check_one(
 ) -> _CheckRow:
     """Compute the status for one detected client.
 
-    The bootstrap-axis status is computed once per client even though
-    the bootstrap file is shared across clients — this matches the
-    existing per-client row shape and keeps the JSON contract uniform
-    (every row carries every status it needs to make a verdict).
+    For Claude the bootstrap-axis status reflects the staged copy's
+    hash against the package source. For Codex and Cursor we return
+    the ``"inlined"`` sentinel: the bootstrap content lives inside
+    the principles adapter for those clients, so drift in bootstrap
+    content surfaces via the principles version comparison rather
+    than a separate hash check.
     """
     host = detection.host_file
-    bootstrap_status = _check_bootstrap_status(target, package_bootstrap_hash)
+    if detection.name == "claude":
+        bootstrap_status = _check_bootstrap_status(target, package_bootstrap_hash)
+    else:
+        bootstrap_status = "inlined"
 
     if host is None or not host.is_file():
         return _CheckRow(
@@ -1044,10 +1088,11 @@ def install_memory(
         False,
         "--no-symlink",
         help=(
-            "Always copy staged files (the Claude principles adapter and "
+            "Always copy Claude's staged files (the principles adapter and "
             "the bootstrap doc) under TARGET/.ctxr-fsm/memory/ instead of "
             "trying to symlink first. Default tries symlink and falls back "
-            "to copy on failure (Windows without dev-mode, some FUSE mounts)."
+            "to copy on failure (Windows without dev-mode, some FUSE mounts). "
+            "No-op for Codex and Cursor (nothing is staged for those clients)."
         ),
     ),
     json_mode: bool = typer.Option(
@@ -1103,10 +1148,15 @@ def install_memory(
             )
             for d in detections
         ]
-        # Drift on EITHER axis (principles version or bootstrap content)
-        # triggers a non-zero exit so CI can fail fast. We treat the
-        # bootstrap doc the same as the principles file: missing or
-        # out-of-date is a problem the human needs to know about.
+        # Drift on EITHER axis triggers a non-zero exit so CI can
+        # fail fast. The principles axis applies to every client; the
+        # bootstrap axis is only meaningful when bootstrap.md is
+        # staged separately (Claude). For codex/cursor the bootstrap
+        # content is inlined into the principles adapter, so its
+        # drift is already detected by the principles version check
+        # plus the adapter-regeneration step; ``bootstrap_status``
+        # is ``"inlined"`` there and is NOT treated as a failure on
+        # its own.
         out_of_date = [
             r
             for r in rows
