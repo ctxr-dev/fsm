@@ -832,7 +832,10 @@ def _publish_active_mcp_file_from_disk(*, project_root: Path) -> None:
 
 
 async def run_supervisor(
-    mode: Literal["dev", "prod"] = "dev",
+    # Literal kept (not an enum) because ``mode`` is a one-off boot
+    # parameter consumed by the supervisor + the dev-reload sibling;
+    # no closed-vocabulary status field, no cross-module reuse.
+    mode: Literal["dev", "prod"] = "dev",  # audit-strings: justified
     db_path: Path | None = None,
     project_root: Path | None = None,
     mcp_only: bool = False,
@@ -1008,7 +1011,7 @@ def main(
     # async body declares. We pin it locally with a partial so the
     # call site stays type-safe without sprinkling ``cast`` at the
     # entry point.
-    runner: Literal["dev", "prod"] = "prod" if mode == "prod" else "dev"
+    runner: Literal["dev", "prod"] = "prod" if mode == "prod" else "dev"  # audit-strings: justified
     anyio.run(
         functools.partial(run_supervisor, runner, db_path, None, mcp_only)
     )

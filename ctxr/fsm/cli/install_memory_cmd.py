@@ -86,24 +86,96 @@ import hashlib
 import re
 import shutil
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 import typer
 
+from ctxr.fsm.cli._clients import McpClient
 from ctxr.fsm.cli._common import json_or_pretty
 from ctxr.fsm.memory import BOOTSTRAP_FILENAME, get_bootstrap_path, get_principles_path
 
-__all__ = ["install_memory", "run_install_memory"]
+__all__ = [
+    "BootstrapStatus",
+    "MemoryInstallStatus",
+    "install_memory",
+    "run_install_memory",
+]
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-# The set of client identifiers the command understands. ``auto`` is a
-# meta-value that fans out to the detected clients in the target dir.
-_CLIENT_CHOICES: tuple[str, ...] = ("auto", "claude", "codex", "cursor")
+
+class BootstrapStatus(StrEnum):
+    """Status of the staged ``.ctxr-fsm/memory/bootstrap.md`` copy.
+
+    Surfaced on per-client ``--check`` rows. ``inlined`` is the
+    sentinel for codex / cursor where the bootstrap content lives
+    inside the principles adapter (drift detected via principles
+    version comparison, not via a separate hash check).
+
+    Members:
+
+    * ``ok``            — staged file present and content matches
+      the package source's bytes.
+    * ``out_of_date``   — staged file present but content differs
+      from the package source.
+    * ``not_installed`` — staged file is absent.
+    * ``inlined``       — bootstrap content is inlined into the
+      principles adapter for this client; no separate file to compare.
+
+    Wire-format note: the legacy hyphenated ``"out-of-date"`` and
+    ``"not-installed"`` values are replaced by snake-case
+    ``"out_of_date"`` / ``"not_installed"`` so the enum member name
+    matches the wire value (StrEnum members cannot contain hyphens).
+    The other values (``ok``, ``inlined``) are byte-identical with
+    the pre-W14i shape.
+    """
+
+    ok = "ok"
+    out_of_date = "out_of_date"
+    not_installed = "not_installed"
+    inlined = "inlined"
+
+
+class MemoryInstallStatus(StrEnum):
+    """Per-client status surfaced on ``install-memory --check`` rows.
+
+    Mirrors the historical free-form strings (``"ok"``,
+    ``"out-of-date"``, ``"missing"``, ``"not-installed"``); kept as
+    snake_case enum members. Wire-format note: ``"out-of-date"`` and
+    ``"not-installed"`` (hyphenated) are replaced by snake-case
+    ``"out_of_date"`` / ``"not_installed"`` so the enum member name
+    matches the wire value.
+    """
+
+    ok = "ok"
+    out_of_date = "out_of_date"
+    missing = "missing"
+    not_installed = "not_installed"
+
+
+# Memory installer historically does NOT accept ``McpClient.none`` —
+# callers that want to skip memory entirely pass ``--no-memory`` on
+# the higher-level ``ensure`` surface, not ``--client none`` here.
+# We exclude it from the install-memory choices but keep the shared
+# enum elsewhere — the install path is the only one that narrows it.
+_MEMORY_CLIENT_CHOICES: tuple[McpClient, ...] = (
+    McpClient.auto,
+    McpClient.claude,
+    McpClient.codex,
+    McpClient.cursor,
+)
+
+# The set of client identifiers the command understands. Kept as a
+# tuple for the CLI's free-form ``--client`` validation; the enum
+# above is the canonical source.
+_CLIENT_CHOICES: tuple[str, ...] = tuple(
+    member.value for member in _MEMORY_CLIENT_CHOICES
+)
 
 # The marker fences. We keep both as module constants so callers
 # (tests, downstream tools) can import and match against them rather
@@ -787,10 +859,11 @@ def _read_installed_version_from_text(text: str) -> str | None:
 class _CheckRow:
     """One row in the per-client ``--check`` status table.
 
-    ``status`` and ``installed_version`` describe the principles file's
-    drift status (parsed from the marker block's ``v=`` attribute or
-    the cursor rule frontmatter). ``bootstrap_status`` describes the
-    drift status of the bootstrap content for THIS client:
+    :attr:`status` and :attr:`installed_version` describe the
+    principles file's drift status (parsed from the marker block's
+    ``v=`` attribute or the cursor rule frontmatter).
+    :attr:`bootstrap_status` describes the drift status of the
+    bootstrap content for THIS client:
 
     * For Claude, the staged ``.ctxr-fsm/memory/bootstrap.md`` copy is
       hash-compared against the package source — bootstrap.md has no
@@ -799,11 +872,11 @@ class _CheckRow:
       the principles adapter file. Drift in that content shows up as
       drift in the principles version (the adapter regenerates when
       bootstrap.md changes, bumping the principles file's bytes), so
-      ``bootstrap_status`` is the static sentinel ``"inlined"`` —
+      :attr:`bootstrap_status` is :attr:`BootstrapStatus.inlined` —
       "checked elsewhere, not staged as a separate file".
 
     A client is considered out-of-date overall when EITHER axis is
-    out of date or missing (where applicable — ``"inlined"`` is
+    out of date or missing (where applicable — ``inlined`` is
     never a failure on its own).
     """
 
@@ -811,10 +884,8 @@ class _CheckRow:
     host_file: Path | None
     package_version: str | None
     installed_version: str | None
-    status: str  # "ok" | "out-of-date" | "missing" | "not-installed"
-    bootstrap_status: str = (
-        "not-installed"
-    )  # "ok" | "out-of-date" | "missing" | "not-installed" | "inlined"
+    status: MemoryInstallStatus
+    bootstrap_status: BootstrapStatus = BootstrapStatus.not_installed
 
 
 def _sha256_file(path: Path) -> str:
@@ -825,7 +896,7 @@ def _sha256_file(path: Path) -> str:
 
 def _check_bootstrap_status(
     target: Path, package_bootstrap_hash: str
-) -> str:
+) -> BootstrapStatus:
     """Compare the staged bootstrap copy under ``target`` against the package.
 
     Bootstrap.md ships without a frontmatter version (it's a procedural
@@ -839,18 +910,20 @@ def _check_bootstrap_status(
     staged file to compare against.
 
     Returns:
-        ``"ok"`` — staged file exists and content matches the package.
-        ``"out-of-date"`` — staged file exists but content differs.
-        ``"not-installed"`` — staged file is absent.
+        :attr:`BootstrapStatus.ok`            — staged file exists and
+            content matches the package.
+        :attr:`BootstrapStatus.out_of_date`   — staged file exists but
+            content differs.
+        :attr:`BootstrapStatus.not_installed` — staged file is absent.
     """
 
     staged = target / _BOOTSTRAP_LINKED_PATH
     if not staged.is_file():
-        return "not-installed"
+        return BootstrapStatus.not_installed
 
     if _sha256_file(staged) == package_bootstrap_hash:
-        return "ok"
-    return "out-of-date"
+        return BootstrapStatus.ok
+    return BootstrapStatus.out_of_date
 
 
 def _check_one(
@@ -863,16 +936,16 @@ def _check_one(
 
     For Claude the bootstrap-axis status reflects the staged copy's
     hash against the package source. For Codex and Cursor we return
-    the ``"inlined"`` sentinel: the bootstrap content lives inside
+    :attr:`BootstrapStatus.inlined`: the bootstrap content lives inside
     the principles adapter for those clients, so drift in bootstrap
     content surfaces via the principles version comparison rather
     than a separate hash check.
     """
     host = detection.host_file
-    if detection.name == "claude":
+    if detection.name == McpClient.claude.value:
         bootstrap_status = _check_bootstrap_status(target, package_bootstrap_hash)
     else:
-        bootstrap_status = "inlined"
+        bootstrap_status = BootstrapStatus.inlined
 
     if host is None or not host.is_file():
         return _CheckRow(
@@ -880,7 +953,7 @@ def _check_one(
             host_file=host,
             package_version=package_version,
             installed_version=None,
-            status="not-installed",
+            status=MemoryInstallStatus.not_installed,
             bootstrap_status=bootstrap_status,
         )
 
@@ -894,7 +967,7 @@ def _check_one(
             host_file=host,
             package_version=package_version,
             installed_version=None,
-            status="missing",
+            status=MemoryInstallStatus.missing,
             bootstrap_status=bootstrap_status,
         )
     if installed == package_version:
@@ -903,7 +976,7 @@ def _check_one(
             host_file=host,
             package_version=package_version,
             installed_version=installed,
-            status="ok",
+            status=MemoryInstallStatus.ok,
             bootstrap_status=bootstrap_status,
         )
     return _CheckRow(
@@ -911,7 +984,7 @@ def _check_one(
         host_file=host,
         package_version=package_version,
         installed_version=installed,
-        status="out-of-date",
+        status=MemoryInstallStatus.out_of_date,
         bootstrap_status=bootstrap_status,
     )
 
@@ -1157,11 +1230,19 @@ def install_memory(
         # plus the adapter-regeneration step; ``bootstrap_status``
         # is ``"inlined"`` there and is NOT treated as a failure on
         # its own.
+        memory_fail_statuses = {
+            MemoryInstallStatus.out_of_date,
+            MemoryInstallStatus.missing,
+        }
+        bootstrap_fail_statuses = {
+            BootstrapStatus.out_of_date,
+            BootstrapStatus.not_installed,
+        }
         out_of_date = [
             r
             for r in rows
-            if r.status in ("out-of-date", "missing")
-            or r.bootstrap_status in ("out-of-date", "not-installed")
+            if r.status in memory_fail_statuses
+            or r.bootstrap_status in bootstrap_fail_statuses
         ]
         json_or_pretty(
             {
@@ -1173,8 +1254,8 @@ def install_memory(
                         "host_file": str(r.host_file) if r.host_file else None,
                         "package_version": r.package_version,
                         "installed_version": r.installed_version,
-                        "status": r.status,
-                        "bootstrap_status": r.bootstrap_status,
+                        "status": r.status.value,
+                        "bootstrap_status": r.bootstrap_status.value,
                     }
                     for r in rows
                 ],

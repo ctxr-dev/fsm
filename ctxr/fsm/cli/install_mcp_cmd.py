@@ -56,10 +56,11 @@ import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import typer
 
+from ctxr.fsm.cli._clients import McpClient, McpConfigStatus
 from ctxr.fsm.cli._common import json_or_pretty
 
 __all__ = ["install_mcp", "run_install_mcp"]
@@ -72,7 +73,9 @@ __all__ = ["install_mcp", "run_install_mcp"]
 # Allowed values for the ``--client`` flag. ``auto`` is a meta-value
 # that fans out to every detected client. ``none`` short-circuits to a
 # no-op — useful for ``ctxr-fsm ensure --no-mcp-config`` plumbing.
-_CLIENT_CHOICES: tuple[str, ...] = ("auto", "claude", "codex", "cursor", "none")
+# The tuple form is kept for backward-compatible callers that grep on
+# the constant; the enum is the canonical source.
+_CLIENT_CHOICES: tuple[str, ...] = tuple(member.value for member in McpClient)
 
 # The MCP entry's logical name as it appears in every client config.
 # Kept as a constant so a rename only touches one place + every
@@ -125,6 +128,36 @@ def _detect_indent(text: str) -> str:
                 return " " * count
             return "  "
     return "  "
+
+
+# ---------------------------------------------------------------------------
+# Shared --check detail strings
+# ---------------------------------------------------------------------------
+
+
+def _check_detail_for(status: McpConfigStatus) -> str:
+    """Return the human-readable ``detail`` for a ``--check`` outcome.
+
+    Centralised so the JSON merger + the TOML splicer surface
+    identical wording per status. ``McpConfigStatus.unchanged`` is not
+    a valid ``--check`` outcome (it's the apply-path "already in
+    sync"); the function still handles it defensively for the
+    Open-Closed audit invariant — adding a new member here is a single
+    edit rather than two.
+    """
+    match status:
+        case McpConfigStatus.installed:
+            return "entry matches desired stdio shape"
+        case McpConfigStatus.missing:
+            return "entry absent"
+        case McpConfigStatus.out_of_date:
+            return "entry present but differs from desired shape"
+        case McpConfigStatus.unchanged:
+            return "entry already matched; no write needed"
+        case _ as never:
+            raise AssertionError(
+                f"unhandled McpConfigStatus member: {never!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -226,21 +259,16 @@ def _merge_json_entry(
 
     if check:
         if current_entry is None:
-            status = "missing"
+            status = McpConfigStatus.missing
         elif is_installed:
-            status = "installed"
+            status = McpConfigStatus.installed
         else:
-            status = "out-of-date"
+            status = McpConfigStatus.out_of_date
         return {
             "path": str(path),
-            "action": f"check:{status}",
-            "status": status,
-            "detail": (
-                "entry matches desired stdio shape"
-                if status == "installed"
-                else "entry absent" if status == "missing"
-                else "entry present but differs from desired shape"
-            ),
+            "action": f"check:{status.value}",
+            "status": status.value,
+            "detail": _check_detail_for(status),
         }
 
     if is_installed:
@@ -479,21 +507,16 @@ def _merge_codex_toml_direct(
 
     if check:
         if current_entry is None:
-            status = "missing"
+            status = McpConfigStatus.missing
         elif matches:
-            status = "installed"
+            status = McpConfigStatus.installed
         else:
-            status = "out-of-date"
+            status = McpConfigStatus.out_of_date
         return {
             "path": str(path),
-            "action": f"check:{status}",
-            "status": status,
-            "detail": (
-                "entry matches desired stdio shape"
-                if status == "installed"
-                else "entry absent" if status == "missing"
-                else "entry present but differs from desired shape"
-            ),
+            "action": f"check:{status.value}",
+            "status": status.value,
+            "detail": _check_detail_for(status),
         }
 
     if matches:
@@ -531,9 +554,16 @@ def _merge_codex_toml_direct(
 
 @dataclass(frozen=True)
 class _ClientTask:
-    """One concrete (client, target_path) pair the dispatcher will act on."""
+    """One concrete (client, target_path) pair the dispatcher will act on.
 
-    client: Literal["claude", "codex", "cursor"]
+    ``client`` is a :class:`McpClient` member; ``auto`` and ``none``
+    never appear here because the dispatcher fans those out before
+    materialising tasks. We keep the typed enum (rather than
+    ``Literal[McpClient.claude, McpClient.codex, McpClient.cursor]``)
+    so the dispatch is uniform with the rest of the W14 surface.
+    """
+
+    client: McpClient
     path: Path
     # For Claude only: the workspace .mcp.json AND the settings.json
     # block can BOTH be present; the dispatcher emits one task per
@@ -593,22 +623,25 @@ def _codex_target() -> Path:
     return Path.home() / ".codex" / "config.toml"
 
 
-def _resolve_tasks(target_dir: Path, client: str) -> list[_ClientTask]:
+def _resolve_tasks(target_dir: Path, client: McpClient) -> list[_ClientTask]:
     """Resolve the ``--client`` value into concrete (client, path) tasks.
 
-    ``auto`` probes each client and includes those whose config file
-    exists OR (for Claude) whose target dir is a workspace root.
-    Explicit names always emit a task even when the file is absent
-    (the merger will create it).
+    ``McpClient.auto`` probes each supported client and includes those
+    whose config file exists OR (for Claude) whose target dir is a
+    workspace root. Explicit names always emit a task even when the
+    file is absent (the merger will create it). ``McpClient.none`` is
+    handled by the caller (short-circuit no-op) and never reaches
+    here.
     """
     tasks: list[_ClientTask] = []
+    auto_or = {McpClient.auto, McpClient.claude}
 
-    if client in ("auto", "claude"):
+    if client in auto_or:
         # Auto includes Claude only when SOMETHING points at it
         # (existing file or workspace marker); explicit always emits.
-        if client == "claude":
+        if client is McpClient.claude:
             for path in _claude_targets(target_dir):
-                tasks.append(_ClientTask(client="claude", path=path))
+                tasks.append(_ClientTask(client=McpClient.claude, path=path))
         else:
             workspace = (
                 (target_dir / ".git").exists()
@@ -617,19 +650,21 @@ def _resolve_tasks(target_dir: Path, client: str) -> list[_ClientTask]:
             mcp_json = target_dir / ".mcp.json"
             settings_json = target_dir / ".claude" / "settings.json"
             if mcp_json.exists() or workspace:
-                tasks.append(_ClientTask(client="claude", path=mcp_json))
+                tasks.append(_ClientTask(client=McpClient.claude, path=mcp_json))
             if settings_json.exists():
-                tasks.append(_ClientTask(client="claude", path=settings_json))
+                tasks.append(
+                    _ClientTask(client=McpClient.claude, path=settings_json)
+                )
 
-    if client in ("auto", "codex"):
+    if client in {McpClient.auto, McpClient.codex}:
         codex_path = _codex_target()
-        if client == "codex" or codex_path.exists():
-            tasks.append(_ClientTask(client="codex", path=codex_path))
+        if client is McpClient.codex or codex_path.exists():
+            tasks.append(_ClientTask(client=McpClient.codex, path=codex_path))
 
-    if client in ("auto", "cursor"):
+    if client in {McpClient.auto, McpClient.cursor}:
         cursor_path = _cursor_target()
-        if client == "cursor" or cursor_path.exists():
-            tasks.append(_ClientTask(client="cursor", path=cursor_path))
+        if client is McpClient.cursor or cursor_path.exists():
+            tasks.append(_ClientTask(client=McpClient.cursor, path=cursor_path))
 
     return tasks
 
@@ -643,7 +678,8 @@ def _dispatch_one(
     Codex uses the CLI path when available and the TOML splicer
     otherwise.
     """
-    if task.client in ("claude", "cursor"):
+    json_clients = {McpClient.claude, McpClient.cursor}
+    if task.client in json_clients:
         try:
             outcome = _merge_json_entry(
                 path=task.path, dry_run=dry_run, check=check
@@ -654,22 +690,22 @@ def _dispatch_one(
                 "action": "failed",
                 "detail": str(exc),
             }
-        outcome["client"] = task.client
+        outcome["client"] = task.client.value
         return outcome
 
     # Codex.
     if not check and not dry_run and _can_use_codex_cli():
         outcome = _invoke_codex_cli_add(dry_run=False)
-        outcome["client"] = "codex"
+        outcome["client"] = McpClient.codex.value
         return outcome
     if dry_run and _can_use_codex_cli():
         outcome = _invoke_codex_cli_add(dry_run=True)
-        outcome["client"] = "codex"
+        outcome["client"] = McpClient.codex.value
         return outcome
     outcome = _merge_codex_toml_direct(
         path=task.path, dry_run=dry_run, check=check
     )
-    outcome["client"] = "codex"
+    outcome["client"] = McpClient.codex.value
     return outcome
 
 
@@ -680,7 +716,7 @@ def _dispatch_one(
 
 def run_install_mcp(
     target_dir: Path,
-    client: Literal["auto", "claude", "codex", "cursor", "none"] = "auto",
+    client: McpClient | str = McpClient.auto,
     dry_run: bool = False,
     check: bool = False,
 ) -> dict[str, Any]:
@@ -699,27 +735,34 @@ def run_install_mcp(
             ...
           ],
         }
+
+    ``client`` accepts either a :class:`McpClient` member or the bare
+    string value (callers reaching the function through the Typer
+    surface still pass strings; both paths normalise to the enum
+    before dispatching).
     """
-    if client not in _CLIENT_CHOICES:
+    try:
+        client_enum = client if isinstance(client, McpClient) else McpClient(client)
+    except ValueError as exc:
         raise ValueError(
             f"client must be one of {_CLIENT_CHOICES!r}; got {client!r}"
-        )
+        ) from exc
 
     target_dir = target_dir.expanduser().resolve()
 
     summary: dict[str, Any] = {
         "target": str(target_dir),
-        "client": client,
+        "client": client_enum.value,
         "dry_run": dry_run,
         "check": check,
         "results": [],
     }
 
-    if client == "none":
+    if client_enum is McpClient.none:
         summary["results"] = []
         return summary
 
-    tasks = _resolve_tasks(target_dir, client)
+    tasks = _resolve_tasks(target_dir, client_enum)
     if not tasks:
         summary["results"] = []
         summary["detail"] = (
@@ -795,11 +838,12 @@ def install_mcp(
     resolved_target = (target if target is not None else Path.cwd()).resolve()
 
     try:
-        # Typer narrows ``client`` at the str level; cast to the literal
-        # union the pure function expects without re-validating here.
+        # ``run_install_mcp`` accepts McpClient | str and normalises
+        # at the boundary, so the Typer-supplied string passes through
+        # without a cast.
         summary = run_install_mcp(
             target_dir=resolved_target,
-            client=client,  # type: ignore[arg-type]
+            client=client,
             dry_run=dry_run,
             check=check,
         )

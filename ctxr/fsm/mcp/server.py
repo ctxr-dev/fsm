@@ -301,7 +301,11 @@ def _install_signal_handlers(project: Project) -> None:
 
 
 def main(
-    transport: Literal["stdio", "http"] = "stdio",
+    # Literal kept (not an enum) because ``transport`` is a one-off
+    # boot parameter consumed by the CLI shim only — no cross-module
+    # reuse, no JSON serialisation, no closed-vocabulary status field
+    # that other layers branch on. Per the W14i audit rule.
+    transport: Literal["stdio", "http"] = "stdio",  # audit-strings: justified
     db_path: Path | None = None,
     host: str = "127.0.0.1",
     port: int = 0,

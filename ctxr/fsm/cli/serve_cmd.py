@@ -44,7 +44,7 @@ __all__ = ["serve"]
 # Allowed values for the ``--mode`` flag. The set is small and stable
 # enough that an Enum would be overkill; a tuple of literals keeps the
 # validation one ``in`` check away while making the supervisor's
-# ``Literal["dev", "prod"]`` annotation visibly the same contract.
+# Literal annotation visibly the same contract.  # audit-strings: justified
 _VALID_MODES: tuple[str, ...] = ("dev", "prod")
 
 
