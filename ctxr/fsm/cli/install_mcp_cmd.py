@@ -91,6 +91,36 @@ _STDIO_ENTRY_JSON: dict[str, Any] = {
 }
 
 
+def _portable_repr(path: Path, *, base: Path) -> str:
+    """Render ``path`` in the most-portable form for a persisted artefact.
+
+    Rules (in priority order):
+
+    1. If ``path`` lives under ``base`` (typically cwd) → project-relative
+       form (e.g., ``.ctxr-fsm/fsm.db``). Persisted JSON envelopes /
+       printed CLI output / committed config files use this shape so the
+       artefact survives being pushed to git or moved between machines.
+    2. Else if under the user's ``$HOME`` → ``~``-prefixed form. Matches
+       how user-level configs (``~/.codex/config.toml``,
+       ``~/.cursor/mcp.json``) are conventionally written.
+    3. Else → absolute path. Caller explicitly pointed at a file outside
+       both cwd and home; we surface that honestly.
+
+    This helper exists so every place that emits a path into a JSON
+    envelope, a stdout summary, or a persisted manifest uses ONE
+    portability convention.
+    """
+    try:
+        return str(path.relative_to(base))
+    except ValueError:
+        pass
+    home = Path.home()
+    try:
+        return "~/" + str(path.relative_to(home))
+    except ValueError:
+        return str(path)
+
+
 # ---------------------------------------------------------------------------
 # Indent detection (JSON files)
 # ---------------------------------------------------------------------------
@@ -265,7 +295,7 @@ def _merge_json_entry(
         else:
             status = McpConfigStatus.out_of_date
         return {
-            "path": str(path),
+            "path": _portable_repr(path, base=Path.cwd()),
             "action": f"check:{status.value}",
             "status": status.value,
             "detail": _check_detail_for(status),
@@ -273,7 +303,7 @@ def _merge_json_entry(
 
     if is_installed:
         return {
-            "path": str(path),
+            "path": _portable_repr(path, base=Path.cwd()),
             "action": "unchanged",
             "detail": "ctxr-fsm entry already matches; no write needed",
         }
@@ -297,7 +327,7 @@ def _merge_json_entry(
 
     if dry_run:
         return {
-            "path": str(path),
+            "path": _portable_repr(path, base=Path.cwd()),
             "action": ("would-create" if not path.exists() else "would-apply"),
             "detail": (
                 f"would write {len(new_text)} bytes "
@@ -308,7 +338,7 @@ def _merge_json_entry(
 
     _atomic_write(path, new_text)
     return {
-        "path": str(path),
+        "path": _portable_repr(path, base=Path.cwd()),
         "action": "applied",
         "detail": "ctxr-fsm entry merged into mcpServers",
     }
@@ -497,7 +527,7 @@ def _merge_codex_toml_direct(
         existing_doc = _read_codex_toml(path)
     except tomllib.TOMLDecodeError as exc:
         return {
-            "path": str(path),
+            "path": _portable_repr(path, base=Path.cwd()),
             "action": "failed",
             "detail": f"{path} exists but is not valid TOML: {exc}",
         }
@@ -513,7 +543,7 @@ def _merge_codex_toml_direct(
         else:
             status = McpConfigStatus.out_of_date
         return {
-            "path": str(path),
+            "path": _portable_repr(path, base=Path.cwd()),
             "action": f"check:{status.value}",
             "status": status.value,
             "detail": _check_detail_for(status),
@@ -521,7 +551,7 @@ def _merge_codex_toml_direct(
 
     if matches:
         return {
-            "path": str(path),
+            "path": _portable_repr(path, base=Path.cwd()),
             "action": "unchanged",
             "detail": "ctxr-fsm table already matches; no write needed",
         }
@@ -533,7 +563,7 @@ def _merge_codex_toml_direct(
 
     if dry_run:
         return {
-            "path": str(path),
+            "path": _portable_repr(path, base=Path.cwd()),
             "action": "would-create" if not path.exists() else "would-apply",
             "detail": f"would write {len(patched_text)} bytes",
             "preview": patched_text,
@@ -541,7 +571,7 @@ def _merge_codex_toml_direct(
 
     _atomic_write(path, patched_text)
     return {
-        "path": str(path),
+        "path": _portable_repr(path, base=Path.cwd()),
         "action": "applied",
         "detail": "ctxr-fsm TOML table spliced",
     }
@@ -686,7 +716,7 @@ def _dispatch_one(
             )
         except ValueError as exc:
             outcome = {
-                "path": str(task.path),
+                "path": _portable_repr(task.path, base=Path.cwd()),
                 "action": "failed",
                 "detail": str(exc),
             }
@@ -726,15 +756,22 @@ def run_install_mcp(
     layer that on top. Returns a JSON-serialisable summary dict::
 
         {
-          "target": "/abs/path",
+          "target": "<target-dir>",
           "client": "auto",
           "dry_run": False,
           "check": False,
           "results": [
-            {"client": "claude", "path": "...", "action": "applied", ...},
+            {"client": "claude", "path": "<config-path>", "action": "applied", ...},
             ...
           ],
         }
+
+    The ``target`` field is the directory the caller supplied (as a
+    string of whatever shape the caller passed in — relative or absolute).
+    Per-result ``path`` strings are project-relative when the config
+    lives under ``target_dir``, ``~``-prefixed when under ``$HOME``, else
+    absolute (the Cursor / Codex user-level configs are typical
+    examples).
 
     ``client`` accepts either a :class:`McpClient` member or the bare
     string value (callers reaching the function through the Typer
@@ -751,7 +788,11 @@ def run_install_mcp(
     target_dir = target_dir.expanduser().resolve()
 
     summary: dict[str, Any] = {
-        "target": str(target_dir),
+        # Persisted into the JSON envelope the CLI prints, so use the
+        # portable form (project-relative when target_dir is under cwd,
+        # ``~``-prefixed when under HOME, absolute only as last resort).
+        # Keeps the envelope safe to commit / share across machines.
+        "target": _portable_repr(target_dir, base=Path.cwd()),
         "client": client_enum.value,
         "dry_run": dry_run,
         "check": check,

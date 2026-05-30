@@ -109,6 +109,33 @@ if [[ "${RULE4_HITS}" -gt 0 ]]; then
   HITS=$((HITS + RULE4_HITS))
 fi
 
+# --- Rule 5: absolute-path literals in source -------------------------
+# Configs, persisted artefacts, and CLI output MUST use portable paths
+# (project-relative or ``~``-prefixed). An absolute-path literal in
+# source code is almost always a leak: a docstring example showing
+# ``/Users/...``, a fixture comparing against ``/abs/path``, a print
+# format string interpolating a resolved Path. The
+# ``_portable_repr(path, base=...)`` helper exists for this — use it.
+#
+# Patterns flagged:
+#   "/Users/...", "/home/...", "/abs/path...", "/private/var/folders/...".
+#
+# Justified cases (system-default paths in tests; the helper itself):
+# tag the line with ``# audit-strings: justified``.
+RULE5=""
+for pattern in '"/Users/' '"/home/' '"/abs/path' '"/private/var/folders/'; do
+  hits=$(grep -rn "${pattern}" "${SRC_DIR}" 2>/dev/null | _filter_justified || true)
+  if [[ -n "${hits}" ]]; then
+    RULE5="${RULE5}${hits}\n"
+  fi
+done
+RULE5_HITS=$(echo -ne "${RULE5}" | grep -c '^' || true)
+if [[ "${RULE5_HITS}" -gt 0 ]]; then
+  echo "--- audit-strings: rule5 (absolute-path literal in source)"
+  echo -ne "${RULE5}" | _report "rule5-absolute-path-literal" "$(cat)"
+  HITS=$((HITS + RULE5_HITS))
+fi
+
 if [[ "${HITS}" -gt 0 ]]; then
   echo ""
   echo "audit-strings: ${HITS} finding(s); see W14i for the audit rationale."
