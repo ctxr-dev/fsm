@@ -689,7 +689,6 @@ def _subsystem_payload(
     *,
     project_root: Path,
     port: int | None,
-    fallback_healthz: bool,
 ) -> dict[str, Any] | None:
     """Build the per-subsystem block for ``active-mcp.json`` or None.
 
@@ -722,9 +721,12 @@ def _subsystem_payload(
     base_url = f"http://127.0.0.1:{port}"
     payload: dict[str, Any] = {
         "http_url": base_url + ("/sse" if name == "mcp" else ""),
-        "healthz_url": (
-            f"{base_url}/healthz" if (fallback_healthz or name != "ui") else None
-        ),
+        # UI has no /healthz route (Vite does not expose one); MCP and
+        # API both mount one. Encoded directly here rather than via a
+        # parameter — every caller previously passed the same value
+        # and the parameter name suggested optionality that did not
+        # exist.
+        "healthz_url": f"{base_url}/healthz" if name != "ui" else None,
         "pid": pid,
     }
     if name == "api":
@@ -771,18 +773,18 @@ def _publish_active_mcp_file(
 
     subsystems: dict[str, Any] = {}
     mcp_block = _subsystem_payload(
-        "mcp", project_root=project_root, port=ports.get("mcp"), fallback_healthz=False
+        "mcp", project_root=project_root, port=ports.get("mcp")
     )
     if mcp_block is not None:
         subsystems["mcp"] = mcp_block
     api_block = _subsystem_payload(
-        "api", project_root=project_root, port=ports.get("api"), fallback_healthz=False
+        "api", project_root=project_root, port=ports.get("api")
     )
     if api_block is not None:
         subsystems["api"] = api_block
     if include_ui:
         ui_block = _subsystem_payload(
-            "ui", project_root=project_root, port=ports.get("ui"), fallback_healthz=False
+            "ui", project_root=project_root, port=ports.get("ui")
         )
         if ui_block is not None:
             subsystems["ui"] = ui_block

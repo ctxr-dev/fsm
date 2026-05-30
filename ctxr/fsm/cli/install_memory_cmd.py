@@ -78,7 +78,7 @@ import typer
 from ctxr.fsm.cli._common import json_or_pretty
 from ctxr.fsm.memory import get_principles_path
 
-__all__ = ["install_memory", "run_install_memory"]
+__all__ = ["install_memory", "run_install_memory", "run_install_memory_check"]
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +719,71 @@ def _diff_preview(old: str, new: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def run_install_memory_check(
+    *,
+    target: Path,
+    client: str = "auto",
+) -> dict[str, Any]:
+    """Programmatic ``install-memory --check`` probe.
+
+    Pure function returning a JSON-serialisable summary; intentionally
+    does NOT print, raise on drift, or call ``typer.Exit``. Callers
+    (notably ``ctxr-fsm ensure --check``) decide how to surface drift
+    by looking at each row's ``status`` field
+    (``"ok"`` / ``"out-of-date"`` / ``"missing"`` / ``"not-installed"``).
+    The Typer command :func:`install_memory` wraps this then prints
+    and exits non-zero when any row is out-of-date.
+
+    Returns ``{"target", "package_version", "results": [...]}``;
+    each result row has ``client``, ``host_file``, ``package_version``,
+    ``installed_version``, ``status``. When no clients are detected the
+    summary uses the same ``{"detected": [], "message": ...}`` shape
+    as :func:`run_install_memory`.
+
+    Raises :class:`typer.BadParameter` for an unknown client name (same
+    behaviour as the CLI surface).
+    """
+    if client not in _CLIENT_CHOICES:
+        raise typer.BadParameter(
+            f"--client must be one of {', '.join(_CLIENT_CHOICES)}, got {client!r}"
+        )
+
+    target = target.resolve()
+    detections = _detect_clients(target, client)
+
+    if not detections:
+        return {
+            "target": str(target),
+            "client": client,
+            "detected": [],
+            "message": (
+                "no AI-client memory files found "
+                "(looked for CLAUDE.md, .claude/CLAUDE.md, AGENTS.md, "
+                ".cursor/rules/)"
+            ),
+        }
+
+    canonical_package_file = get_principles_path("canonical")
+    package_version = _parse_version(
+        canonical_package_file.read_text(encoding="utf-8")
+    )
+    rows = [_check_one(d, package_version) for d in detections]
+    return {
+        "target": str(target),
+        "package_version": package_version,
+        "results": [
+            {
+                "client": r.client,
+                "host_file": str(r.host_file) if r.host_file else None,
+                "package_version": r.package_version,
+                "installed_version": r.installed_version,
+                "status": r.status,
+            }
+            for r in rows
+        ],
+    }
+
+
 def run_install_memory(
     *,
     target: Path,
@@ -888,49 +953,15 @@ def install_memory(
     resolved_target: Path = (target if target is not None else Path.cwd()).resolve()
 
     if check:
-        # --check has its own report shape (per-client status rows) and
-        # an explicit non-zero exit when anything is out of date — keep
-        # its logic local rather than threading another mode through
-        # ``run_install_memory``.
-        detections = _detect_clients(resolved_target, client)
-        if not detections:
-            json_or_pretty(
-                {
-                    "target": str(resolved_target),
-                    "client": client,
-                    "detected": [],
-                    "message": (
-                        "no AI-client memory files found "
-                        "(looked for CLAUDE.md, .claude/CLAUDE.md, AGENTS.md, "
-                        ".cursor/rules/)"
-                    ),
-                },
-                json_mode,
-            )
-            return
-        canonical_package_file = get_principles_path("canonical")
-        package_version = _parse_version(
-            canonical_package_file.read_text(encoding="utf-8")
-        )
-        rows = [_check_one(d, package_version) for d in detections]
-        out_of_date = [r for r in rows if r.status in ("out-of-date", "missing")]
-        json_or_pretty(
-            {
-                "target": str(resolved_target),
-                "package_version": package_version,
-                "results": [
-                    {
-                        "client": r.client,
-                        "host_file": str(r.host_file) if r.host_file else None,
-                        "package_version": r.package_version,
-                        "installed_version": r.installed_version,
-                        "status": r.status,
-                    }
-                    for r in rows
-                ],
-            },
-            json_mode,
-        )
+        # Delegate to the programmatic probe so ``ctxr-fsm ensure --check``
+        # can call the same code path without going through Typer.
+        summary = run_install_memory_check(target=resolved_target, client=client)
+        json_or_pretty(summary, json_mode)
+        results = summary.get("results", [])
+        out_of_date = [
+            r for r in results
+            if r.get("status") in ("out-of-date", "missing")
+        ]
         if out_of_date:
             raise typer.Exit(1)
         return

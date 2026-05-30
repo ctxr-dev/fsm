@@ -54,7 +54,10 @@ import typer
 from ctxr.fsm.cli._common import json_or_pretty
 from ctxr.fsm.cli.init_cmd import run_init
 from ctxr.fsm.cli.install_mcp_cmd import run_install_mcp
-from ctxr.fsm.cli.install_memory_cmd import run_install_memory
+from ctxr.fsm.cli.install_memory_cmd import (
+    run_install_memory,
+    run_install_memory_check,
+)
 from ctxr.fsm.cli.lifecycle.primitives import (
     pid_is_alive,
     read_active_mcp_file,
@@ -211,41 +214,31 @@ def _spawn_supervisor_detached(
     Returns the spawned pid (for the ensure summary; ownership is
     transferred to the OS — the parent process is free to exit).
     """
+    import shutil
+
     logs_dir = project_root / ".ctxr-fsm" / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"supervisor-{time.strftime('%Y%m%d')}.log"
     log_fp = open(log_path, "ab", buffering=0)  # noqa: SIM115
-    cmd = [
-        sys.executable or "python3",
-        "-m",
-        "ctxr.fsm.cli",
-        "serve",
-        "--mode",
-        "dev",
-        "--db",
-        str(db_path),
-    ]
+
+    # Single resolution path: rely on the ``ctxr-fsm`` console script
+    # the project's pyproject.toml ships. The previous code had a
+    # ``[sys.executable, "-m", "ctxr.fsm.cli", ...]`` construction as
+    # a "fallback" but the package has no ``__main__.py`` under
+    # ``ctxr.fsm.cli`` — the module form would fail with "No module
+    # named ctxr.fsm.cli.__main__", confusing operators in the rare
+    # case that the console script is genuinely missing. We surface
+    # that case as a clear MissingRequirement-style error instead.
+    binary = shutil.which("ctxr-fsm")
+    if binary is None:
+        raise RuntimeError(
+            "ctxr-fsm console script not found on PATH; install the "
+            "package with `uv add ctxr-fsm` / `pipx install ctxr-fsm` / "
+            "`pip install --user ctxr-fsm` and re-run."
+        )
+    cmd = [binary, "serve", "--mode", "dev", "--db", str(db_path)]
     if mcp_only:
         cmd.append("--mcp-only")
-
-    # ``sys.executable -m ctxr.fsm.cli`` is brittle if the package
-    # entry point isn't a module — fall back to the ``ctxr-fsm``
-    # console script when sys.executable isn't a usable Python.
-    if not sys.executable:
-        cmd = ["ctxr-fsm", "serve", "--mode", "dev", "--db", str(db_path)]
-        if mcp_only:
-            cmd.append("--mcp-only")
-
-    # Some environments don't expose the ``-m ctxr.fsm.cli`` module
-    # entry (the project ships only the ``ctxr-fsm`` console script).
-    # Probe ``ctxr-fsm`` on PATH first; if found, prefer it.
-    import shutil
-
-    binary = shutil.which("ctxr-fsm")
-    if binary is not None:
-        cmd = [binary, "serve", "--mode", "dev", "--db", str(db_path)]
-        if mcp_only:
-            cmd.append("--mcp-only")
 
     proc = subprocess.Popen(
         cmd,
@@ -356,18 +349,44 @@ def run_ensure(
         actions["init"] = "current"
 
     # ---- Step 2: memory --------------------------------------------
-    if no_memory:
+    # ``client == "none"`` short-circuits memory too (mirrors the
+    # mcp_config branch). install_memory's _CLIENT_CHOICES does NOT
+    # accept ``"none"`` (it has no equivalent of --no-mcp-config), so
+    # calling it would raise typer.BadParameter and the catch-all
+    # below would flip the whole ensure status to ``failed`` for what
+    # is actually a "the user asked to skip" path.
+    if no_memory or client == "none":
         actions["memory"] = "skipped"
     elif check:
-        actions["memory"] = (
-            "current" if not init_needed else "missing"
-        )
+        # Delegate to install_memory's pure --check probe so we report
+        # the actual on-disk memory state rather than the
+        # ``init_needed`` heuristic. Previously a project where init
+        # had run but the AI-client memory files had been deleted
+        # would silently report ``current``; now the per-client probe
+        # surfaces the drift via the rows' ``status`` field.
+        try:
+            mem_probe = run_install_memory_check(target=root, client=client)
+        except Exception as exc:
+            actions["memory"] = "failed"
+            failure_detail = f"memory check: {type(exc).__name__}: {exc}"
+        else:
+            mem_results = mem_probe.get("results", [])
+            statuses = [r.get("status") for r in mem_results if "status" in r]
+            if not statuses:
+                # No client detected at all — neither current nor
+                # missing applies; report skipped so the top-level
+                # status surfaces the upstream missing_init / etc.
+                actions["memory"] = "skipped"
+            elif all(s == "ok" for s in statuses):
+                actions["memory"] = "current"
+            else:
+                actions["memory"] = "missing"
     else:
         try:
             mem_result = run_install_memory(target=root, client=client)
             # If every per-client result was a "noop", that counts as
             # current rather than applied.
-            results = mem_result.get("results", [])
+            results = mem_result.get("results", []) if isinstance(mem_result, dict) else []
             if results and all(r.get("action") == "noop" for r in results):
                 actions["memory"] = "current"
             else:
