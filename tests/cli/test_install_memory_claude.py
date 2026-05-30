@@ -216,7 +216,7 @@ def test_check_reports_out_of_date_after_version_bump(
     row = payload["results"][0]
     assert row["client"] == "claude"
     assert row["installed_version"] == _current_principles_version()
-    assert row["status"] == "out-of-date"
+    assert row["status"] == "out_of_date"
 
 
 def test_dry_run_prints_patch_but_does_not_write(tmp_target: Path) -> None:

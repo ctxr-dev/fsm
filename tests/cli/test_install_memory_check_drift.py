@@ -136,7 +136,7 @@ def test_check_reports_drift_across_all_clients_after_version_bump(
         row = by_client[client]
         assert row["installed_version"] == current, row
         assert row["package_version"] == bumped_version, row
-        assert row["status"] == "out-of-date", row
+        assert row["status"] == "out_of_date", row
 
 
 def test_check_before_any_install_reports_missing(tmp_target: Path) -> None:
@@ -179,4 +179,4 @@ def test_check_before_any_install_reports_missing(tmp_target: Path) -> None:
     # Cursor: the rule file does not exist yet, so its host file is
     # absent -> 'not-installed'.
     assert by_client["cursor"]["installed_version"] is None
-    assert by_client["cursor"]["status"] == "not-installed"
+    assert by_client["cursor"]["status"] == "not_installed"

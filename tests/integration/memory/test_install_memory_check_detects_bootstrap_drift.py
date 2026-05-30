@@ -127,7 +127,7 @@ def test_check_flags_claude_staged_bootstrap_mutation(tmp_target: Path) -> None:
 
     exit_code, payload = _run_check(tmp_target)
     assert exit_code == 1, payload
-    assert _row_for(payload, "claude")["bootstrap_status"] == "out-of-date"
+    assert _row_for(payload, "claude")["bootstrap_status"] == "out_of_date"
 
     # Re-running install rewrites the staged copy back to the package
     # source.
@@ -167,7 +167,7 @@ def test_check_flags_claude_package_bootstrap_bump(
     # on the Claude row.
     exit_code, payload = _run_check(tmp_target)
     assert exit_code == 1, payload
-    assert _row_for(payload, "claude")["bootstrap_status"] == "out-of-date"
+    assert _row_for(payload, "claude")["bootstrap_status"] == "out_of_date"
 
     # Re-running install (with the monkey-patched source still in
     # effect) materialises the bumped content.
@@ -228,7 +228,7 @@ def test_check_flags_codex_principles_drift_when_adapter_bumps(
 
     exit_code, payload = _run_check(tmp_target)
     assert exit_code == 1, payload
-    assert _row_for(payload, "codex")["status"] == "out-of-date"
+    assert _row_for(payload, "codex")["status"] == "out_of_date"
     # bootstrap_status stays ``"inlined"`` — for codex it's the
     # principles axis that catches the drift.
     assert _row_for(payload, "codex")["bootstrap_status"] == "inlined"
@@ -256,7 +256,7 @@ def test_check_flags_cursor_principles_drift_when_rule_file_bumps(
 
     exit_code, payload = _run_check(tmp_target)
     assert exit_code == 1, payload
-    assert _row_for(payload, "cursor")["status"] == "out-of-date"
+    assert _row_for(payload, "cursor")["status"] == "out_of_date"
     assert _row_for(payload, "cursor")["bootstrap_status"] == "inlined"
 
 
@@ -275,7 +275,7 @@ def test_check_reports_not_installed_when_bootstrap_absent_for_claude(
     exit_code, payload = _run_check(tmp_target)
     assert exit_code == 1, payload
     claude = _row_for(payload, "claude")
-    assert claude["bootstrap_status"] == "not-installed"
+    assert claude["bootstrap_status"] == "not_installed"
 
 
 def test_check_reports_inlined_for_codex_when_principles_missing(

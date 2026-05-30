@@ -83,7 +83,7 @@ def test_ensure_cold_start_mcp_only(tmp_path: Path) -> None:
                 "ctxr-fsm",
                 "ensure",
                 "--mode",
-                "mcp-only",
+                "mcp_only",
                 "--no-memory",
                 "--no-mcp-config",
                 "--client",
@@ -183,7 +183,7 @@ def test_ensure_timeout_failed_when_supervisor_wont_come_up(
     summary = run_ensure(
         project_root=tmp_path,
         client="none",
-        mode="mcp-only",
+        mode="mcp_only",
         no_memory=True,
         no_mcp_config=True,
         check=False,

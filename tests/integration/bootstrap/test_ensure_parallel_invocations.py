@@ -66,7 +66,7 @@ def _run_ensure_mcp_only(project_root: Path, timeout_s: int) -> dict[str, object
             "ctxr-fsm",
             "ensure",
             "--mode",
-            "mcp-only",
+            "mcp_only",
             "--no-memory",
             "--no-mcp-config",
             "--client",

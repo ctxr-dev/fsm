@@ -84,7 +84,10 @@ def test_check_mode_exits_nonzero_when_missing() -> None:
         )
         assert result.returncode != 0
         payload = json.loads(result.stdout)
-        assert payload["status"].startswith("missing:")
+        # W14i: ``status`` is one of the typed ``missing_*`` enum
+        # members; init is the most-upstream missing step on a fresh
+        # tmpdir so it wins.
+        assert payload["status"].startswith("missing_")
 
 
 def test_help_renders() -> None:

@@ -30,10 +30,13 @@ def test_check_on_fresh_dir_reports_missing(tmp_path: Path) -> None:
         check=True,
         timeout=2.0,
     )
-    assert summary["status"].startswith("missing:")
-    assert "init" in summary["status"]
-    assert "supervisor" in summary["status"]
+    # W14i: ``status`` is one of the ``missing_*`` enum members rather
+    # than a colon-prefixed list. When multiple steps are missing the
+    # most-upstream one (init) wins so the wrapping script knows which
+    # gate fired first; per-step granularity remains on ``actions``.
+    assert summary["status"] == "missing_init"
     assert summary["actions"]["init"] == "missing"
+    assert summary["actions"]["supervisor"] == "missing"
     # mcp-config skipped because client=none.
     assert summary["actions"]["mcp_config"] == "skipped"
     # No filesystem mutation.

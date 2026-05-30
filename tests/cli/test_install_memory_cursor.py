@@ -189,4 +189,4 @@ def test_check_detects_out_of_date_after_version_bump(
     row = payload["results"][0]
     assert row["client"] == "cursor"
     assert row["installed_version"] == _current_principles_version()
-    assert row["status"] == "out-of-date"
+    assert row["status"] == "out_of_date"

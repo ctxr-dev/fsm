@@ -194,7 +194,7 @@ def test_check_detects_version_drift(
     row = payload["results"][0]
     assert row["client"] == "codex"
     assert row["installed_version"] == _current_principles_version()
-    assert row["status"] == "out-of-date"
+    assert row["status"] == "out_of_date"
 
 
 def test_inlined_content_matches_package_file_byte_for_byte(

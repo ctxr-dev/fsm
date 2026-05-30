@@ -99,8 +99,8 @@ def test_check_reports_out_of_date_when_entry_differs(
 
     result = run_install_mcp(proj, client="claude", check=True)
     claude_row = result["results"][0]
-    assert claude_row["action"] == "check:out-of-date"
-    assert claude_row["status"] == "out-of-date"
+    assert claude_row["action"] == "check:out_of_date"
+    assert claude_row["status"] == "out_of_date"
 
 
 def test_client_none_is_noop(tmp_path: Path) -> None:

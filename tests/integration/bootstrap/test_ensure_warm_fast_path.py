@@ -199,7 +199,7 @@ def test_mcp_only_warm_only_probes_mcp(
     summary = run_ensure(
         project_root=tmp_path,
         client="none",
-        mode="mcp-only",
+        mode="mcp_only",
         no_memory=True,
         no_mcp_config=True,
         check=False,
