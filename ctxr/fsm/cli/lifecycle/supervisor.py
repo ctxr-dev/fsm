@@ -979,8 +979,8 @@ async def run_supervisor(
                     # ``[ctxr-fsm supervisor] ...`` chatter on stderr
                     # — two independent streams, easy to pipe
                     # separately for downstream tooling.
-                    _augmented = _augment_active_with_status(active)
-                    print_subsystem_table(_augmented, project_root=project_root)
+                    augmented = _augment_active_with_status(active)
+                    print_subsystem_table(augmented, project_root=project_root)
 
             # Dev-mode reload loop. Sibling task; cancellation of the
             # group tears it down with the rest. anyio's

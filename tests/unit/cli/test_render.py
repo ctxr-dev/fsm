@@ -4,8 +4,9 @@ The renderer (:mod:`ctxr.fsm.cli._render`) is shared by ``ensure``,
 ``doctor``, and the ``serve`` supervisor banner. These tests pin the
 column ordering, the project-row content, the swagger-derivation
 rule for the ``api`` row, the "skip missing subsystems" semantics
-(``--mode mcp-only`` only ships an ``mcp`` block), and the colour
-mapping per status.
+(``--mode mcp_only`` only ships an ``mcp`` block; W14i renamed the
+wire value from the hyphenated ``mcp-only``), and the colour mapping
+per status.
 
 ANSI capture pattern
 --------------------
@@ -158,9 +159,9 @@ def test_render_subsystem_table_swagger_derived_for_api(tmp_path: Path) -> None:
 
 
 def test_render_subsystem_table_skips_missing_subsystems(tmp_path: Path) -> None:
-    """In ``--mode mcp-only`` only the mcp row appears (plus the project row)."""
+    """In ``--mode mcp_only`` only the mcp row appears (plus the project row)."""
     payload = _full_active_mcp()
-    # Drop api + ui as the mcp-only mode would.
+    # Drop api + ui as the mcp_only mode would.
     del payload["subsystems"]["api"]
     del payload["subsystems"]["ui"]
 
@@ -219,12 +220,14 @@ def test_render_subsystem_table_status_colours(tmp_path: Path) -> None:
         }
     }
     green_output = _render_to_string(green_payload, project_root=tmp_path, force_terminal=True)
-    # Rich emits SGR escapes; bold-green starts with ``\x1b[1;32m``
-    # on truecolor terminals. The leading ``\x1b[`` + the ``32`` /
-    # ``green`` substring suffices to identify the colour without
-    # over-coupling to the exact SGR sequence shape.
-    assert "\x1b[" in green_output
-    assert "32" in green_output  # green channel
+    # Rich emits a specific SGR sequence for ``bold green`` on a
+    # truecolor terminal: ``\x1b[1;32m``. Pinning the full sequence
+    # rather than just ``"32"`` keeps the test from passing silently
+    # when any other column happens to contain the digits 32 (a PID,
+    # a port number, a future timestamp); a colour regression that
+    # drops the bold-green styling cannot accidentally still satisfy
+    # the assertion.
+    assert "\x1b[1;32m" in green_output
 
     # Yellow (reused / degraded).
     yellow_payload = {
@@ -238,7 +241,7 @@ def test_render_subsystem_table_status_colours(tmp_path: Path) -> None:
         }
     }
     yellow_output = _render_to_string(yellow_payload, project_root=tmp_path, force_terminal=True)
-    assert "33" in yellow_output  # yellow channel
+    assert "\x1b[1;33m" in yellow_output
 
     # Red (missing / unreachable / failed).
     red_payload = {
@@ -252,7 +255,7 @@ def test_render_subsystem_table_status_colours(tmp_path: Path) -> None:
         }
     }
     red_output = _render_to_string(red_payload, project_root=tmp_path, force_terminal=True)
-    assert "31" in red_output  # red channel
+    assert "\x1b[1;31m" in red_output
 
 
 def test_render_subsystem_table_unknown_status_falls_back(tmp_path: Path) -> None:
