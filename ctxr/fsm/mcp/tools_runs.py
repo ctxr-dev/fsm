@@ -45,8 +45,9 @@ import logging
 import os
 import uuid
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
@@ -57,11 +58,14 @@ from ctxr.fsm.core.engine import build_brief
 from ctxr.fsm.core.models import (
     Brief,
     CommitSignature,
+    EngineAdvanceKind,
     EventKind,
     FsmSpec,
     PostValidationResultEntry,
     RunCtx,
     TransitionEvaluation,
+    TransitionKind,
+    VerifierVerdict,
 )
 from ctxr.fsm.core.verifier import VerifierOutcome, run_verifier
 from ctxr.fsm.mcp import mcp
@@ -78,10 +82,12 @@ __all__ = [
     "AbortRunInput",
     "CommitOutputsInput",
     "CommitResult",
+    "CommitResultKind",
     "ConfirmCommitInput",
     "ConfirmResult",
     "GetBriefInput",
     "GetRunInput",
+    "JournalAction",
     "ListRunsInput",
     "ResumeResult",
     "ResumeRunInput",
@@ -89,6 +95,34 @@ __all__ = [
     "RunStartedPayload",
     "StartRunInput",
 ]
+
+
+class CommitResultKind(StrEnum):
+    """Discriminator for :class:`CommitResult`.
+
+    Mirrors the engine's :class:`EngineAdvanceKind` taxonomy but with
+    one rename: ``advance`` becomes ``advanced`` and ``loop_continue``
+    becomes ``loop_continued`` to match the JS legacy MCP wire contract.
+    Members carry the literal wire strings so JSON serialisation stays
+    byte-stable.
+    """
+
+    advanced = "advanced"
+    loop_continued = "loop_continued"
+    terminal = "terminal"
+    fault = "fault"
+
+
+class JournalAction(StrEnum):
+    """Action a resume / journal-recovery call may take on a pending tx.
+
+    Surfaced on ``ResumeRunInput.journal`` and on the dedicated
+    journal-recovery MCP/CLI surface. ``discard`` rolls the pending
+    journal_txn back; ``replay`` finalises its staged writes.
+    """
+
+    discard = "discard"
+    replay = "replay"
 
 
 # Module logger. The server entry-point configures the root logger to
@@ -297,7 +331,7 @@ class CommitResult(BaseModel):
 
     model_config = _OUT_CFG
 
-    kind: Literal["advanced", "terminal", "fault", "loop_continued"]
+    kind: CommitResultKind
     brief: Brief | None = None
     next_state: str | None = None
     iteration_n: int | None = None
@@ -352,7 +386,7 @@ class ResumeRunInput(BaseModel):
 
     run_id: uuid.UUID
     from_state: str | None = None
-    journal: Literal["discard", "replay"] | None = None
+    journal: JournalAction | None = None
 
 
 class ResumeResult(BaseModel):
@@ -986,7 +1020,7 @@ _COMMIT_TOKEN_TTL_SECONDS: int = 60
 
 def _stage_commit_writes(
     *,
-    result_kind: Literal["advance", "loop_continue", "terminal"],
+    result_kind: EngineAdvanceKind,
     run_id: str,
     spec_id: str,
     current_state_id: str,
@@ -1011,7 +1045,11 @@ def _stage_commit_writes(
     """
     steps: list[dict[str, Any]] = []
 
-    if result_kind in ("advance", "terminal") and from_state_pk is not None:
+    exits_current_state = result_kind in {
+        EngineAdvanceKind.advance,
+        EngineAdvanceKind.terminal,
+    }
+    if exits_current_state and from_state_pk is not None:
         # The exiting state — its outputs land on the state-entry row,
         # the run's last_update_at bumps, and a ``state_exited`` event
         # is emitted by the replay so subscribers see the same shape
@@ -1025,13 +1063,13 @@ def _stage_commit_writes(
             }
         )
 
-    if result_kind == "advance":
+    if result_kind is EngineAdvanceKind.advance:
         steps.append(
             {
                 "op": "record_transition",
                 "from_state_pk": from_state_pk,
                 "to_state_id": next_state_id or "",
-                "kind": winning_kind or "always",
+                "kind": winning_kind or TransitionKind.always.value,
                 "predicate": winning_predicate,
                 "predicate_result": winning_predicate_result,
             }
@@ -1044,7 +1082,7 @@ def _stage_commit_writes(
             }
         )
 
-    if result_kind == "loop_continue":
+    if result_kind is EngineAdvanceKind.loop_continue:
         # The state-entry row stays open across iterations; nothing to
         # mark exited. We still stage a no-op step so replay produces a
         # deterministic event trail.
@@ -1056,7 +1094,7 @@ def _stage_commit_writes(
             }
         )
 
-    if result_kind == "terminal":
+    if result_kind is EngineAdvanceKind.terminal:
         steps.append(
             {
                 "op": "complete_run",
@@ -1069,12 +1107,15 @@ def _stage_commit_writes(
     # is canonical-JSON-friendly because every value is already a
     # Python primitive (env / outputs are dicts of JSON-able values by
     # contract).
+    # ``result_kind`` is serialised as its string value (StrEnum
+    # collapses to str under json) so the wire payload stays identical
+    # to the pre-W14i shape.
     steps.append(
         {
             "op": "_meta",
             "spec_id": spec_id,
             "run_id": run_id,
-            "result_kind": result_kind,
+            "result_kind": result_kind.value,
             "current_state_id": current_state_id,
             "next_state_id": next_state_id,
             "env_after": {**env, **outputs},
@@ -1133,7 +1174,7 @@ def _replay_journal_txn(
                 run_id=run_id,
                 from_state_pk=str(from_pk),
                 to_state_id=str(step.get("to_state_id") or ""),
-                kind=str(step.get("kind") or "always"),
+                kind=str(step.get("kind") or TransitionKind.always.value),
                 predicate=step.get("predicate"),
                 predicate_result=step.get("predicate_result"),
                 producer_id=producer_id,
@@ -1178,7 +1219,7 @@ def _replay_journal_txn(
         # without breaking older replayers.
 
     next_brief: Brief | None = None
-    if result_kind == "advance" and next_state_id:
+    if result_kind == EngineAdvanceKind.advance.value and next_state_id:
         next_state_obj = spec.get_state(next_state_id)
         next_brief = build_brief(
             spec,
@@ -1186,7 +1227,7 @@ def _replay_journal_txn(
             env=env_after,
             run_id=uuid.UUID(run_id),
         )
-    elif result_kind == "loop_continue":
+    elif result_kind == EngineAdvanceKind.loop_continue.value:
         # The loop body's next brief is already in the CommitResult
         # held by the worker; we still rebuild it here so confirm can
         # echo it back uniformly.
@@ -1413,7 +1454,7 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
                     run_id=run.id,
                 )
             return CommitResult(
-                kind="fault",
+                kind=CommitResultKind.fault,
                 reason=result.reason,
                 errors=list(result.errors),
                 evaluations=list(result.evaluations),
@@ -1432,7 +1473,7 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
             # against. Rebuild it from the current state + env.
             iter_for_brief = (
                 getattr(result, "iteration_n", None)
-                if result.kind == "loop_continue"
+                if result.kind is EngineAdvanceKind.loop_continue
                 else None
             )
             current_brief = build_brief(
@@ -1452,7 +1493,7 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
                     producer_id=producer_id,
                     kind=(
                         EventKind.verifier_passed.value
-                        if verifier_outcome.verdict == "passed"
+                        if verifier_outcome.verdict is VerifierVerdict.passed
                         else EventKind.verifier_rejected.value
                     ),
                     payload={
@@ -1471,7 +1512,7 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
                     run_id=run.id,
                 )
 
-            if verifier_outcome.verdict == "rejected":
+            if verifier_outcome.verdict is VerifierVerdict.rejected:
                 return as_error(
                     "verifier_rejected",
                     detail="verifier panel rejected the worker outputs",
@@ -1504,9 +1545,9 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
             )
 
         # ── Stage writes + mint token (deferred to confirm_commit) ──
-        if result.kind == "loop_continue":
+        if result.kind is EngineAdvanceKind.loop_continue:
             staged = _stage_commit_writes(
-                result_kind="loop_continue",
+                result_kind=EngineAdvanceKind.loop_continue,
                 run_id=run.id,
                 spec_id=spec.id,
                 current_state_id=current_state_id,
@@ -1529,16 +1570,16 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
                 staged_writes=staged,
             )
             return CommitResult(
-                kind="loop_continued",
+                kind=CommitResultKind.loop_continued,
                 brief=result.brief,
                 iteration_n=result.iteration_n,
                 token=_to_wire_token(token),
                 expected_next_state=current_state_id,
             )
 
-        if result.kind == "terminal":
+        if result.kind is EngineAdvanceKind.terminal:
             staged = _stage_commit_writes(
-                result_kind="terminal",
+                result_kind=EngineAdvanceKind.terminal,
                 run_id=run.id,
                 spec_id=spec.id,
                 current_state_id=current_state_id,
@@ -1566,7 +1607,7 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
                 staged_writes=staged,
             )
             return CommitResult(
-                kind="terminal",
+                kind=CommitResultKind.terminal,
                 verdict=result.verdict,
                 evaluations=list(result.evaluations),
                 token=_to_wire_token(token),
@@ -1592,8 +1633,12 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
         if next_worker is not None:
             next_inputs = {name: merged_env.get(name) for name in next_worker.inputs}
 
+        unconditional_kinds = {
+            TransitionKind.always.value,
+            TransitionKind.otherwise.value,
+        }
         staged = _stage_commit_writes(
-            result_kind="advance",
+            result_kind=EngineAdvanceKind.advance,
             run_id=run.id,
             spec_id=spec.id,
             current_state_id=current_state_id,
@@ -1603,14 +1648,17 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
             env=env,
             iteration_n=None,
             verdict=None,
-            winning_kind=(winning_eval.kind if winning_eval else "always") or "always",
+            winning_kind=(
+                (winning_eval.kind if winning_eval else None)
+                or TransitionKind.always.value
+            ),
             winning_predicate=(
                 winning_eval.expression if winning_eval else None
             ),
             winning_predicate_result=(
                 None
                 if winning_eval is None
-                or winning_eval.kind in {"always", "otherwise"}
+                or winning_eval.kind in unconditional_kinds
                 else bool(winning_eval.result)
             ),
             next_inputs=next_inputs,
@@ -1623,7 +1671,7 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
             staged_writes=staged,
         )
         return CommitResult(
-            kind="advanced",
+            kind=CommitResultKind.advanced,
             brief=result.brief,
             next_state=result.next_state,
             evaluations=list(result.evaluations),
@@ -1874,7 +1922,7 @@ def fsm_confirm_commit(input: ConfirmCommitInput) -> ConfirmResult | McpToolErro
         # current state. Terminal commits clear the marker so any
         # subsequent tool calls are unconstrained (no run is active).
         result_kind = replay.get("result_kind")
-        if result_kind == "terminal":
+        if result_kind == EngineAdvanceKind.terminal.value:
             _publish_active_run_marker(run_id=None, spec=None, state_id=None)
         else:
             next_state_id = replay.get("next_state_id") or consumed_token.state_id

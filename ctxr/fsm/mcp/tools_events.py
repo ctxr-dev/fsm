@@ -64,15 +64,17 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Annotated, Literal
+from typing import Annotated
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ctxr.fsm.core.models import JournalStatus
 from ctxr.fsm.mcp import mcp
 from ctxr.fsm.mcp._drain_decorator import drain_aware
 from ctxr.fsm.mcp._errors import McpToolError, as_error
 from ctxr.fsm.mcp._state import get_project
+from ctxr.fsm.mcp.tools_runs import JournalAction
 from ctxr.fsm.sqlite.repos_events import Consumer, Event, Producer
 from ctxr.fsm.sqlite.repos_locks_journal import JournalTxn
 
@@ -206,11 +208,9 @@ class JournalRecovered(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     run_id: str
-    action: Literal["discard", "replay"]
+    action: JournalAction
     txn_id: str | None = None
-    previous_status: (
-        Literal["pending", "ready_to_finalise", "finalised"] | None
-    ) = None
+    previous_status: JournalStatus | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +453,7 @@ def recover_journal(
         Field(description="The run whose journal needs recovering."),
     ],
     action: Annotated[
-        Literal["discard", "replay"],
+        JournalAction,
         Field(
             description=(
                 "`discard` deletes the staged-write row (rollback). "
@@ -494,15 +494,15 @@ def recover_journal(
                 )
 
             previous_status = txn.status
-            if action == "discard":
+            if action is JournalAction.discard:
                 project.journal.discard(session, txn_id=txn.id)
-            else:  # action == "replay"
+            else:  # action is JournalAction.replay
                 # Only ``ready_to_finalise`` rows are legal to
                 # roll forward — a still-``pending`` row has no
                 # staged writes to finalise. We refuse with a
                 # structured error rather than silently doing the
                 # wrong thing.
-                if txn.status != "ready_to_finalise":
+                if txn.status is not JournalStatus.ready_to_finalise:
                     return as_error(
                         "journal_replay_not_ready",
                         detail=(

@@ -43,7 +43,7 @@ Design notes
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
@@ -53,6 +53,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from starlette.concurrency import run_in_threadpool
 
 from ctxr.fsm.api._deps import ProjectDep, require_auth
+from ctxr.fsm.core.models import JournalStatus
 from ctxr.fsm.sqlite import (
     CommitSignatureRecord,
     DriftSignal,
@@ -182,7 +183,7 @@ _VALID_JOURNAL_STATUSES: tuple[str, ...] = (
 def _select_journal_txns(
     session_factory: sessionmaker[Session],
     *,
-    status: str | None,
+    status: JournalStatus | None,
     limit: int,
 ) -> list[JournalTxn]:
     """Return journal-txn rows across all runs, optionally filtered by status.
@@ -202,7 +203,7 @@ def _select_journal_txns(
             JournalTxnTable.id.desc(),
         )
         if status is not None:
-            stmt = stmt.where(JournalTxnTable.status == status)
+            stmt = stmt.where(JournalTxnTable.status == status.value)
         stmt = stmt.limit(limit)
         rows = session.execute(stmt).scalars().all()
         # ``_row_to_txn`` is the canonical projection — using it
@@ -395,9 +396,6 @@ def _build_doctor_report(
 # ---------------------------------------------------------------------------
 
 
-_JournalStatusLiteral = Literal["pending", "ready_to_finalise", "finalised"]
-
-
 @router.get(
     "/journal_txns",
     response_model=list[JournalTxn],
@@ -406,7 +404,7 @@ _JournalStatusLiteral = Literal["pending", "ready_to_finalise", "finalised"]
 async def list_journal_txns(
     project: ProjectDep,
     status: Annotated[
-        _JournalStatusLiteral | None,
+        JournalStatus | None,
         Query(
             description=(
                 "Optional status filter. One of ``pending``, "
