@@ -50,6 +50,7 @@ from ctxr.fsm.cli import (
     export_cmd,
     import_cmd,
     init_cmd,
+    install_memory_cmd,
     mcp_cmd,
     migrate_cmd,
     runs_cmd,
@@ -90,6 +91,13 @@ app.command(name="migrate", help="Run alembic upgrade head against the project D
 app.command(name="doctor", help="Print a diagnostic report for the project DB.")(
     doctor_cmd.doctor
 )
+# ``install-memory`` (W11) writes the FSM-usage principles into the
+# consumer project's AI-client memory files (CLAUDE.md, AGENTS.md,
+# .cursor/rules/). Idempotent via marker-fenced blocks.
+app.command(
+    name="install-memory",
+    help="Install (or check) FSM-usage principles into AI-client memory.",
+)(install_memory_cmd.install_memory)
 
 # The ``spec`` group bundles spec validate / register / list under one
 # namespace so the top-level help screen stays short. Adding it via

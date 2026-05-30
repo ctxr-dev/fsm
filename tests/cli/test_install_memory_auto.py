@@ -1,0 +1,134 @@
+"""Tests for ``ctxr-fsm install-memory --client auto``.
+
+``auto`` runs every per-client detector and applies the install only
+to the clients whose signature is present in the target directory:
+
+* ``CLAUDE.md`` (or ``.claude/CLAUDE.md``) -> Claude.
+* ``AGENTS.md`` -> Codex.
+* ``.cursor/rules/`` directory -> Cursor.
+
+These tests verify the three interesting branches:
+
+* Both ``CLAUDE.md`` and ``AGENTS.md`` present -> both get patched.
+* Empty target dir -> command exits cleanly with "no client detected"
+  rather than erroring.
+* Only ``.cursor/rules/`` present -> only the Cursor rule file is
+  written (CLAUDE.md / AGENTS.md are NOT created).
+"""
+
+from __future__ import annotations
+
+import json
+import tempfile
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from ctxr.fsm.cli import app
+
+runner = CliRunner()
+
+
+@pytest.fixture
+def tmp_target() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory() as tmp:
+        yield Path(tmp).resolve()
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+def test_auto_patches_both_claude_and_codex_when_both_present(
+    tmp_target: Path,
+) -> None:
+    """Both CLAUDE.md and AGENTS.md present -> both get a marker block."""
+    claude = tmp_target / "CLAUDE.md"
+    agents = tmp_target / "AGENTS.md"
+    claude.write_text("", encoding="utf-8")
+    agents.write_text("", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "install-memory",
+            "--target",
+            str(tmp_target),
+            "--client",
+            "auto",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    clients_touched = {row["client"] for row in payload["results"]}
+    assert {"claude", "codex"}.issubset(clients_touched)
+    # Cursor should NOT be in the result set (no .cursor/rules dir).
+    assert "cursor" not in clients_touched
+
+    # Both host files now carry a marker block at version 0.1.0.
+    assert "<!-- ctxr-fsm:begin v=0.1.0 -->" in claude.read_text(encoding="utf-8")
+    assert "<!-- ctxr-fsm:begin v=0.1.0 -->" in agents.read_text(encoding="utf-8")
+
+    # And Claude's @ import points at the materialised in-project file.
+    assert "@.ctxr-fsm/memory/principles.claude.md" in claude.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_auto_in_empty_dir_is_clean_no_op(tmp_target: Path) -> None:
+    """No client signature anywhere -> noop, exit 0, no files written."""
+    result = runner.invoke(
+        app,
+        [
+            "install-memory",
+            "--target",
+            str(tmp_target),
+            "--client",
+            "auto",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["detected"] == []
+    assert "no AI-client memory files found" in payload["message"]
+
+    # Verify the command did not create any of the canonical client files.
+    assert not (tmp_target / "CLAUDE.md").exists()
+    assert not (tmp_target / "AGENTS.md").exists()
+    assert not (tmp_target / ".cursor").exists()
+    assert not (tmp_target / ".ctxr-fsm").exists()
+
+
+def test_auto_with_only_cursor_rules_writes_only_cursor(tmp_target: Path) -> None:
+    """Only .cursor/rules/ present -> only the Cursor rule file is written."""
+    (tmp_target / ".cursor" / "rules").mkdir(parents=True)
+
+    result = runner.invoke(
+        app,
+        [
+            "install-memory",
+            "--target",
+            str(tmp_target),
+            "--client",
+            "auto",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    clients_touched = {row["client"] for row in payload["results"]}
+    assert clients_touched == {"cursor"}
+
+    # The cursor rule file exists.
+    assert (tmp_target / ".cursor" / "rules" / "ctxr-fsm.mdc").is_file()
+    # No spurious CLAUDE.md / AGENTS.md created.
+    assert not (tmp_target / "CLAUDE.md").exists()
+    assert not (tmp_target / "AGENTS.md").exists()

@@ -14,13 +14,16 @@ Side effects this command intentionally performs (in order):
    ``.ctxr-fsm/`` to ``.gitignore`` — idempotent: we read the existing
    ignore file and only append the entry when it is genuinely missing.
    The file is created if absent.
-4. Emits a friendly summary (DB path, alembic revision, follow-up
-   memory-installer note) via :func:`json_or_pretty` so ``--json`` is
+4. Unless ``--no-memory`` is passed, invokes the W11 memory installer
+   (``install_memory(target=cwd, client='auto')``) so any AI-client
+   memory files already present in the project (CLAUDE.md, AGENTS.md,
+   .cursor/rules/) get the FSM-usage principles wired in. The call is
+   idempotent — a re-run of ``ctxr-fsm init`` re-asserts the marker
+   block without duplicating it. Any exception from the installer is
+   caught and surfaced in the summary instead of failing init.
+5. Emits a friendly summary (DB path, alembic revision, memory
+   installer outcome) via :func:`json_or_pretty` so ``--json`` is
    honoured for scripting.
-
-The ``--no-memory`` flag is recognised today (so the contract is
-forward-compatible) but the actual memory installer ships in W11; for
-now we simply note the deferral in the summary.
 """
 
 from __future__ import annotations
@@ -114,9 +117,10 @@ def init(
         False,
         "--no-memory",
         help=(
-            "Skip queueing the memory installer for follow-up. "
-            "The installer itself ships in W11 — until then this flag "
-            "only suppresses the post-init reminder."
+            "Skip invoking the AI-client memory installer at the end of "
+            "init. Useful for non-interactive setups (CI, scripted "
+            "container builds) where touching CLAUDE.md / AGENTS.md / "
+            ".cursor/rules/ is undesirable."
         ),
     ),
 ) -> None:
@@ -125,7 +129,9 @@ def init(
     Creates ``./.ctxr-fsm`` (plus ``pids/`` subdir), runs
     ``alembic upgrade head`` against the project's SQLite DB,
     appends ``.ctxr-fsm/`` to ``.gitignore`` when in a git checkout,
-    and prints a summary.
+    then (unless ``--no-memory``) invokes the W11 memory installer to
+    wire FSM-usage principles into any detected AI-client memory.
+    Finishes by printing a summary.
     """
     db_path = resolve_db_path(db)
     project_dir = db_path.parent
@@ -145,6 +151,40 @@ def init(
 
     revision = _read_alembic_revision(db_path)
 
+    # ---- Memory installer (W11) ----------------------------------
+    #
+    # We invoke the in-process function (not the CLI command) so any
+    # side effects happen in the same Python process and we don't need
+    # to spawn a subprocess. Auto-detect mode is the right default —
+    # it patches CLAUDE.md / AGENTS.md / .cursor/rules/ only if those
+    # files exist, leaving a project with none of them untouched.
+    #
+    # We catch broad exceptions so a failed memory install never
+    # bricks ``ctxr-fsm init``; the summary surfaces the error so the
+    # operator can re-run ``ctxr-fsm install-memory`` directly to see
+    # the full traceback.
+    memory_installer: dict[str, Any] | str
+    if no_memory:
+        memory_installer = "skipped (--no-memory)"
+    else:
+        try:
+            # Local import to keep ``init`` startup cheap when
+            # ``--no-memory`` is passed — and to avoid a hard import
+            # cycle if the install-memory module ever wants to import
+            # init helpers.
+            from ctxr.fsm.cli.install_memory_cmd import run_install_memory
+
+            # ``run_install_memory`` is the non-printing core of
+            # ``install-memory``; we embed its summary as a sub-field
+            # so init's own JSON output remains a single valid
+            # document.
+            memory_installer = run_install_memory(target=cwd, client="auto")
+        except Exception as exc:
+            # Surface failures as a field rather than crashing init —
+            # the operator can re-run ``ctxr-fsm install-memory`` to
+            # get the full traceback.
+            memory_installer = f"failed: {type(exc).__name__}: {exc}"
+
     summary: dict[str, Any] = {
         "db_path": str(db_path),
         "project_dir": str(project_dir),
@@ -153,10 +193,6 @@ def init(
         "gitignore_updated": gitignore_updated,
         "ports_json": str(project_dir / "ports.json")
         + " (placeholder — populated by the serve subcommand in W7)",
-        "memory_installer": (
-            "skipped (--no-memory)"
-            if no_memory
-            else "memory installer comes in W11; re-run init then to wire it up"
-        ),
+        "memory_installer": memory_installer,
     }
     json_or_pretty(summary, json_mode)
