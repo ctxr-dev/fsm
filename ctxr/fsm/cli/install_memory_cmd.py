@@ -814,7 +814,7 @@ class _CheckRow:
     status: str  # "ok" | "out-of-date" | "missing" | "not-installed"
     bootstrap_status: str = (
         "not-installed"
-    )  # "ok" | "out-of-date" | "missing" | "not-installed" | "inlined"
+    )  # "ok" | "out-of-date" | "not-installed" | "inlined"
 
 
 def _sha256_file(path: Path) -> str:
@@ -1160,7 +1160,7 @@ def install_memory(
         out_of_date = [
             r
             for r in rows
-            if r.status in ("out-of-date", "missing")
+            if r.status in ("out-of-date", "missing", "not-installed")
             or r.bootstrap_status in ("out-of-date", "not-installed")
         ]
         json_or_pretty(

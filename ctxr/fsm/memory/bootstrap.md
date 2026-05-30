@@ -26,7 +26,7 @@ uv run ctxr-fsm ensure --json
 
 This is idempotent. On a cold project it: creates `.ctxr-fsm/fsm.db`, runs migrations, installs principles into CLAUDE.md/AGENTS.md/.cursor/rules, registers `ctxr-fsm` as an MCP server in the active client config(s), boots the supervisor (MCP + FastAPI + UI). On a warm project it returns in <500ms confirming everything is up.
 
-Parse the JSON output. Capture `mcp_http_url` (the HTTP-SSE MCP endpoint for current-session use) and `api_url`.
+Parse the JSON output. Subsystem URLs live under `subsystems.<name>.http_url`. Capture `subsystems.mcp.http_url` (the HTTP-SSE MCP endpoint for current-session use), `subsystems.api.http_url`, and `subsystems.api.docs_url` (Swagger). Health probes are at `subsystems.<name>.healthz_url`.
 
 ### Per-client reload semantics
 
@@ -43,10 +43,11 @@ Call `fsm.healthcheck()` via the MCP tool surface. If it returns ok, proceed to 
 If `fsm.healthcheck()` is unavailable (the stdio config was JUST registered and won't be effective until next session) call the HTTP-SSE fallback via Bash:
 
 ```bash
-curl -s "$MCP_HTTP_HEALTHZ"  # MCP_HTTP_HEALTHZ comes from ensure --json output
+MCP_HEALTHZ=$(uv run ctxr-fsm ensure --json | jq -r .subsystems.mcp.healthz_url)
+curl -s "$MCP_HEALTHZ"
 ```
 
-and continue calling fsm primitives via `curl http://127.0.0.1:<port>/...` for THIS session. The next session will pick up the stdio config automatically.
+and continue calling fsm primitives via the URL captured from `subsystems.mcp.http_url` for THIS session. The next session will pick up the stdio config automatically.
 
 ## Step 4 — register your skill's spec (one-time per project)
 
@@ -62,4 +63,4 @@ Idempotent — re-registering the same spec at the same version is a no-op. If t
 
 Use the `fsm.*` MCP tool family: `fsm.start_run(spec_id, args)` → loop `fsm.get_brief(run_id)` → for worker states, dispatch a sub-agent with the brief's prompt + inputs → `fsm.commit_outputs(run_id, outputs, signature)` → repeat until brief is terminal. Inline states are advanced server-side; you don't see them as briefs.
 
-See [`principles.md`](./principles.md) for the rules every FSM-driving agent must follow once a run is active.
+See [`principles.claude.md`](./principles.claude.md) (the per-client adapter staged alongside this file under `.ctxr-fsm/memory/`) for the rules every FSM-driving agent must follow once a run is active. Codex and Cursor inline the same rules into their principles adapter and have no separate staged file — those clients read this guidance from their adapter location (`~/.codex/AGENTS.md` / `.cursor/rules/ctxr-fsm.mdc`) rather than from this directory.
