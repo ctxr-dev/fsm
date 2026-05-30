@@ -54,17 +54,30 @@ The stdio MCP server registration written by `ctxr-fsm ensure` lands in a client
 - **Codex** (Codex CLI): stdio config in `~/.codex/config.toml` is loaded on next `codex` invocation. In-session: keep using HTTP-SSE fallback; on the next codex command, the stdio MCP becomes available. To force reload now: exit the current codex session and start a new one.
 - **Cursor**: stdio config in `~/.cursor/mcp.json` is loaded on Cursor reload. In-session: keep using HTTP-SSE fallback. To force reload now: Cmd/Ctrl+Shift+P -> "Developer: Reload Window" OR fully restart Cursor.
 
-#### Step 3 — try stdio MCP first, fall back to HTTP-SSE
+#### Step 3 — choose your driver: stdio MCP, Python API, or HTTP-SSE
 
-Call `fsm.healthcheck()` via the MCP tool surface. If it returns ok, proceed to your skill's actual work — the stdio MCP server is registered with this client and reachable.
+Three driver paths, in preference order. Pick the FIRST one that works in your session.
 
-If `fsm.healthcheck()` is unavailable (the stdio config was JUST registered and won't be effective until next session) call the HTTP-SSE fallback via Bash:
+**Path A — stdio MCP (the registered, primary path).** Call `fsm.healthcheck()` via the MCP tool surface. If it returns ok, proceed to your skill's actual work; the stdio MCP server is registered with this client and reachable. This is the path you SHOULD be on after the per-client reload listed in Step 2.
+
+**Path B — Python API (recommended fallback when stdio isn't live yet).** If `fsm.healthcheck()` is unavailable (the stdio config was JUST registered and won't be effective until the next session per Step 2's per-client reload table), drive the run directly via Python in the current session. The fsm engine is installable; you can open the project and step it forward without going through any IPC layer:
 
 ```bash
-curl -s "$MCP_HTTP_HEALTHZ"  # MCP_HTTP_HEALTHZ comes from ensure --json output
+uv run python - <<'PY'
+from pathlib import Path
+from ctxr.fsm.sqlite import Project
+
+project = Project.open(Path(".ctxr-fsm/fsm.db"))
+run = project.start_run(spec_id="<your-spec-slug>", args={...})
+print("run_id:", run.id)
+### Loop: read brief → dispatch sub-agent → commit_outputs → repeat.
+### project.runs.get(run.id).brief() ... project.run.commit_outputs(run.id, outputs)
+PY
 ```
 
-and continue calling fsm primitives via `curl http://127.0.0.1:<port>/...` for THIS session. The next session will pick up the stdio config automatically.
+This is the path skills should default to when invoked from a Bash-driven shell loop (the cycle 1 sub-agent used this; the MCP-over-SSE path in Path C is harder to drive from a single Bash tool call).
+
+**Path C — HTTP-SSE MCP fallback (advanced, requires an SSE-aware client).** The supervisor's HTTP MCP endpoint is a JSON-RPC 2.0 transport over Server-Sent Events. To exercise it you need an SSE consumer (e.g., the official MCP Python SDK's `ClientSession` over `sse_client`) — you cannot drive it with a single `curl -X POST`. Capture the URL from `ensure --json`'s `subsystems.mcp.http_url` field; pair it with the parallel POST endpoint `/messages/?session_id=...` for the request side. Prefer Path A or B unless your harness already speaks SSE.
 
 #### Step 4 — register your skill's spec (one-time per project)
 
