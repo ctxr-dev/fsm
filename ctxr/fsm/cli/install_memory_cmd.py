@@ -477,9 +477,14 @@ def _materialise_bootstrap_doc(
     """Stage the canonical bootstrap doc under ``target/.ctxr-fsm/memory/``.
 
     Wraps :func:`_materialise_package_file` against the package's
-    bootstrap source so every client install path stages the file
-    consistently. The bootstrap doc has no per-client variant, so
-    there's exactly one ``package_file`` to materialise.
+    bootstrap source. Called only from the Claude install path — Codex
+    and Cursor inline the bootstrap body inside their principles
+    adapter at generation time (see
+    ``tools/generate_memory_adapters.py``) and never materialise a
+    separate ``.ctxr-fsm/memory/bootstrap.md`` because their LLMs do
+    not follow Claude's ``@`` import syntax. The bootstrap doc has no
+    per-client variant, so there's exactly one ``package_file`` to
+    materialise.
     """
 
     return _materialise_package_file(
@@ -794,13 +799,22 @@ class _CheckRow:
 
     * For Claude, the staged ``.ctxr-fsm/memory/bootstrap.md`` copy is
       hash-compared against the package source — bootstrap.md has no
-      frontmatter version, so we compare content hashes.
+      frontmatter version, so we compare content hashes. Any byte
+      change in the source surfaces as drift.
     * For Codex and Cursor, the bootstrap content lives inlined inside
-      the principles adapter file. Drift in that content shows up as
-      drift in the principles version (the adapter regenerates when
-      bootstrap.md changes, bumping the principles file's bytes), so
-      ``bootstrap_status`` is the static sentinel ``"inlined"`` —
-      "checked elsewhere, not staged as a separate file".
+      the principles adapter file and ``bootstrap_status`` is the
+      static sentinel ``"inlined"`` (not a separate hash check).
+      **Caveat:** drift is only detected here when the principles
+      ``version`` is bumped alongside the bootstrap-content change.
+      If bootstrap.md changes but the principles version is NOT
+      bumped, the regenerated adapter has new bytes but the marker
+      block on disk still pins the old version, so the version
+      comparison passes and the byte-level drift is invisible. The
+      adapter-regeneration tooling (``tools/generate_memory_adapters.py``)
+      treats the principles version as the authoritative drift signal;
+      a future hash-based audit could tighten this, but it would
+      require the installed adapter to carry a content hash alongside
+      the version marker.
 
     A client is considered out-of-date overall when EITHER axis is
     out of date or missing (where applicable — ``"inlined"`` is

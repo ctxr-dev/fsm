@@ -92,9 +92,10 @@ _BOOTSTRAP_REF_PHRASE_INLINED: str = (
 )
 
 # Regex matching any ATX heading from H1 through H5. H6 is excluded
-# because HTML has no H7; promoting an H6 further would silently
-# collapse to H6 and lose information. We document this cap in
-# :func:`_demote_headings` and refuse to silently exceed it.
+# because HTML has no H7; demoting an H6 further (i.e. adding another
+# ``#`` to make it an H7) would silently collapse to H6 and lose
+# information. We document this cap in :func:`_demote_headings` and
+# refuse to silently exceed it.
 _HEADING_RE: re.Pattern[str] = re.compile(r"^(#{1,5}) ", flags=re.MULTILINE)
 
 

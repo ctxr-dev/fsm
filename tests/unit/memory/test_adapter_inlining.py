@@ -250,7 +250,7 @@ def test_codex_adapter_demotes_step_headings_to_h4(gen_mod: object) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_generator_is_idempotent(gen_mod: object, tmp_path: Path) -> None:
+def test_generator_is_idempotent(gen_mod: object) -> None:
     """Running the generator twice produces byte-identical adapter files."""
 
     # Run main() once — the adapter files on disk now reflect the
