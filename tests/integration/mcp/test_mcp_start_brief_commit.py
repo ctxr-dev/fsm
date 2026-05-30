@@ -138,11 +138,14 @@ async def _mcp_session(db_path: Path) -> AsyncIterator[ClientSession]:
 
 
 async def _drive_two_state_run_to_terminal(db_path: Path) -> dict[str, Any]:
-    """Run the full register -> start -> commit x2 -> get_run flow.
+    """Run register -> start -> (commit + confirm) x2 -> get_run.
 
-    Returns a dict bundling the intermediate payloads so the synchronous
-    test function can make assertions against each step without needing
-    to be async itself.
+    W12 made ``fsm.commit_outputs`` two-phase: the commit stages the
+    deferred writes and mints a single-use CommitToken; the client
+    must call ``fsm.confirm_commit`` with the token before the run
+    actually advances. We drive both halves of the flow here so the
+    test ends in the same terminal manifest the original W4 walk
+    produced.
     """
     async with _mcp_session(db_path) as session:
         # --- 1. Register the fixture spec ---------------------------------
@@ -173,7 +176,7 @@ async def _drive_two_state_run_to_terminal(db_path: Path) -> dict[str, Any]:
         )
         start = _unwrap(start_resp.structuredContent)
 
-        # --- 3. Commit outputs for state_a (expect advanced) --------------
+        # --- 3. Commit outputs for state_a (expect advanced + token) ------
         first_commit_resp = await session.call_tool(
             "fsm.commit_outputs",
             {
@@ -188,7 +191,22 @@ async def _drive_two_state_run_to_terminal(db_path: Path) -> dict[str, Any]:
         )
         first_commit = _unwrap(first_commit_resp.structuredContent)
 
-        # --- 4. Commit outputs for state_b (expect terminal) --------------
+        # --- 3b. Confirm the first commit to actually advance the run ----
+        first_token = first_commit["token"]["token"]
+        first_confirm_resp = await session.call_tool(
+            "fsm.confirm_commit",
+            {
+                "input": {
+                    "token": first_token,
+                    "expected_next_state": first_commit["expected_next_state"],
+                }
+            },
+        )
+        assert first_confirm_resp.isError is False, (
+            f"fsm.confirm_commit (first) returned an error: {first_confirm_resp}"
+        )
+
+        # --- 4. Commit outputs for state_b (expect terminal + token) ------
         second_commit_resp = await session.call_tool(
             "fsm.commit_outputs",
             {
@@ -202,6 +220,21 @@ async def _drive_two_state_run_to_terminal(db_path: Path) -> dict[str, Any]:
             f"fsm.commit_outputs (second) returned an error: {second_commit_resp}"
         )
         second_commit = _unwrap(second_commit_resp.structuredContent)
+
+        # --- 4b. Confirm the terminal commit to flip the run to complete -
+        second_token = second_commit["token"]["token"]
+        second_confirm_resp = await session.call_tool(
+            "fsm.confirm_commit",
+            {
+                "input": {
+                    "token": second_token,
+                    "expected_next_state": second_commit["expected_next_state"],
+                }
+            },
+        )
+        assert second_confirm_resp.isError is False, (
+            f"fsm.confirm_commit (second) returned an error: {second_confirm_resp}"
+        )
 
         # --- 5. Read the final picture for state_tree assertions ----------
         detail_resp = await session.call_tool(

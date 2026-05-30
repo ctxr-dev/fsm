@@ -133,6 +133,18 @@ from ctxr.fsm.core.spec import (
     validate_fsm_spec,
 )
 
+# ---------------------------------------------------------------------------
+# Verifier — adversarial verifier panel runtime (W12 layer 3)
+# ---------------------------------------------------------------------------
+from ctxr.fsm.core.verifier import (
+    VerifierHandler,
+    VerifierOutcome,
+    VerifierVote,
+    get_verifier_handler,
+    run_verifier,
+    set_verifier_handler,
+)
+
 # Ensure ``spec.validate()`` / ``spec.hash()`` are live for every
 # ``FsmSpec`` instance produced anywhere in the process. ``attach_methods``
 # is idempotent: a second invocation is a no-op.
@@ -182,8 +194,11 @@ __all__ = [
     "TransitionEvaluation",
     "TransitionKind",
     "ValidationResult",
+    "VerifierHandler",
+    "VerifierOutcome",
     "VerifierSpec",
     "VerifierVerdict",
+    "VerifierVote",
     "Worker",
     "WorkerOutput",
     "advance",
@@ -193,10 +208,13 @@ __all__ = [
     "build_brief",
     "evaluate_expression",
     "fsm_spec_hash",
+    "get_verifier_handler",
     "loop_decide",
     "outputs_path_for",
     "resolve_transition",
     "run_post_validations",
+    "run_verifier",
+    "set_verifier_handler",
     "validate_expression",
     "validate_fsm_spec",
     "validate_output",

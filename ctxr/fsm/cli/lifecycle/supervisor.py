@@ -90,6 +90,11 @@ from ctxr.fsm.cli.lifecycle.primitives import (
     remember_port,
     write_pid_file,
 )
+from ctxr.fsm.sqlite.drift import (
+    DRIFT_DISABLED_ENV_VAR,
+    DriftConfig,
+    drift_detector_loop,
+)
 
 __all__ = ["main", "run_supervisor"]
 
@@ -594,6 +599,49 @@ async def _reload_loop(
 # ---------------------------------------------------------------------------
 
 
+async def _drift_detector_task(db_path: Path) -> None:
+    """Open a :class:`Project` and run the W12 drift detector loop.
+
+    The supervisor owns a long-lived background task that opens its
+    own :class:`Project` against ``db_path`` and drives
+    :func:`drift_detector_loop` for the lifetime of the supervisor.
+    A separate Project handle (rather than reusing the MCP / API
+    child's handle, which lives in a different process) is required
+    because the drift detector talks directly to the SQLite
+    substrate; we cannot tunnel through the children's HTTP
+    surfaces without inventing a new bridge.
+
+    The loop honours the :data:`DRIFT_DISABLED_ENV_VAR` env var
+    before the Project is opened, so flipping the kill switch
+    skips the engine bind entirely — useful for ops who need to
+    stop the loop without paying the migration cost on every
+    reload cycle.
+    """
+    if os.environ.get(DRIFT_DISABLED_ENV_VAR) == "1":
+        _log(
+            f"[ctxr-fsm supervisor] drift detector disabled via "
+            f"{DRIFT_DISABLED_ENV_VAR}=1; skipping bind."
+        )
+        return
+    # Lazy import to avoid a hard dependency on SQLAlchemy at module
+    # import time — keeps ``ctxr-fsm serve --help`` fast when the
+    # sqlite extras are not installed.
+    from ctxr.fsm.sqlite import Project
+
+    try:
+        project = Project.open(db_path, migrate=False)
+    except Exception:
+        _log(
+            "[ctxr-fsm supervisor] drift detector could not open the "
+            "project; loop disabled this run."
+        )
+        return
+    try:
+        await drift_detector_loop(project, DriftConfig())
+    finally:
+        project.close()
+
+
 async def _signal_scope(cancel_scope: anyio.CancelScope) -> None:
     """Translate SIGINT/SIGTERM into a task-group cancellation.
 
@@ -704,6 +752,22 @@ async def run_supervisor(
                         children=children,
                         locks=locks,
                     )
+                )
+
+            # W12 drift detector. Started in both ``dev`` and ``prod``
+            # modes so the enforcement layer is always live; the only
+            # way to disable it is the ``CTXR_FSM_DRIFT_DISABLED=1``
+            # env var honoured inside :func:`_drift_detector_task`.
+            # We need a database path to bind a Project; when none is
+            # supplied (e.g. unit tests that exercise the supervisor
+            # against an empty CWD) we log + skip the task rather than
+            # crash the boot.
+            if db_path is not None:
+                tg.start_soon(_drift_detector_task, db_path)
+            else:
+                _log(
+                    "[ctxr-fsm supervisor] no --db path provided; "
+                    "drift detector loop disabled."
                 )
 
             # The task group's __aexit__ blocks until every child task

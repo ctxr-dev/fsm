@@ -589,19 +589,56 @@ async def resume_run(
 
     404 when the run does not exist.
     """
+    from ctxr.fsm.core import spec as _spec_module  # noqa: F401  (binds .hash)
     from ctxr.fsm.core.models import EventKind  # local: avoid import cycle
 
     def _run_resume(session: Session) -> dict[str, Any] | None:
         run: Run | None = project.runs.get(session, run_id)
         if run is None:
             return None
-        return {"status": run.status}
+        # W12 layer-9: resolve the latest registered version under the
+        # same slug (NOT just the row the run was started against).
+        # Re-registering a v2 under the same slug must trip the lock
+        # even when the run still references the original row's PK —
+        # the lock is about "did the operator change the canonical
+        # definition mid-flight".
+        registered = project.specs.get(session, run.fsm_spec_id)
+        current_hash: str | None = None
+        if registered is not None:
+            versions = project.specs.list_versions(
+                session,
+                project_id=registered.project_id,
+                slug=registered.slug,
+            )
+            current_hash = versions[-1].hash if versions else registered.hash
+        return {
+            "status": run.status,
+            "fsm_spec_hash": run.fsm_spec_hash,
+            "current_hash": current_hash,
+        }
 
     pre = await run_in_threadpool(_within_session, project, _run_resume)
     if pre is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"no run with id {run_id!r}",
+        )
+
+    # W12 layer-9: spec-hash lock. Surface a 409 (same family as
+    # ``already in terminal status``) with the structured detail
+    # carrying both hashes so the UI can render the drift directly.
+    if (
+        pre["current_hash"] is not None
+        and pre["fsm_spec_hash"] != pre["current_hash"]
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "fsm_spec_changed",
+                "detail": "FSM spec hash changed since run started",
+                "run_hash": pre["fsm_spec_hash"],
+                "current_hash": pre["current_hash"],
+            },
         )
 
     def _apply(session: Session) -> dict[str, Any]:

@@ -8,6 +8,59 @@ cosignatures, and observes tool calls. W4 is the **plumbing** wave —
 schema validation and basic commit semantics — and intentionally does
 NOT yet enforce the hard rules; W12 wires those.
 
+Brief contract (what every ``fsm.get_brief`` / ``fsm.start_run`` /
+``fsm.commit_outputs.advanced`` return MUST include and clients MUST
+honour)
+----------------------------------------------------------------------
+
+The :class:`~ctxr.fsm.core.models.Brief` payload carries — among other
+fields — a closed capability surface for the worker:
+
+* ``allowed_tools`` — list of tool names the worker may invoke for
+  this state. **MUST be honoured by every MCP client.** Any call the
+  worker makes outside this list is "off-allowlist" and the engine
+  treats it as a layer-2 drift signal (W12). An empty list means no
+  side-effecting tools are allowed for that state.
+* ``post_validations`` — predicate expressions the engine will run
+  against the committed outputs. A worker should self-check against
+  them before committing to avoid a faulted commit.
+* ``transitions`` — the outbound guards the engine will evaluate at
+  commit time, with their predicate sources verbatim. Used by clients
+  that want to preview the next state without committing.
+* ``has_worker`` / ``has_loop`` / ``iteration_n`` — discriminators
+  for the worker / loop / terminal shapes of a state.
+
+Clients are expected to inspect ``allowed_tools`` *before* dispatching
+any tool call and refuse the call locally if the name is not on the
+list — the server-side enforcement (layer 2 in W12) is a
+defence-in-depth backstop, not the primary gate.
+
+Spec-hash lock (layer 9)
+------------------------
+
+Every commit / brief tool checks ``run.fsm_spec_hash`` against the
+current registered spec hash and returns the structured
+``fsm_spec_changed`` error envelope on mismatch. A run is therefore
+"locked" to the spec version it was started against — re-registering a
+new version while runs are in flight causes those runs to refuse new
+work until they are aborted or the spec change is rolled back.
+
+Commit cosignature (layer 5)
+----------------------------
+
+``fsm.commit_outputs`` accepts an optional ``signature`` (computed as
+:meth:`CommitSignature.compute`). The signature is REQUIRED when:
+
+* the env var ``CTXR_FSM_REQUIRE_COSIGNATURE`` is set to ``"1"``;
+* OR the current state declares any :attr:`State.allowed_tools` entry;
+* OR the current state declares a :attr:`State.verifier`.
+
+A valid signature is persisted via ``commit_signatures`` and
+``commit_signature_verified`` is emitted on the event bus. A
+mismatched signature surfaces as ``signature_mismatch`` and emits
+``commit_signature_mismatch``; a missing-but-required signature
+surfaces as ``signature_required``.
+
 Module layout
 -------------
 

@@ -486,7 +486,13 @@ def release_singleton(lock: PidLock, *, project_root: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def write_active_run_marker(run_id: str | None, *, project_root: Path) -> None:
+def write_active_run_marker(
+    run_id: str | None,
+    *,
+    project_root: Path,
+    allowed_tools: list[str] | None = None,
+    current_state: str | None = None,
+) -> None:
     """Publish (or clear) the active-run marker the W12 hook reads.
 
     The marker lives at ``<project_root>/.ctxr-fsm/active-run.json``
@@ -496,9 +502,26 @@ def write_active_run_marker(run_id: str | None, *, project_root: Path) -> None:
     find the nearest ``.ctxr-fsm`` directory, which makes the
     per-project layout transparent on the consumer side.
 
-    Passing ``run_id=None`` removes the marker (used by the supervisor
-    on a clean shutdown so a later hook invocation doesn't attach an
-    event to a run that's no longer current).
+    Parameters
+    ----------
+    run_id:
+        UUID-as-string for the in-flight FSM run, or ``None`` to clear
+        the marker entirely (used by ``fsm.abort_run`` / terminal
+        commits / supervisor shutdown so a later hook invocation
+        doesn't attach an event to a run that's no longer current).
+    project_root:
+        Directory whose ``.ctxr-fsm/`` subtree owns the marker. The
+        directory is created on demand.
+    allowed_tools:
+        The current FSM state's allowed_tools list — the hook adds
+        ``fsm.*`` implicitly and then blocks any tool call that
+        matches neither. ``None`` (or empty list) means the worker is
+        unrestricted within the FSM run, in which case the hook will
+        not block any tool call.
+    current_state:
+        The current state id, recorded purely for diagnostics so
+        ``doctor`` / hook stderr can name the state that imposed the
+        allowlist. Optional; omitted from the document if ``None``.
     """
     path = _state_dir(project_root) / _ACTIVE_RUN_FILE_NAME
     if run_id is None:
@@ -509,5 +532,11 @@ def write_active_run_marker(run_id: str | None, *, project_root: Path) -> None:
             # the race as an error.
             return
         return
-    payload = {"run_id": run_id, "set_at": _now_iso()}
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "set_at": _now_iso(),
+        "allowed_tools": list(allowed_tools or []),
+    }
+    if current_state is not None:
+        payload["current_state"] = current_state
     _atomic_write_text(path, json.dumps(payload, sort_keys=True, indent=2))

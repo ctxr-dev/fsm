@@ -42,23 +42,28 @@ imported across module boundaries for no real benefit.
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
+from ctxr.fsm.cli.lifecycle.primitives import write_active_run_marker
 from ctxr.fsm.core.engine import advance as engine_advance
 from ctxr.fsm.core.engine import build_brief
 from ctxr.fsm.core.models import (
     Brief,
+    CommitSignature,
     EventKind,
     FsmSpec,
     PostValidationResultEntry,
     RunCtx,
     TransitionEvaluation,
 )
+from ctxr.fsm.core.verifier import VerifierOutcome, run_verifier
 from ctxr.fsm.mcp import mcp
 from ctxr.fsm.mcp._drain_decorator import drain_aware
 from ctxr.fsm.mcp._errors import McpToolError, as_error
@@ -91,6 +96,69 @@ __all__ = [
 # of it here so log lines carry the ``ctxr.fsm.mcp.tools_runs`` name and
 # never leak onto stdout.
 _LOG = logging.getLogger(__name__)
+
+
+# Env-var override for the active-run marker location. When unset we
+# fall back to ``Path.cwd()`` — matching how the supervisor / doctor
+# resolve ``project_root``. Tests rely on the override so a temp dir
+# can serve as the project root without changing the worker's cwd.
+_ACTIVE_RUN_PROJECT_ROOT_ENV: str = "CTXR_FSM_PROJECT_ROOT"
+
+
+def _project_root_for_marker() -> Path:
+    """Return the directory whose ``.ctxr-fsm/`` should hold the marker.
+
+    Precedence:
+    1. ``$CTXR_FSM_PROJECT_ROOT`` from the process environment (used by
+       tests + by operators with a non-cwd project layout).
+    2. The current working directory (matches every other lifecycle
+       primitive: supervisor, doctor, default DB path resolution).
+    """
+    override = os.environ.get(_ACTIVE_RUN_PROJECT_ROOT_ENV)
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path.cwd().resolve()
+
+
+def _publish_active_run_marker(
+    *,
+    run_id: str | None,
+    spec: FsmSpec | None,
+    state_id: str | None,
+) -> None:
+    """Best-effort writer for the active-run marker (W12 layer-4 hook).
+
+    ``run_id=None`` clears the marker. Otherwise we look up the named
+    state on ``spec`` to extract its ``allowed_tools`` and record both
+    on the marker so a Claude Code (or other layer-4) hook can decide
+    in O(1) whether to allow a given tool call.
+
+    Any filesystem failure here is swallowed and logged — losing the
+    marker degrades enforcement but must NEVER break the run itself.
+    """
+    try:
+        project_root = _project_root_for_marker()
+        if run_id is None:
+            write_active_run_marker(None, project_root=project_root)
+            return
+        allowed: list[str] = []
+        current_state: str | None = state_id
+        if spec is not None and state_id is not None:
+            try:
+                state = spec.get_state(state_id)
+                allowed = list(state.allowed_tools or [])
+            except KeyError:
+                # Unknown state id — record the run + empty allowlist so
+                # the hook fails open rather than blocking everything.
+                allowed = []
+        write_active_run_marker(
+            run_id,
+            project_root=project_root,
+            allowed_tools=allowed,
+            current_state=current_state,
+        )
+    except OSError:
+        _LOG.exception("failed to update active-run marker")
 
 
 # Producer identity used when this module emits engine-attributed
@@ -158,8 +226,28 @@ class CommitOutputsInput(BaseModel):
     signature: str | None = Field(
         default=None,
         description=(
-            "Optional commit signature. Recorded as-is in W4; cryptographic "
-            "verification is wired in W12 alongside the cosignature surface."
+            "Optional commit signature (layer-5 cosignature). When the "
+            "current state declares allowed_tools, a verifier, or the "
+            "server runs with CTXR_FSM_REQUIRE_COSIGNATURE=1, the "
+            "signature is REQUIRED and a missing/mismatched value rejects "
+            "the commit. Computed as "
+            "CommitSignature.compute(brief_id, inputs, outputs, session_id)."
+        ),
+    )
+    brief_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Brief id the worker is committing against. Required when a "
+            "signature is supplied: the signature hashes (brief_id, "
+            "inputs, outputs, session_id) so verification needs the same "
+            "brief_id the worker saw."
+        ),
+    )
+    session_id: str | None = Field(
+        default=None,
+        description=(
+            "Worker session id that signed the commit. Required when a "
+            "signature is supplied."
         ),
     )
 
@@ -190,9 +278,21 @@ class CommitResult(BaseModel):
     here to match the JS legacy MCP contract. ``"loop_continue"``
     likewise becomes ``"loop_continued"``.
 
-    For W4 ``token`` is always ``None``; W12 will mint a
-    :class:`CommitToken` and require the client to call
-    :func:`fsm_confirm_commit` before the next brief is materialised.
+    W12 two-phase semantics
+    -----------------------
+
+    When ``kind`` is ``"advanced"``, ``"loop_continued"``, or
+    ``"terminal"``, the result carries a :class:`CommitToken` plus
+    ``expected_next_state``. The state-row + transition-row + manifest
+    update are NOT applied yet — they are staged in a ``journal_txn``
+    row marked ``ready_to_finalise`` and replayed by
+    :func:`fsm_confirm_commit` when the client presents the token.
+
+    Tokens are minted only after every prior W12 gate has passed:
+    signature verification, engine validation, post-validations,
+    transition resolution, and (when ``State.verifier`` is set) the
+    verifier panel. A ``"fault"`` or rejected-verifier result returns
+    ``token=None`` and the run does not advance.
     """
 
     model_config = _OUT_CFG
@@ -207,6 +307,7 @@ class CommitResult(BaseModel):
     evaluations: list[TransitionEvaluation] = Field(default_factory=list)
     post_validations: list[PostValidationResultEntry] = Field(default_factory=list)
     token: CommitToken | None = None
+    expected_next_state: str | None = None
 
 
 class ConfirmCommitInput(BaseModel):
@@ -221,15 +322,27 @@ class ConfirmCommitInput(BaseModel):
 class ConfirmResult(BaseModel):
     """Return value of :func:`fsm_confirm_commit`.
 
-    W4 always returns ``confirmed=True``; the real two-phase commit
-    semantics land in W12. ``note`` documents that for any caller that
-    is reading the surface today expecting hard enforcement.
+    W12 two-phase commit
+    --------------------
+
+    ``confirmed=True`` iff the token existed, was unconsumed, had not
+    expired, and the supplied ``expected_next_state`` matched the value
+    the token was minted against. On success the staged journal_txn is
+    replayed (state-row + transition-row + manifest update + lifecycle
+    events) and the response carries the newly-minted ``next_brief``
+    plus a fresh ``manifest`` snapshot.
+
+    ``next_brief`` is populated for ``advanced`` / ``loop_continued``
+    transitions; for ``terminal`` it stays ``None`` because there is no
+    further state to brief on.
     """
 
     model_config = _OUT_CFG
 
     confirmed: bool
     note: str | None = None
+    next_brief: Brief | None = None
+    manifest: dict[str, Any] | None = None
 
 
 class ResumeRunInput(BaseModel):
@@ -319,6 +432,44 @@ class RunDetail(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Enforcement constants (W12)
+# ---------------------------------------------------------------------------
+
+
+# Env-var gate for the layer-5 commit cosignature requirement. When set
+# to "1" (the literal string), every ``fsm.commit_outputs`` call MUST
+# carry a valid ``signature``; missing signatures surface as
+# ``signature_required`` and mismatched signatures as
+# ``signature_mismatch``. The cosignature is also required, regardless
+# of the env var, when the current state declares ``allowed_tools`` or a
+# ``verifier`` (those are stronger trust contracts and the cosignature
+# is the proof that the brief and the committed outputs match).
+_COSIGNATURE_ENV_VAR: str = "CTXR_FSM_REQUIRE_COSIGNATURE"
+
+
+def _cosignature_required(state: Any) -> bool:
+    """Return ``True`` when the W12 layer-5 cosignature must be present.
+
+    Three triggers escalate a state's commit to "signature required":
+
+    * The process-wide env var :data:`_COSIGNATURE_ENV_VAR` is set to
+      ``"1"`` (operator opts the whole server into strict mode).
+    * The state declares any ``allowed_tools`` entry — once we hand a
+      worker a capability surface, the cosignature is the proof that
+      the outputs came from the brief we wrote.
+    * The state declares a ``verifier`` — verifier panels run against
+      the committed outputs, and a signature mismatch must reject the
+      commit before any verifier work begins.
+    """
+    if os.environ.get(_COSIGNATURE_ENV_VAR) == "1":
+        return True
+    allowed_tools = getattr(state, "allowed_tools", None) or []
+    if allowed_tools:
+        return True
+    return getattr(state, "verifier", None) is not None
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -346,13 +497,69 @@ def _load_fsm_spec(project: Project, registered_spec_id: str) -> FsmSpec | None:
     The W2 substrate stores the spec as a canonical JSON ``definition``
     column; we reload it via Pydantic so the engine sees the same
     object shape it would see if the caller had constructed the spec
-    in-process. Returns ``None`` when the spec row is missing.
+    in-process. Returns ``None`` when the spec row is missing. The
+    :func:`ctxr.fsm.core.spec.attach_methods` shim is imported here so
+    ``spec.hash()`` is always callable on the returned object (the spec
+    module installs the method on first import; the import below is the
+    safe entry point even when this module is loaded before any other
+    caller has touched ``ctxr.fsm.core.spec``).
     """
+    # Side-effect import: binds ``FsmSpec.hash()`` / ``FsmSpec.validate()``.
+    # Idempotent and cheap once the module is on the path.
+    from ctxr.fsm.core import spec as _spec_module  # noqa: F401
+
     with project.session_factory() as session:
         registered = project.specs.get(session, registered_spec_id)
     if registered is None:
         return None
     return FsmSpec.model_validate(registered.definition)
+
+
+def _spec_hash_lock_error(
+    run_hash: str,
+    current_hash: str,
+) -> McpToolError:
+    """Construct the canonical ``fsm_spec_changed`` error envelope.
+
+    Centralised so the MCP and (indirectly) API layers emit the exact
+    same payload — clients can branch on ``error == "fsm_spec_changed"``
+    and reach for ``payload.run_hash`` / ``payload.current_hash`` to
+    show the operator the drift. The detail string is fixed so log
+    grepping is reliable.
+    """
+    return as_error(
+        "fsm_spec_changed",
+        detail="FSM spec hash changed since run started",
+        run_hash=run_hash,
+        current_hash=current_hash,
+    )
+
+
+def _current_spec_hash_for_run(project: Project, run_spec: Any) -> str:
+    """Return the hash of the *latest* registered version for the run's slug.
+
+    The W12 spec-hash lock is about "the spec the operator currently
+    considers canonical for this slug" — re-registering a v2 under the
+    same slug must trip the lock, even though the run still references
+    the v1 row PK. We therefore resolve the latest version under
+    ``(project_id, slug)`` and use its hash for the comparison.
+
+    Falls back to the spec's own hash when no version is registered
+    under that slug (defensive — should not happen for a run that was
+    started against a registered spec, but the fallback keeps the
+    function total).
+    """
+    with project.session_factory() as session:
+        versions = project.specs.list_versions(
+            session,
+            project_id=run_spec.project_id,
+            slug=run_spec.slug,
+        )
+    if not versions:
+        return str(run_spec.hash)
+    # ``list_versions`` returns oldest-first; the last entry is the
+    # newest registered version — the one the lock compares against.
+    return str(versions[-1].hash)
 
 
 def _current_state_id(run_manifest: Any, spec: FsmSpec) -> str:
@@ -458,6 +665,52 @@ def _record_state_exit(
             producer_id=producer_id,
             kind=EventKind.state_exited.value,
             payload={"run_id": run_id, "state_pk": state_pk},
+            run_id=run_id,
+        )
+
+
+def _record_verified_signature(
+    project: Project,
+    *,
+    run_id: str,
+    state_pk: str,
+    state_id: str,
+    iteration_n: int | None,
+    envelope: CommitSignature,
+    producer_id: str,
+) -> None:
+    """Persist a verified :class:`CommitSignature` + emit the verified event.
+
+    Called after the cosignature check passes and the engine has decided
+    the commit will proceed (not faulted). Wrapped in one atomic block
+    so the audit-trail row and the bus event land together — partial
+    visibility would let a subscriber see the event without the
+    underlying envelope row, which would corrupt downstream replay.
+    """
+    with project.session_factory() as session, session.begin():
+        project.commit_signatures.record(
+            session,
+            run_id=run_id,
+            state_pk=state_pk,
+            iteration_n=iteration_n,
+            brief_id=str(envelope.brief_id),
+            inputs_hash=envelope.inputs_hash,
+            outputs_hash=envelope.outputs_hash,
+            session_id=envelope.session_id,
+            signature=envelope.signature,
+            verified=True,
+        )
+        project.events.emit(
+            session,
+            producer_id=producer_id,
+            kind=EventKind.commit_signature_verified.value,
+            payload={
+                "run_id": run_id,
+                "state": state_id,
+                "brief_id": str(envelope.brief_id),
+                "signature": envelope.signature,
+                "iteration_n": iteration_n,
+            },
             run_id=run_id,
         )
 
@@ -624,6 +877,15 @@ def fsm_start_run(input: StartRunInput) -> RunStartedPayload | McpToolError:
             run_id=uuid.UUID(run.id),
         )
 
+        # W12 layer-4: publish the active-run marker so any installed
+        # Claude Code (or peer) tool-use hook can constrain the worker
+        # to the entry state's allowed_tools.
+        _publish_active_run_marker(
+            run_id=run.id,
+            spec=spec,
+            state_id=entry_state.id,
+        )
+
         return RunStartedPayload(
             run_id=uuid.UUID(run.id),
             brief=brief,
@@ -659,12 +921,31 @@ def fsm_get_brief(input: GetBriefInput) -> Brief | McpToolError:
                 run_id=run_id_str,
             )
 
-        spec = _load_fsm_spec(project, run.fsm_spec_id)
-        if spec is None:
+        # Load the registered spec row directly so we have both
+        # ``project_id`` (for the lock check below) and the canonical
+        # JSON definition (to reconstruct the FsmSpec the engine wants).
+        with project.session_factory() as session:
+            registered = project.specs.get(session, run.fsm_spec_id)
+        if registered is None:
             return as_error(
                 "spec_not_found",
                 detail=f"run references missing spec {run.fsm_spec_id!r}",
                 spec_id=run.fsm_spec_id,
+            )
+        # Side-effect import binds ``FsmSpec.hash`` / ``.validate``.
+        from ctxr.fsm.core import spec as _spec_module  # noqa: F401
+        spec = FsmSpec.model_validate(registered.definition)
+
+        # W12 layer-9: spec-hash lock. Compare the run's snapshot hash
+        # against the *latest* registered version under the same slug
+        # — re-registering a new shape under the same name must trip
+        # the lock even when the run still references the original
+        # row's PK.
+        current_hash = _current_spec_hash_for_run(project, registered)
+        if run.fsm_spec_hash != current_hash:
+            return _spec_hash_lock_error(
+                run_hash=run.fsm_spec_hash,
+                current_hash=current_hash,
             )
 
         current_state_id = _current_state_id(run, spec)
@@ -690,30 +971,284 @@ def fsm_get_brief(input: GetBriefInput) -> Brief | McpToolError:
         return as_error("internal_error", detail=str(exc))
 
 
+# ---------------------------------------------------------------------------
+# Two-phase commit (W12) — staged journal txn + token issue / replay
+# ---------------------------------------------------------------------------
+
+
+# The token TTL is short enough that an unattended worker cannot
+# permanently hold open a half-commit, long enough that an LLM client
+# has time to make the follow-up confirm_commit call. The brief calls
+# out 60s explicitly; we surface it as a module constant so future
+# tuning happens in one place.
+_COMMIT_TOKEN_TTL_SECONDS: int = 60
+
+
+def _stage_commit_writes(
+    *,
+    result_kind: Literal["advance", "loop_continue", "terminal"],
+    run_id: str,
+    spec_id: str,
+    current_state_id: str,
+    next_state_id: str | None,
+    from_state_pk: str | None,
+    outputs: dict[str, Any],
+    env: dict[str, Any],
+    iteration_n: int | None,
+    verdict: Any,
+    winning_kind: str | None,
+    winning_predicate: str | None,
+    winning_predicate_result: bool | None,
+    next_inputs: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Build the canonical ``staged_writes`` payload for a journal_txn.
+
+    The list is a flat sequence of step dicts; :func:`_replay_journal_txn`
+    walks it in order to materialise the deferred state-row +
+    transition-row + manifest update on confirm. Each step is a plain
+    JSON-serialisable dict so the row is byte-stable across the
+    canonical encoder used by ``JournalRepo.mark_ready``.
+    """
+    steps: list[dict[str, Any]] = []
+
+    if result_kind in ("advance", "terminal") and from_state_pk is not None:
+        # The exiting state — its outputs land on the state-entry row,
+        # the run's last_update_at bumps, and a ``state_exited`` event
+        # is emitted by the replay so subscribers see the same shape
+        # they did under single-phase commit.
+        steps.append(
+            {
+                "op": "mark_state_exited",
+                "state_pk": from_state_pk,
+                "outputs": dict(outputs),
+                "state_id": current_state_id,
+            }
+        )
+
+    if result_kind == "advance":
+        steps.append(
+            {
+                "op": "record_transition",
+                "from_state_pk": from_state_pk,
+                "to_state_id": next_state_id or "",
+                "kind": winning_kind or "always",
+                "predicate": winning_predicate,
+                "predicate_result": winning_predicate_result,
+            }
+        )
+        steps.append(
+            {
+                "op": "persist_state_entry",
+                "state_id": next_state_id or "",
+                "inputs": dict(next_inputs or {}),
+            }
+        )
+
+    if result_kind == "loop_continue":
+        # The state-entry row stays open across iterations; nothing to
+        # mark exited. We still stage a no-op step so replay produces a
+        # deterministic event trail.
+        steps.append(
+            {
+                "op": "loop_continue",
+                "state_id": current_state_id,
+                "iteration_n": iteration_n,
+            }
+        )
+
+    if result_kind == "terminal":
+        steps.append(
+            {
+                "op": "complete_run",
+                "verdict": (str(verdict) if verdict is not None else None),
+            }
+        )
+
+    # Carry the env-merged-with-outputs snapshot so confirm can rebuild
+    # the next brief without re-running the engine pipeline. The shape
+    # is canonical-JSON-friendly because every value is already a
+    # Python primitive (env / outputs are dicts of JSON-able values by
+    # contract).
+    steps.append(
+        {
+            "op": "_meta",
+            "spec_id": spec_id,
+            "run_id": run_id,
+            "result_kind": result_kind,
+            "current_state_id": current_state_id,
+            "next_state_id": next_state_id,
+            "env_after": {**env, **outputs},
+        }
+    )
+
+    return steps
+
+
+def _replay_journal_txn(
+    project: Project,
+    *,
+    spec: FsmSpec,
+    run_id: str,
+    producer_id: str,
+    staged_writes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Apply the staged writes against the substrate and emit lifecycle events.
+
+    Returns a small dict carrying the names the caller needs for the
+    confirm response: ``next_state_id`` (if any), ``next_brief`` (if
+    any), ``result_kind`` (so the caller can branch on terminal /
+    advance / loop_continue).
+    """
+    # Pull the meta envelope first — we need ``result_kind`` /
+    # ``next_state_id`` before we walk the ops so the replay can keep
+    # the right invariants (e.g. terminal must NOT persist a next
+    # state-entry).
+    meta: dict[str, Any] = next(
+        (step for step in staged_writes if step.get("op") == "_meta"), {}
+    )
+    result_kind: str = str(meta.get("result_kind", ""))
+    next_state_id: str | None = meta.get("next_state_id")
+    current_state_id: str = str(meta.get("current_state_id", ""))
+    env_after: dict[str, Any] = dict(meta.get("env_after") or {})
+
+    next_state_entry_pk: str | None = None
+
+    for step in staged_writes:
+        op = step.get("op")
+        if op == "mark_state_exited":
+            state_pk = str(step["state_pk"])
+            _record_state_exit(
+                project,
+                run_id=run_id,
+                state_pk=state_pk,
+                outputs=dict(step.get("outputs") or {}),
+                producer_id=producer_id,
+            )
+        elif op == "record_transition":
+            from_pk = step.get("from_state_pk")
+            if from_pk is None:
+                continue
+            _record_transition(
+                project,
+                run_id=run_id,
+                from_state_pk=str(from_pk),
+                to_state_id=str(step.get("to_state_id") or ""),
+                kind=str(step.get("kind") or "always"),
+                predicate=step.get("predicate"),
+                predicate_result=step.get("predicate_result"),
+                producer_id=producer_id,
+            )
+        elif op == "persist_state_entry":
+            next_state_entry_pk = _persist_state_entry(
+                project,
+                run_id=run_id,
+                state_id=str(step.get("state_id") or ""),
+                inputs=dict(step.get("inputs") or {}),
+                producer_id=producer_id,
+            )
+        elif op == "complete_run":
+            now = _iso_now_ms()
+            verdict = step.get("verdict")
+            with project.session_factory() as session, session.begin():
+                project.runs.update_status(
+                    session,
+                    run_id=run_id,
+                    status="completed",
+                    ended_at=now,
+                    verdict=verdict,
+                )
+                project.events.emit(
+                    session,
+                    producer_id=producer_id,
+                    kind=EventKind.run_completed.value,
+                    payload={
+                        "run_id": run_id,
+                        "verdict": verdict,
+                        "ended_at": now,
+                    },
+                    run_id=run_id,
+                )
+        elif op == "loop_continue":
+            # No state-row mutation; loop replay is a no-op as far as
+            # the substrate is concerned. The iteration's brief is
+            # rebuilt below from spec + env_after.
+            continue
+        # ``_meta`` is consumed up front; anything unknown is ignored
+        # so a forward-compatible producer can stage richer payloads
+        # without breaking older replayers.
+
+    next_brief: Brief | None = None
+    if result_kind == "advance" and next_state_id:
+        next_state_obj = spec.get_state(next_state_id)
+        next_brief = build_brief(
+            spec,
+            next_state_obj,
+            env=env_after,
+            run_id=uuid.UUID(run_id),
+        )
+    elif result_kind == "loop_continue":
+        # The loop body's next brief is already in the CommitResult
+        # held by the worker; we still rebuild it here so confirm can
+        # echo it back uniformly.
+        loop_state = spec.get_state(current_state_id)
+        iter_n = meta.get("iteration_n")
+        next_brief = build_brief(
+            spec,
+            loop_state,
+            env=env_after,
+            run_id=uuid.UUID(run_id),
+            iteration_n=iter_n if isinstance(iter_n, int) else None,
+        )
+
+    return {
+        "result_kind": result_kind,
+        "next_state_id": next_state_id,
+        "next_brief": next_brief,
+        "next_state_entry_pk": next_state_entry_pk,
+    }
+
+
+def _manifest_for_run(project: Project, run_id: str) -> dict[str, Any] | None:
+    """Return a JSON-able manifest snapshot for ``run_id`` (or ``None``)."""
+    run = project.get_run(run_id)
+    if run is None:
+        return None
+    return run.model_dump(mode="json")
+
+
 @mcp.tool(
     name="fsm.commit_outputs",
     description=(
-        "Commit worker outputs for the run's current state. Drives the pure "
-        "engine to validate, decide loop continuation, run post-validations, "
-        "and resolve the outgoing transition. Persists the resulting state "
-        "transition (W4 plumbing; W12 wraps this with two-phase commit)."
+        "Commit worker outputs for the run's current state. W12 two-phase: "
+        "drives the engine to validate + decide loop/transition/terminal, "
+        "runs the verifier panel when the state declares one, stages the "
+        "resulting writes in a journal_txn marked ready_to_finalise, and "
+        "returns a single-use CommitToken. The client must call "
+        "fsm.confirm_commit with the token to actually advance the run."
     ),
 )
 @drain_aware
 def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError:
-    """Implement ``fsm.commit_outputs`` — single-phase advance for W4.
+    """Implement ``fsm.commit_outputs`` — W12 two-phase commit + verifier.
 
-    Persistence rules applied here:
-    * ``advanced``: exit the current state, record the transition, enter
-      the next state, return the next brief.
-    * ``loop_continued``: leave the current state-entry row alone, return
-      the iteration's brief (no exit yet).
-    * ``terminal``: exit the current state, update the run to
-      ``completed`` with verdict, emit ``run_completed``.
-    * ``fault``: leave the current state-entry row alone, emit
-      ``validation_failed`` so the audit trail captures the diagnostic.
+    Flow:
 
-    Returns a :class:`CommitResult` discriminated on ``kind``.
+    1. Resolve the run + spec; run the layer-9 spec-hash lock.
+    2. Materialise the env + run the layer-5 commit cosignature check.
+    3. Drive the pure engine via :func:`engine_advance`.
+    4. On fault: emit ``validation_failed``, return ``kind="fault"`` (no
+       token).
+    5. On non-fault: if the state declares a ``verifier``, run the
+       verifier panel; on reject return ``verifier_rejected`` (no
+       token); on pass emit ``verifier_passed``.
+    6. Persist any verified cosignature (layer 5 audit row + event).
+    7. Stage the deferred writes in a ``journal_txn`` row marked
+       ``ready_to_finalise`` and mint a :class:`CommitToken` bound to
+       ``(run_id, current_state, expected_next_state)`` with the
+       module-default TTL.
+    8. Return :class:`CommitResult` carrying the brief, token, and
+       ``expected_next_state``. The state-entry / transition / manifest
+       updates land on :func:`fsm_confirm_commit`.
     """
     try:
         project = get_project()
@@ -727,17 +1262,38 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
                 run_id=run_id_str,
             )
 
-        spec = _load_fsm_spec(project, run.fsm_spec_id)
-        if spec is None:
+        # Load the registered spec row directly so we have both
+        # ``project_id`` / ``slug`` (for the W12 lock check) and the
+        # canonical JSON definition (to rebuild the FsmSpec the engine
+        # operates against). The run stays bound to the *original*
+        # spec version for FSM semantics; the lock check is what
+        # surfaces the drift to the operator.
+        with project.session_factory() as session:
+            registered = project.specs.get(session, run.fsm_spec_id)
+        if registered is None:
             return as_error(
                 "spec_not_found",
                 detail=f"run references missing spec {run.fsm_spec_id!r}",
                 spec_id=run.fsm_spec_id,
             )
+        from ctxr.fsm.core import spec as _spec_module  # noqa: F401
+        spec = FsmSpec.model_validate(registered.definition)
+
+        # W12 layer-9: spec-hash lock. Compare the run's snapshot hash
+        # against the *latest* registered version under the same slug
+        # — re-registering a new shape under the same name must trip
+        # the lock even when the run still references the original
+        # row's PK.
+        current_hash = _current_spec_hash_for_run(project, registered)
+        if run.fsm_spec_hash != current_hash:
+            return _spec_hash_lock_error(
+                run_hash=run.fsm_spec_hash,
+                current_hash=current_hash,
+            )
 
         current_state_id = _current_state_id(run, spec)
         try:
-            spec.get_state(current_state_id)
+            current_state = spec.get_state(current_state_id)
         except KeyError:
             return as_error(
                 "invalid_state",
@@ -748,7 +1304,82 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
                 state=current_state_id,
             )
 
+        # Materialise the run env *before* the cosignature check —
+        # signature verification hashes inputs (= env merged with the
+        # run's seed args) so we need the env in hand to call
+        # CommitSignature.compute.
         env = _materialise_env(project, run)
+
+        # W12 layer-5: commit cosignature. Triggered when the env-var
+        # opts the server into strict mode, or when the state itself
+        # declares allowed_tools / a verifier. The producer_id we need
+        # for the verified/mismatched events is the same engine producer
+        # the rest of this body uses; mint it up front so the early
+        # error branches can attribute their events correctly.
+        producer_id = _ensure_engine_producer(project)
+        signature_required = _cosignature_required(current_state)
+        signature_verified = False
+        signature_envelope: CommitSignature | None = None
+
+        if input.signature is not None:
+            # Verification path. Both brief_id and session_id MUST be
+            # supplied so the hash inputs are unambiguous; reject up
+            # front rather than silently using placeholder zeros that
+            # could never match a real worker-side compute.
+            if input.brief_id is None or input.session_id is None:
+                return as_error(
+                    "signature_required",
+                    detail=(
+                        "brief_id and session_id are required when a "
+                        "signature is supplied"
+                    ),
+                )
+            signature_envelope = CommitSignature.compute(
+                brief_id=input.brief_id,
+                inputs=dict(env),
+                outputs=dict(input.outputs),
+                session_id=input.session_id,
+            )
+            if signature_envelope.signature != input.signature:
+                # Emit the mismatch event for the drift aggregator
+                # before returning so the audit trail captures the
+                # rejection regardless of how the caller handles the
+                # error envelope.
+                with project.session_factory() as session, session.begin():
+                    project.events.emit(
+                        session,
+                        producer_id=producer_id,
+                        kind=EventKind.commit_signature_mismatch.value,
+                        payload={
+                            "run_id": run.id,
+                            "state": current_state_id,
+                            "brief_id": str(input.brief_id),
+                            "expected": signature_envelope.signature,
+                            "got": input.signature,
+                        },
+                        run_id=run.id,
+                    )
+                return as_error(
+                    "signature_mismatch",
+                    detail="commit signature does not match expected value",
+                    expected=signature_envelope.signature,
+                    got=input.signature,
+                )
+            signature_verified = True
+        elif signature_required:
+            # Required-but-missing path. We do NOT emit a drift signal
+            # here yet — the call has not produced any outputs to bind,
+            # so there is nothing to redact / persist; the caller is
+            # expected to retry with the signature attached.
+            return as_error(
+                "signature_required",
+                detail=(
+                    "this state requires a commit signature "
+                    "(allowed_tools / verifier / CTXR_FSM_REQUIRE_COSIGNATURE=1)"
+                ),
+                state=current_state_id,
+            )
+
         ctx = RunCtx(
             run_id=uuid.UUID(run.id),
             fsm_id=spec.id,
@@ -757,13 +1388,13 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
         )
 
         result = engine_advance(spec, ctx, dict(input.outputs))
-        producer_id = _ensure_engine_producer(project)
         from_pk = _current_state_pk(project, run.id, current_state_id)
 
         if result.kind == "fault":
             # Audit-trail the failure so subscribers see it on the bus;
-            # do NOT mark the state exited — the worker is expected to
-            # retry or the operator to intervene.
+            # do NOT mark the state exited, mint a token, or stage a
+            # journal txn — the worker is expected to retry or the
+            # operator to intervene.
             with project.session_factory() as session, session.begin():
                 project.events.emit(
                     session,
@@ -789,90 +1420,168 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
                 post_validations=list(result.post_validations),
             )
 
+        # ── W12 layer-3: adversarial verifier panel ──────────────────
+        # Runs AFTER engine.advance produces a non-fault outcome but
+        # BEFORE token issuance. A rejected panel surfaces as
+        # ``verifier_rejected`` and does NOT stage a journal txn or mint
+        # a token — the run sits on the current state until the worker
+        # retries with a passing payload.
+        if current_state.verifier is not None:
+            # ``result.brief`` for advance/loop_continue is the *next*
+            # brief; we want the brief the worker just committed
+            # against. Rebuild it from the current state + env.
+            iter_for_brief = (
+                getattr(result, "iteration_n", None)
+                if result.kind == "loop_continue"
+                else None
+            )
+            current_brief = build_brief(
+                spec,
+                current_state,
+                env=env,
+                run_id=uuid.UUID(run.id),
+                iteration_n=iter_for_brief,
+            )
+            verifier_outcome: VerifierOutcome = run_verifier(
+                current_state.verifier, current_brief, dict(input.outputs)
+            )
+
+            with project.session_factory() as session, session.begin():
+                project.events.emit(
+                    session,
+                    producer_id=producer_id,
+                    kind=(
+                        EventKind.verifier_passed.value
+                        if verifier_outcome.verdict == "passed"
+                        else EventKind.verifier_rejected.value
+                    ),
+                    payload={
+                        "run_id": run.id,
+                        "state": current_state_id,
+                        "verdict": verifier_outcome.verdict,
+                        "passed_count": verifier_outcome.passed_count,
+                        "rejected_count": verifier_outcome.rejected_count,
+                        "majority_threshold": verifier_outcome.majority_threshold,
+                        "parallel_count": verifier_outcome.parallel_count,
+                        "votes": [
+                            vote.model_dump(mode="json")
+                            for vote in verifier_outcome.votes
+                        ],
+                    },
+                    run_id=run.id,
+                )
+
+            if verifier_outcome.verdict == "rejected":
+                return as_error(
+                    "verifier_rejected",
+                    detail="verifier panel rejected the worker outputs",
+                    state=current_state_id,
+                    verdicts=[
+                        vote.model_dump(mode="json")
+                        for vote in verifier_outcome.votes
+                    ],
+                    reasons=[vote.reason for vote in verifier_outcome.votes],
+                    passed_count=verifier_outcome.passed_count,
+                    rejected_count=verifier_outcome.rejected_count,
+                    majority_threshold=verifier_outcome.majority_threshold,
+                )
+
+        # Persist any verified cosignature now — it binds the brief +
+        # outputs at commit time, independent of whether the journal
+        # txn is later finalised by confirm_commit. The audit trail
+        # captures "the worker signed this commit" even if the operator
+        # never confirms (in which case the staged writes are simply
+        # discarded at reaper time).
+        if signature_verified and signature_envelope is not None and from_pk is not None:
+            _record_verified_signature(
+                project,
+                run_id=run.id,
+                state_pk=from_pk,
+                state_id=current_state_id,
+                iteration_n=getattr(result, "iteration_n", None),
+                envelope=signature_envelope,
+                producer_id=producer_id,
+            )
+
+        # ── Stage writes + mint token (deferred to confirm_commit) ──
         if result.kind == "loop_continue":
-            # The loop body wants another iteration. Hand back the next
-            # brief; the state-entry row stays open until the loop
-            # actually terminates.
+            staged = _stage_commit_writes(
+                result_kind="loop_continue",
+                run_id=run.id,
+                spec_id=spec.id,
+                current_state_id=current_state_id,
+                next_state_id=current_state_id,
+                from_state_pk=from_pk,
+                outputs=dict(input.outputs),
+                env=env,
+                iteration_n=result.iteration_n,
+                verdict=None,
+                winning_kind=None,
+                winning_predicate=None,
+                winning_predicate_result=None,
+                next_inputs=None,
+            )
+            token = _open_and_stage_journal(
+                project,
+                run_id=run.id,
+                current_state_id=current_state_id,
+                expected_next_state=current_state_id,
+                staged_writes=staged,
+            )
             return CommitResult(
                 kind="loop_continued",
                 brief=result.brief,
                 iteration_n=result.iteration_n,
+                token=_to_wire_token(token),
+                expected_next_state=current_state_id,
             )
 
         if result.kind == "terminal":
-            # Mark the current state exited with its outputs, flip the
-            # run to ``completed`` with the engine's verdict, emit
-            # ``run_completed``.
-            if from_pk is not None:
-                _record_state_exit(
-                    project,
-                    run_id=run.id,
-                    state_pk=from_pk,
-                    outputs=dict(input.outputs),
-                    producer_id=producer_id,
-                )
-            now = _iso_now_ms()
-            with project.session_factory() as session, session.begin():
-                project.runs.update_status(
-                    session,
-                    run_id=run.id,
-                    status="completed",
-                    ended_at=now,
-                    verdict=str(result.verdict) if result.verdict is not None else None,
-                )
-                project.events.emit(
-                    session,
-                    producer_id=producer_id,
-                    kind=EventKind.run_completed.value,
-                    payload={
-                        "run_id": run.id,
-                        "verdict": result.verdict,
-                        "ended_at": now,
-                    },
-                    run_id=run.id,
-                )
+            staged = _stage_commit_writes(
+                result_kind="terminal",
+                run_id=run.id,
+                spec_id=spec.id,
+                current_state_id=current_state_id,
+                next_state_id=None,
+                from_state_pk=from_pk,
+                outputs=dict(input.outputs),
+                env=env,
+                iteration_n=None,
+                verdict=result.verdict,
+                winning_kind=None,
+                winning_predicate=None,
+                winning_predicate_result=None,
+                next_inputs=None,
+            )
+            # ``expected_next_state`` for a terminal commit is the
+            # sentinel ``"__terminal__"`` — there is no actual next
+            # state, but the confirm-side code needs a non-empty string
+            # to compare against. The token records the same sentinel.
+            terminal_marker = "__terminal__"
+            token = _open_and_stage_journal(
+                project,
+                run_id=run.id,
+                current_state_id=current_state_id,
+                expected_next_state=terminal_marker,
+                staged_writes=staged,
+            )
             return CommitResult(
                 kind="terminal",
                 verdict=result.verdict,
                 evaluations=list(result.evaluations),
+                token=_to_wire_token(token),
+                expected_next_state=terminal_marker,
             )
 
         # result.kind == "advance"
         # Find the winning transition's guard kind / predicate text from
-        # the evaluations trace so the transitions row is faithful.
+        # the evaluations trace so the staged transition row is faithful.
         winning_eval: TransitionEvaluation | None = None
         for ev in result.evaluations:
             if ev.result and ev.to == result.next_state:
                 winning_eval = ev
                 break
 
-        if from_pk is not None:
-            _record_state_exit(
-                project,
-                run_id=run.id,
-                state_pk=from_pk,
-                outputs=dict(input.outputs),
-                producer_id=producer_id,
-            )
-            _record_transition(
-                project,
-                run_id=run.id,
-                from_state_pk=from_pk,
-                to_state_id=result.next_state or "",
-                kind=(winning_eval.kind if winning_eval else "always") or "always",
-                predicate=(winning_eval.expression if winning_eval else None),
-                # ``always`` / ``otherwise`` carry no predicate_result;
-                # everything else gets the boolean evaluation outcome.
-                predicate_result=(
-                    None
-                    if winning_eval is None
-                    or winning_eval.kind in {"always", "otherwise"}
-                    else bool(winning_eval.result)
-                ),
-                producer_id=producer_id,
-            )
-
-        # Enter the next state and bump runs.current_state.
         next_state_id = result.next_state or ""
         next_state = spec.get_state(next_state_id)
         next_worker = next_state.worker or (
@@ -882,19 +1591,44 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
         next_inputs: dict[str, Any] = {}
         if next_worker is not None:
             next_inputs = {name: merged_env.get(name) for name in next_worker.inputs}
-        _persist_state_entry(
+
+        staged = _stage_commit_writes(
+            result_kind="advance",
+            run_id=run.id,
+            spec_id=spec.id,
+            current_state_id=current_state_id,
+            next_state_id=next_state_id,
+            from_state_pk=from_pk,
+            outputs=dict(input.outputs),
+            env=env,
+            iteration_n=None,
+            verdict=None,
+            winning_kind=(winning_eval.kind if winning_eval else "always") or "always",
+            winning_predicate=(
+                winning_eval.expression if winning_eval else None
+            ),
+            winning_predicate_result=(
+                None
+                if winning_eval is None
+                or winning_eval.kind in {"always", "otherwise"}
+                else bool(winning_eval.result)
+            ),
+            next_inputs=next_inputs,
+        )
+        token = _open_and_stage_journal(
             project,
             run_id=run.id,
-            state_id=next_state_id,
-            inputs=next_inputs,
-            producer_id=producer_id,
+            current_state_id=current_state_id,
+            expected_next_state=next_state_id,
+            staged_writes=staged,
         )
-
         return CommitResult(
             kind="advanced",
             brief=result.brief,
             next_state=result.next_state,
             evaluations=list(result.evaluations),
+            token=_to_wire_token(token),
+            expected_next_state=next_state_id,
         )
     except KeyboardInterrupt:
         raise
@@ -903,34 +1637,256 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
         return as_error("internal_error", detail=str(exc))
 
 
+def _open_and_stage_journal(
+    project: Project,
+    *,
+    run_id: str,
+    current_state_id: str,
+    expected_next_state: str,
+    staged_writes: list[dict[str, Any]],
+) -> Any:
+    """Open a journal_txn, mark it ready_to_finalise, mint + persist a token.
+
+    Returns the persisted :class:`CommitTokenRecord` (with the run-side
+    UUID + expiry already populated). All three writes happen inside a
+    single ``session.begin()`` so a crash between any two of them
+    leaves the substrate consistent — either the operator sees a
+    token + matching journal row, or neither.
+    """
+    with project.session_factory() as session, session.begin():
+        txn = project.journal.open(session, run_id=run_id)
+        # Inject the journal txn id into the meta step so confirm can
+        # cross-reference and finalise the exact row.
+        enriched_writes = list(staged_writes)
+        for step in enriched_writes:
+            if step.get("op") == "_meta":
+                step["journal_txn_id"] = txn.id
+        project.journal.mark_ready(
+            session, txn_id=txn.id, staged_writes=enriched_writes
+        )
+
+        token_record = project.commit_tokens.issue(
+            session,
+            run_id=run_id,
+            state_id=current_state_id,
+            expected_next_state=expected_next_state,
+            ttl_seconds=_COMMIT_TOKEN_TTL_SECONDS,
+        )
+
+        # Emit the commit_token_issued event so subscribers see the
+        # pending hand-off. Producer is the engine itself; using
+        # ``project.events.emit`` keeps the per-run seq monotonic.
+        producer = project.producers.upsert(
+            session, kind=_ENGINE_PRODUCER_KIND, name=_ENGINE_PRODUCER_NAME
+        )
+        project.events.emit(
+            session,
+            producer_id=producer.id,
+            kind=EventKind.commit_token_issued.value,
+            payload={
+                "run_id": run_id,
+                "token": token_record.token,
+                "state_id": current_state_id,
+                "expected_next_state": expected_next_state,
+                "expires_at": token_record.expires_at,
+                "journal_txn_id": txn.id,
+            },
+            run_id=run_id,
+        )
+
+    return token_record
+
+
+def _to_wire_token(token_record: Any) -> CommitToken:
+    """Project a persistence-side :class:`CommitTokenRecord` to the wire shape.
+
+    The wire :class:`CommitToken` carries the same identifiers but uses
+    ``uuid.UUID`` / ``datetime`` types instead of the storage-friendly
+    strings. We do the conversion in one place so the call sites stay
+    declarative.
+    """
+    expires_at = token_record.expires_at
+    if isinstance(expires_at, str):
+        # Persisted as the canonical ISO/Z form; tolerate the trailing Z.
+        iso = expires_at[:-1] + "+00:00" if expires_at.endswith("Z") else expires_at
+        expires_at_dt = datetime.fromisoformat(iso)
+    else:
+        expires_at_dt = expires_at
+    return CommitToken(
+        token=uuid.UUID(token_record.token),
+        run_id=uuid.UUID(token_record.run_id),
+        state_id=token_record.state_id,
+        expected_next_state=token_record.expected_next_state,
+        expires_at=expires_at_dt,
+    )
+
+
 @mcp.tool(
     name="fsm.confirm_commit",
     description=(
-        "Confirm a previously-issued commit token. W4 stub: always returns "
-        "confirmed=True. W12 wires the real two-phase commit semantics."
+        "Confirm a previously-issued CommitToken: validate, consume, and "
+        "replay the staged journal_txn so the run actually advances. "
+        "Returns the new manifest and the next brief (if any)."
     ),
 )
 @drain_aware
 def fsm_confirm_commit(input: ConfirmCommitInput) -> ConfirmResult | McpToolError:
-    """Implement ``fsm.confirm_commit`` — W4 stub for the W12 surface.
+    """Implement ``fsm.confirm_commit`` — finalise a two-phase commit (W12).
 
-    The tool exists so MCP clients can already wire the two-call commit
-    flow today; the actual token-issue / token-consume path lands in
-    W12. We accept any token + expected_next_state and return
-    ``confirmed=True`` plus a note documenting the deferral.
+    Steps:
+    1. Consume the token (refuse if missing / consumed / expired /
+       state-mismatch).
+    2. Locate the matching ``journal_txn`` row (ready_to_finalise).
+    3. Replay the staged writes against the substrate.
+    4. Mark the journal txn finalised.
+    5. Emit ``commit_token_consumed``.
+    6. Return :class:`ConfirmResult` with the next brief (if any) and a
+       fresh manifest snapshot.
     """
     try:
-        # Touch the args so a linter cannot flag them as unused; the
-        # tool's contract is "accept these and return confirmed=True"
-        # in W4, but we still validate that the inputs Pydantic-parsed.
-        _ = input.token
-        _ = input.expected_next_state
+        project = get_project()
+        token_str = str(input.token)
+
+        # 1. Validate + consume the token atomically. ``consume``
+        #    returns ok=False with a discriminator slug we surface in
+        #    the error envelope so the client can branch on it.
+        with project.session_factory() as session, session.begin():
+            consume_result = project.commit_tokens.consume(
+                session,
+                token=token_str,
+                expected_next_state=input.expected_next_state,
+            )
+        if not consume_result.ok:
+            # An expired token is operationally interesting — a drift
+            # aggregator wants to know that a worker tried to finalise
+            # too late so we surface a ``commit_token_expired`` event on
+            # the bus, attributed to the token's run, before returning
+            # the rejection envelope.
+            if (
+                consume_result.reason == "expired"
+                and consume_result.token is not None
+            ):
+                expired_run_id = consume_result.token.run_id
+                producer_id = _ensure_engine_producer(project)
+                with project.session_factory() as session, session.begin():
+                    project.events.emit(
+                        session,
+                        producer_id=producer_id,
+                        kind=EventKind.commit_token_expired.value,
+                        payload={
+                            "run_id": expired_run_id,
+                            "token": token_str,
+                            "expected_next_state": (
+                                consume_result.token.expected_next_state
+                            ),
+                            "state_id": consume_result.token.state_id,
+                        },
+                        run_id=expired_run_id,
+                    )
+            return as_error(
+                "commit_token_invalid",
+                detail=(
+                    f"commit token cannot be consumed: {consume_result.reason!r}"
+                ),
+                reason=consume_result.reason,
+                token=token_str,
+            )
+
+        # The consumed token carries the run_id we need to look up the
+        # matching journal_txn and the spec for replay.
+        consumed_token = consume_result.token
+        assert consumed_token is not None  # ok=True path always populates token
+        run_id = consumed_token.run_id
+
+        run = project.get_run(run_id)
+        if run is None:
+            return as_error(
+                "run_not_found",
+                detail=f"token references missing run {run_id!r}",
+                run_id=run_id,
+            )
+
+        # Reload the spec so we can rebuild the next brief during replay.
+        with project.session_factory() as session:
+            registered = project.specs.get(session, run.fsm_spec_id)
+        if registered is None:
+            return as_error(
+                "spec_not_found",
+                detail=f"run references missing spec {run.fsm_spec_id!r}",
+                spec_id=run.fsm_spec_id,
+            )
+        from ctxr.fsm.core import spec as _spec_module  # noqa: F401
+        spec = FsmSpec.model_validate(registered.definition)
+
+        # 2. Find the open journal_txn. ``inspect`` returns the newest
+        #    unfinalised row; under normal flow this is the one our
+        #    token was minted alongside.
+        with project.session_factory() as session:
+            txn = project.journal.inspect(session, run_id=run_id)
+        if txn is None or txn.status != "ready_to_finalise":
+            return as_error(
+                "journal_not_ready",
+                detail=(
+                    "no ready_to_finalise journal_txn found for the token's run"
+                ),
+                run_id=run_id,
+                journal_status=(txn.status if txn is not None else None),
+            )
+
+        producer_id = _ensure_engine_producer(project)
+
+        # 3. Replay the staged writes.
+        replay = _replay_journal_txn(
+            project,
+            spec=spec,
+            run_id=run_id,
+            producer_id=producer_id,
+            staged_writes=list(txn.staged_writes),
+        )
+
+        # 4. Mark the journal finalised + emit consumed/finalised events.
+        with project.session_factory() as session, session.begin():
+            project.journal.finalise(session, txn_id=txn.id)
+            project.events.emit(
+                session,
+                producer_id=producer_id,
+                kind=EventKind.journal_finalised.value,
+                payload={
+                    "run_id": run_id,
+                    "journal_txn_id": txn.id,
+                    "result_kind": replay.get("result_kind"),
+                },
+                run_id=run_id,
+            )
+            project.events.emit(
+                session,
+                producer_id=producer_id,
+                kind=EventKind.commit_token_consumed.value,
+                payload={
+                    "run_id": run_id,
+                    "token": consumed_token.token,
+                    "expected_next_state": consumed_token.expected_next_state,
+                },
+                run_id=run_id,
+            )
+
+        # W12 layer-4: keep the active-run marker in sync with the new
+        # current state. Terminal commits clear the marker so any
+        # subsequent tool calls are unconstrained (no run is active).
+        result_kind = replay.get("result_kind")
+        if result_kind == "terminal":
+            _publish_active_run_marker(run_id=None, spec=None, state_id=None)
+        else:
+            next_state_id = replay.get("next_state_id") or consumed_token.state_id
+            _publish_active_run_marker(
+                run_id=run_id, spec=spec, state_id=next_state_id
+            )
+
+        manifest = _manifest_for_run(project, run_id)
         return ConfirmResult(
             confirmed=True,
-            note=(
-                "two-phase commit semantics are W12; commit_outputs is "
-                "currently single-phase and confirm_commit is a stub."
-            ),
+            next_brief=replay.get("next_brief"),
+            manifest=manifest,
         )
     except KeyboardInterrupt:
         raise
@@ -1067,6 +2023,10 @@ def fsm_abort_run(input: AbortRunInput) -> AbortResult | McpToolError:
                 },
                 run_id=run.id,
             )
+
+        # W12 layer-4: clear the active-run marker so a peer tool-use
+        # hook stops constraining tool calls now that the run is over.
+        _publish_active_run_marker(run_id=None, spec=None, state_id=None)
 
         return AbortResult(
             run_id=uuid.UUID(run.id),
