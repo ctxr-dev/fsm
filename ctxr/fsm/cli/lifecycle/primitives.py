@@ -64,6 +64,7 @@ __all__ = [
     "remember_active_mcp_file",
     "remember_port",
     "remove_active_mcp_file",
+    "sharded_log_path",
     "write_active_run_marker",
     "write_pid_file",
 ]
@@ -123,6 +124,72 @@ def pid_file_for(name: str, *, project_root: Path) -> Path:
     ``.ctxr-fsm/pids/<name>.pid`` join themselves.
     """
     return _pids_dir(project_root) / f"{name}.pid"
+
+
+def sharded_log_path(
+    category: str,
+    *,
+    project_root: Path,
+    when: datetime | None = None,
+    pid: int | None = None,
+    extension: str = "log",
+) -> Path:
+    """Return the canonical date-sharded path for an accumulating log file.
+
+    Layout: ``<project_root>/.ctxr-fsm/logs/<category>/YYYY/MM/DD/<category>-<HHMMSS>-<pid>.<ext>``
+
+    Why nested: every directory that ACCUMULATES files over time would
+    otherwise grow without bound into a single flat folder, hitting the
+    classic FS bottleneck on directory enumeration (ext4 / APFS / NTFS
+    degrade past ~10k to 100k entries, and even `ls` / tab-completion
+    crawl for shells). The YYYY/MM/DD prefix caps any single leaf at
+    one day's worth of files for the same category.
+
+    Use cases:
+
+    * Supervisor stdout/stderr capture (``category="supervisor"``).
+    * Future per-subsystem operator logs (``category="mcp"`` etc.).
+    * Audit-trail dumps, telemetry exports, anything else that streams
+      files into ``.ctxr-fsm/`` over the project's lifetime.
+
+    Parameters
+    ----------
+    category:
+        Snake_case slug naming the log stream. Becomes both the top-level
+        subdir (``logs/<category>/...``) and the leading token of the
+        filename so a quick ``grep`` survives a casual operator's
+        ``cat .ctxr-fsm/logs/**/*.log`` invocation.
+    project_root:
+        The project root; the standard ``.ctxr-fsm/`` state dir lives
+        directly under it.
+    when:
+        UTC ``datetime`` that picks the date shard + the HHMMSS suffix.
+        Defaults to ``datetime.now(tz=UTC)`` so callers in the common
+        case can omit it.
+    pid:
+        Optional process id to disambiguate concurrent log files in the
+        same wall-clock second (e.g. two supervisors racing on startup).
+        When omitted, the suffix is just ``<HHMMSS>``.
+    extension:
+        File extension WITHOUT the leading dot. Defaults to ``"log"``.
+
+    Returns
+    -------
+    Path
+        The full resolved path with parent directories created (a
+        following ``open(path, "ab")`` finds the path ready). The file
+        itself is NOT created; the caller writes.
+
+    Convention: every caller that needs a log file MUST go through this
+    helper. Hand-rolling ``logs/<filename>`` is a portability and
+    scale bug — see the workspace memory lesson on flat-folder pitfalls.
+    """
+    now = when or datetime.now(tz=UTC)
+    date_dir = _state_dir(project_root) / "logs" / category / f"{now:%Y}" / f"{now:%m}" / f"{now:%d}"
+    date_dir.mkdir(parents=True, exist_ok=True)
+    pid_suffix = f"-{pid}" if pid is not None else ""
+    filename = f"{category}-{now:%H%M%S}{pid_suffix}.{extension}"
+    return date_dir / filename
 
 
 def _atomic_write_text(path: Path, text: str) -> None:

@@ -42,6 +42,7 @@ status.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -67,6 +68,7 @@ from ctxr.fsm.cli.lifecycle.primitives import (
     pid_is_alive,
     read_active_mcp_file,
     read_pid_file,
+    sharded_log_path,
 )
 
 __all__ = ["ensure", "run_ensure"]
@@ -214,16 +216,19 @@ def _spawn_supervisor_detached(
 
     The supervisor runs in a new session (``start_new_session=True``)
     so a SIGINT in the ensuring shell doesn't take it down. stdout +
-    stderr are redirected to a per-day log file under
-    ``<project_root>/.ctxr-fsm/logs/`` so a later operator can
-    inspect what happened during the cold start.
+    stderr are redirected to a date-sharded log file under
+    ``<project_root>/.ctxr-fsm/logs/supervisor/YYYY/MM/DD/`` (see
+    :func:`sharded_log_path` for the convention) so a later operator
+    can inspect what happened during the cold start AND so the logs
+    directory doesn't grow into a flat accumulation that bottlenecks
+    the filesystem over months of dev sessions.
 
     Returns the spawned pid (for the ensure summary; ownership is
     transferred to the OS — the parent process is free to exit).
     """
-    logs_dir = project_root / ".ctxr-fsm" / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    log_path = logs_dir / f"supervisor-{time.strftime('%Y%m%d')}.log"
+    log_path = sharded_log_path(
+        "supervisor", project_root=project_root, pid=os.getpid()
+    )
     log_fp = open(log_path, "ab", buffering=0)  # noqa: SIM115
     cmd = [
         sys.executable or "python3",
