@@ -69,6 +69,7 @@ from ctxr.fsm import __version__ as _PACKAGE_VERSION  # noqa: N812
 from ctxr.fsm.core.models import EventKind, FsmSpec
 from ctxr.fsm.core.spec import validate_fsm_spec
 from ctxr.fsm.mcp import mcp
+from ctxr.fsm.mcp._drain_decorator import drain_aware
 from ctxr.fsm.mcp._errors import McpToolError, as_error
 from ctxr.fsm.mcp._state import get_project
 from ctxr.fsm.sqlite.models_core import FsmSpecTable, ProjectTable
@@ -263,6 +264,7 @@ def _engine_db_path(engine: Any) -> str:
         "is reachable and current."
     ),
 )
+@drain_aware
 def fsm_healthcheck() -> HealthcheckResult | McpToolError:
     """Probe the live MCP server and return a structured snapshot.
 
@@ -324,6 +326,7 @@ def fsm_healthcheck() -> HealthcheckResult | McpToolError:
         "definition body is intentionally omitted."
     ),
 )
+@drain_aware
 def fsm_list_specs() -> list[SpecSummary] | McpToolError:
     """Enumerate registered specs as trimmed summaries.
 
@@ -398,6 +401,7 @@ def fsm_list_specs() -> list[SpecSummary] | McpToolError:
         "byte-identical re-registrations are idempotent (created=False)."
     ),
 )
+@drain_aware
 def fsm_register_spec(
     definition_json: str,
     project_slug: str = "default",
@@ -501,6 +505,7 @@ def fsm_register_spec(
         "enforcement."
     ),
 )
+@drain_aware
 def fsm_observe_tool_call(
     producer_kind: str,
     producer_name: str,

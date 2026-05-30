@@ -129,9 +129,10 @@ app.command(
 # lands. Moving the bodies out of this file means a later workstream
 # (W5/W6/W7) can flesh them out without touching the top-level wiring
 # at all.
-app.command(name="serve", help="(Stub) long-running orchestrator — ships in W7.")(
-    serve_cmd.serve
-)
+app.command(
+    name="serve",
+    help="Run the unified supervisor (MCP + API + UI in dev mode).",
+)(serve_cmd.serve)
 # ``mcp`` is the W4 entry point — boots the FastMCP server over the
 # selected transport. The help string mentions both transports so
 # operators see the shape on ``ctxr-fsm --help`` without drilling in.

@@ -1,27 +1,35 @@
-"""Tests for the W3 ``ctxr-fsm`` CLI stub commands.
+"""Tests for the ``ctxr-fsm`` CLI subcommand surface.
 
-The ``serve`` / ``mcp`` / ``api`` / ``ui`` subcommands are placeholders
-for later workstreams (W7 / W4 / W5 / W6). Each one must:
+The file is named ``test_cli_stubs`` for historical reasons — it was
+born in W3 when ``serve`` / ``mcp`` / ``api`` / ``ui`` were all
+"deferral" stubs and the only thing worth asserting was the exit code
+and wording of the deferral message. As each workstream (W4 mcp,
+W5 api, W6 ui, W7 serve) replaced its stub with a real implementation,
+the corresponding test block was rewritten in the same shape: drive
+``<subcommand> --help`` through Typer's :class:`CliRunner` to render
+the surface without entering the command body, then assert the
+documented flags are visible.
 
-1. Exit with a non-zero status so wrapping shell scripts that pipe
-   through ``set -e`` fail loudly today rather than silently no-op'ing
-   once the real implementation lands.
-2. Print the documented "lands in W{N}" deferral message on stderr so
-   stdout stays clean for callers that pipe into ``jq`` / similar.
-3. Honour the documented per-command option validation today (``--mode``
-   for ``serve``, ``--transport`` for ``mcp``, ``--port`` bounds for
-   ``api`` / ``ui``) — anything accepted by the stub must also be
-   accepted by the eventual real implementation, so a future change can
-   never break operator scripts pinned against today's surface.
+Why the ``--help`` shape and not the real body
+----------------------------------------------
 
-The tests below lock those guarantees in. They run through Typer's
-``CliRunner`` to exercise the actual argv-parsing path, give each
-invocation an isolated tempdir (the stubs do not actually open the
-project DB — they fail before any IO — but the tempdir scaffolding
-matches the convention used by sibling CLI tests and shields these
-cases from any future change that starts touching the FS), and assert
-on both the exit code and the deferral message wording so any silent
-drift trips a test.
+Every real implementation in this family takes over the process until
+its server returns:
+
+* ``mcp`` enters the FastMCP stdio (or HTTP) loop.
+* ``api`` enters the uvicorn / FastAPI loop.
+* ``ui`` shells out to ``npm install`` + ``npm run dev``.
+* ``serve`` enters the W7 supervisor's task group (which itself
+  spawns and supervises the three above).
+
+Driving any of those from an in-process unit test would block the
+runner; the right place for end-to-end coverage of each boot sequence
+is the per-workstream integration tests (subprocess + wire-level
+client) that live outside this file. What stays here is the
+surface-level contract: registration, option visibility, and Typer's
+own up-front validation (port bounds, mode allowlist, transport
+allowlist), all of which the runner can exercise via ``--help`` or a
+deliberately-invalid argument that trips Typer before the body runs.
 """
 
 from __future__ import annotations
@@ -29,7 +37,6 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-import pytest
 from typer.testing import CliRunner
 
 from ctxr.fsm.cli import app
@@ -48,58 +55,74 @@ runner = CliRunner()
 def _project_db(tmpdir: str) -> Path:
     """Resolve a project-DB path inside the test's tempdir.
 
-    The W3 stubs do not actually open the project DB — they fail before
-    any IO — but constructing this path keeps the test shape aligned
-    with the convention in the brief (``tempfile.TemporaryDirectory()``
-    for the project DB) so the next workstream can extend these tests
-    without restructuring them.
+    None of the commands exercised in this file actually consume the
+    DB path — the assertions either run against ``--help`` (which never
+    touches the FS) or against an invalid flag value that fails Typer
+    validation before the body runs. Constructing this path anyway
+    keeps the test shape aligned with the convention in the brief
+    (``tempfile.TemporaryDirectory()`` for the project DB) so a future
+    addition that does touch the FS can extend these tests without
+    restructuring them.
     """
     return Path(tmpdir) / "fsm.db"
 
 
 # ---------------------------------------------------------------------------
-# ``serve`` — supervisor stub (W7)
+# ``serve`` — unified supervisor (W7, now implemented)
 # ---------------------------------------------------------------------------
+#
+# These tests used to assert on the W3 stub's deferral message. W7
+# replaced the stub with a real boot path that spawns the MCP + API
+# (+ UI in dev mode) children inside an anyio task group and blocks
+# until SIGINT/SIGTERM, so we can no longer ``invoke(app, ["serve"])``
+# from a unit test — that would actually start the supervisor and hang
+# the runner. Instead we exercise the surface via ``--help`` (which
+# the Typer runner can render without entering the command body) and
+# assert that every documented flag (``--mode``, ``--db``) is listed.
+# Real end-to-end coverage of the boot sequence is a W7 integration
+# test that drives the supervisor in a subprocess and confirms the
+# three child URLs come up; that lives outside this stub-shaped file.
 
 
-def test_serve_stub_exits_nonzero_with_deferral_message() -> None:
-    """``ctxr-fsm serve`` must defer to W7 and exit non-zero."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        _project_db(tmpdir)  # reserve a path; stub does not consume it
-        result = runner.invoke(app, ["serve"])
+def test_serve_help_lists_mode_and_db_options() -> None:
+    """``ctxr-fsm serve --help`` documents the W7 flag surface."""
+    result = runner.invoke(app, ["serve", "--help"])
 
-    # Non-zero exit is the loud-failure contract — see module docstring.
-    assert result.exit_code != 0, (
-        f"serve stub must exit non-zero (got {result.exit_code}); "
-        f"stderr={result.stderr!r}"
+    # ``--help`` always exits 0 — anything else means a registration
+    # regression (e.g. the import in cli/__init__.py was dropped).
+    assert result.exit_code == 0, (
+        f"`serve --help` must exit 0 (got {result.exit_code}); "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    # Wording match — runbooks may quote this string verbatim, so any
-    # drift here is a docs-breaking change we want to catch in CI.
-    assert "lands in W7" in result.stderr
-    assert "supervisor" in result.stderr.lower()
+
+    # Each flag must be visible by name so operator scripts and the
+    # docs site can reliably parse the help text. We assert on the
+    # long-form name with the leading double-dash because Typer's
+    # rich help renderer can wrap descriptions but always prints the
+    # flag token verbatim on its own line.
+    assert "--mode" in result.stdout
+    # ``--db`` is shared across every subcommand — also documented here
+    # so callers see the full surface in one screen. Asserting on it
+    # too pins the wiring against an accidental drop of ``DB_OPTION``.
+    assert "--db" in result.stdout
 
 
-def test_serve_stub_accepts_valid_mode_flag() -> None:
-    """A valid ``--mode`` value reaches the stub body (still exits 1)."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        _project_db(tmpdir)
-        result = runner.invoke(app, ["serve", "--mode", "prod"])
+def test_serve_rejects_invalid_mode_flag() -> None:
+    """An out-of-set ``--mode`` value fails the up-front allowlist check.
 
-    # Valid mode -> stub body runs -> deferral + exit 1.
-    assert result.exit_code == 1
-    assert "lands in W7" in result.stderr
-
-
-def test_serve_stub_rejects_invalid_mode_flag() -> None:
-    """An out-of-set ``--mode`` value fails Typer validation (exit 2)."""
+    The ``--mode`` allowlist (``dev``, ``prod``) is enforced inside the
+    Typer shim *before* the supervisor's heavyweight task-group boot
+    runs, so this test can safely invoke the command without ever
+    spawning a child process. ``typer.BadParameter`` renders through
+    Click's usage-error path, which exits with code 2.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         _project_db(tmpdir)
         result = runner.invoke(app, ["serve", "--mode", "staging"])
 
-    # ``typer.BadParameter`` renders through Click's usage error path,
-    # which exits with code 2. We assert on "non-zero, not 1" to pin
-    # the distinction between validation failure (2) and stub deferral
-    # (1) so a future refactor cannot collapse them.
+    # We assert "non-zero, not 1" to pin the distinction between
+    # validation failure (2) and any future stub-style deferral (1)
+    # so a future refactor cannot silently collapse them.
     assert result.exit_code != 0
     assert result.exit_code != 1
 
@@ -317,48 +340,38 @@ def test_ui_rejects_out_of_range_api_port() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Surface-level smoke — all four stubs registered on the top-level app
+# Surface-level smoke — every long-running subcommand is registered
 # ---------------------------------------------------------------------------
+#
+# The W3 parametrised "stubs registered" test is gone — the only stub
+# it ever covered (``serve``) is now a real implementation, leaving an
+# empty parametrize list that pytest would warn about. The per-command
+# registration checks below take its place: each one asserts the
+# subcommand name appears on the top-level help screen alongside a
+# stable, distinctive token from its registered help line.
 
 
-@pytest.mark.parametrize(
-    ("subcommand", "marker"),
-    [
-        # Stub commands carry an explicit "ships in W{N}" marker in
-        # their registered help line. ``mcp`` (W4), ``api`` (W5) and
-        # ``ui`` (W6) are now real implementations, so their top-level
-        # help strings no longer advertise a workstream — see the
-        # dedicated cases below.
-        ("serve", "W7"),
-    ],
-)
-def test_all_stubs_registered_and_visible_in_help(
-    subcommand: str, marker: str
-) -> None:
-    """``--help`` must mention each stub and its target workstream.
+def test_serve_registered_and_visible_in_help() -> None:
+    """The real ``serve`` command must appear on the top-level help screen.
 
-    This is the single test that catches "someone removed the stub
-    registration in ``ctxr/fsm/cli/__init__.py``" — the per-command
-    invocation tests above would still pass via the module-level
-    function, but the top-level help screen would silently lose its
-    advertised surface.
+    Mirrors the per-workstream registration checks below — asserting
+    on the subcommand name plus a stable token from the registered
+    help text pins both the registration and the documented purpose.
     """
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    # ``--help`` lists each subcommand by name; the workstream marker
-    # ships in the per-command help line registered in the app factory.
-    assert subcommand in result.stdout
-    assert marker in result.stdout
+    assert "serve" in result.stdout
+    # "supervisor" is the stable, distinctive token in the registered
+    # help line — unlikely to false-match against any other command's
+    # description.
+    assert "supervisor" in result.stdout.lower()
 
 
 def test_mcp_registered_and_visible_in_help() -> None:
     """The real ``mcp`` command must appear on the top-level help screen.
 
-    Mirrors :func:`test_all_stubs_registered_and_visible_in_help` for
-    the now-implemented W4 command — the parametrised case above can't
-    cover it because ``mcp``'s help line no longer carries a workstream
-    marker. Asserting on the subcommand name plus the word "Protocol"
-    pins both the registration and the documented purpose.
+    Asserting on the subcommand name plus the word "Protocol" pins
+    both the registration and the documented purpose.
     """
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
@@ -372,12 +385,9 @@ def test_mcp_registered_and_visible_in_help() -> None:
 def test_api_registered_and_visible_in_help() -> None:
     """The real ``api`` command must appear on the top-level help screen.
 
-    Mirrors :func:`test_mcp_registered_and_visible_in_help` for the
-    now-implemented W5 command — the parametrised case above can't
-    cover it because ``api``'s help line no longer carries a
-    workstream marker. Asserting on the subcommand name plus a stable
-    token from the registered help text pins both the registration
-    and the documented purpose.
+    Asserting on the subcommand name plus a stable token from the
+    registered help text pins both the registration and the
+    documented purpose.
     """
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
@@ -391,12 +401,9 @@ def test_api_registered_and_visible_in_help() -> None:
 def test_ui_registered_and_visible_in_help() -> None:
     """The real ``ui`` command must appear on the top-level help screen.
 
-    Mirrors :func:`test_api_registered_and_visible_in_help` for the
-    now-implemented W6 command — the parametrised case above can't
-    cover it because ``ui``'s help line no longer carries a
-    workstream marker. Asserting on the subcommand name plus a stable
-    token from the registered help text pins both the registration
-    and the documented purpose.
+    Asserting on the subcommand name plus a stable token from the
+    registered help text pins both the registration and the
+    documented purpose.
     """
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0

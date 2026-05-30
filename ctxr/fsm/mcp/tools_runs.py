@@ -60,6 +60,7 @@ from ctxr.fsm.core.models import (
     TransitionEvaluation,
 )
 from ctxr.fsm.mcp import mcp
+from ctxr.fsm.mcp._drain_decorator import drain_aware
 from ctxr.fsm.mcp._errors import McpToolError, as_error
 from ctxr.fsm.mcp._state import get_project
 from ctxr.fsm.sqlite import Project
@@ -565,6 +566,7 @@ def _journal_to_dict(txn: JournalTxn | None) -> dict[str, Any] | None:
         "against the run."
     ),
 )
+@drain_aware
 def fsm_start_run(input: StartRunInput) -> RunStartedPayload | McpToolError:
     """Implement the ``fsm.start_run`` tool.
 
@@ -642,6 +644,7 @@ def fsm_start_run(input: StartRunInput) -> RunStartedPayload | McpToolError:
         "exit outputs)."
     ),
 )
+@drain_aware
 def fsm_get_brief(input: GetBriefInput) -> Brief | McpToolError:
     """Implement ``fsm.get_brief`` — build the brief for the current state."""
     try:
@@ -696,6 +699,7 @@ def fsm_get_brief(input: GetBriefInput) -> Brief | McpToolError:
         "transition (W4 plumbing; W12 wraps this with two-phase commit)."
     ),
 )
+@drain_aware
 def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError:
     """Implement ``fsm.commit_outputs`` — single-phase advance for W4.
 
@@ -906,6 +910,7 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
         "confirmed=True. W12 wires the real two-phase commit semantics."
     ),
 )
+@drain_aware
 def fsm_confirm_commit(input: ConfirmCommitInput) -> ConfirmResult | McpToolError:
     """Implement ``fsm.confirm_commit`` — W4 stub for the W12 surface.
 
@@ -941,6 +946,7 @@ def fsm_confirm_commit(input: ConfirmCommitInput) -> ConfirmResult | McpToolErro
         "emits run_resumed; engine-driven resume itself comes in W12."
     ),
 )
+@drain_aware
 def fsm_resume_run(input: ResumeRunInput) -> ResumeResult | McpToolError:
     """Implement ``fsm.resume_run`` — mirrors the CLI ``run resume``."""
     try:
@@ -1008,6 +1014,7 @@ def fsm_resume_run(input: ResumeRunInput) -> ResumeResult | McpToolError:
         "in a terminal state (completed / aborted)."
     ),
 )
+@drain_aware
 def fsm_abort_run(input: AbortRunInput) -> AbortResult | McpToolError:
     """Implement ``fsm.abort_run`` — atomic update + run_aborted emit."""
     try:
@@ -1083,6 +1090,7 @@ def fsm_abort_run(input: AbortRunInput) -> AbortResult | McpToolError:
         "full per-run picture."
     ),
 )
+@drain_aware
 def fsm_list_runs(input: ListRunsInput) -> list[RunSummary] | McpToolError:
     """Implement ``fsm.list_runs`` — mirrors the CLI ``runs ls`` shortcuts.
 
@@ -1122,6 +1130,7 @@ def fsm_list_runs(input: ListRunsInput) -> list[RunSummary] | McpToolError:
         "events, journal, locks."
     ),
 )
+@drain_aware
 def fsm_get_run(input: GetRunInput) -> RunDetail | McpToolError:
     """Implement ``fsm.get_run`` — assemble the full run picture."""
     try:

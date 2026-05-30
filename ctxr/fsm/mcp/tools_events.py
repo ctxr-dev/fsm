@@ -70,6 +70,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from ctxr.fsm.mcp import mcp
+from ctxr.fsm.mcp._drain_decorator import drain_aware
 from ctxr.fsm.mcp._errors import McpToolError, as_error
 from ctxr.fsm.mcp._state import get_project
 from ctxr.fsm.sqlite.repos_events import Consumer, Event, Producer
@@ -225,6 +226,7 @@ class JournalRecovered(BaseModel):
         "where the previous call stopped — registration is idempotent."
     ),
 )
+@drain_aware
 def subscribe_events(
     consumer_name: Annotated[
         str,
@@ -399,6 +401,7 @@ def subscribe_events(
         "or null when the run is quiescent. Read-only."
     ),
 )
+@drain_aware
 def inspect_journal(
     run_id: Annotated[
         UUID,
@@ -443,6 +446,7 @@ def inspect_journal(
         "`finalised`. Returns a structured no-op if nothing is in flight."
     ),
 )
+@drain_aware
 def recover_journal(
     run_id: Annotated[
         UUID,
@@ -551,6 +555,7 @@ def recover_journal(
         "subscribers, MCP tail clients, verifiers, …)."
     ),
 )
+@drain_aware
 def list_consumers() -> list[Consumer] | McpToolError:
     """Enumerate every consumer registered on the event bus.
 
@@ -576,6 +581,7 @@ def list_consumers() -> list[Consumer] | McpToolError:
         "workers, verifiers, the CLI)."
     ),
 )
+@drain_aware
 def list_producers() -> list[Producer] | McpToolError:
     """Enumerate every producer registered on the event bus.
 
