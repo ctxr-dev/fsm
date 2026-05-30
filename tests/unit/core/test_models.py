@@ -26,6 +26,7 @@ from ctxr.fsm.core.models import (
     ResponseSchema,
     State,
     Transition,
+    TransitionKind,
     VerifierSpec,
     Worker,
 )
@@ -209,11 +210,16 @@ def test_fsm_spec_rejects_zero_version() -> None:
 def test_transition_when_always_literal() -> None:
     t = Transition(to="next_state", when="always")
     assert t.when == "always"
+    # W14i: the boundary normaliser maps the bare string onto the
+    # ``TransitionKind`` enum so downstream code can branch on the
+    # typed value rather than on a free-form literal.
+    assert t.when is TransitionKind.always
 
 
 def test_transition_when_otherwise_literal() -> None:
     t = Transition(to="next_state", when="otherwise")
     assert t.when == "otherwise"
+    assert t.when is TransitionKind.otherwise
 
 
 def test_transition_when_bare_string_becomes_predicate() -> None:

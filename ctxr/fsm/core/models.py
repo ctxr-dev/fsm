@@ -27,7 +27,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from re import compile as re_compile
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import (
     BaseModel,
@@ -96,6 +96,38 @@ class TransitionKind(StrEnum):
     judgement = "judgement"
 
 
+class StateKind(StrEnum):
+    """Derived kind of a :class:`State`, computed from which body fields are set.
+
+    Closed vocabulary surfaced via :attr:`State.kind`; consumed by the
+    engine, the SQLite materialisation layer, and the brief serialiser.
+    Members carry the same wire strings the engine used pre-W14i so JSON
+    payloads remain byte-identical.
+    """
+
+    worker = "worker"
+    loop = "loop"
+    inline = "inline"
+    terminal = "terminal"
+
+
+class InlineFaultReason(StrEnum):
+    """Closed taxonomy of inline-handler failure modes.
+
+    Surfaced on :attr:`InlineExecutionResult.fault_reason` so callers
+    branch on a typed value rather than parsing free-form strings. Any
+    additional human-readable diagnostic (the offending type name, the
+    handler's exception message, the spec/handler key) goes on
+    :attr:`InlineExecutionResult.fault_detail`.
+    """
+
+    unregistered = "unregistered"
+    raised = "raised"
+    bad_return_type = "bad_return_type"
+    validation_failed = "validation_failed"
+    post_validation_failed = "post_validation_failed"
+
+
 class EventKind(StrEnum):
     """Closed taxonomy of events recorded on the FSM event journal."""
 
@@ -155,6 +187,82 @@ class VerifierVerdict(StrEnum):
     passed = "passed"
     rejected = "rejected"
     inconclusive = "inconclusive"
+
+
+class LoopTerminationReason(StrEnum):
+    """Why a loop body terminated.
+
+    Surfaced on :attr:`LoopDecision.reason`; persisted on the loop
+    state row so the dashboard can distinguish "the worker said it was
+    done" from "the safety cap fired before the worker said so".
+    """
+
+    done_field = "done_field"
+    max_iterations = "max_iterations"
+
+
+class EngineAdvanceKind(StrEnum):
+    """Discriminator for :class:`~ctxr.fsm.core.engine.EngineAdvanceResult`.
+
+    The engine's high-level driver returns one of four results — this
+    enum is the typed handle every downstream layer (MCP tool layer,
+    SQLite repo, CLI) branches on.
+    """
+
+    advance = "advance"
+    loop_continue = "loop_continue"
+    terminal = "terminal"
+    fault = "fault"
+
+
+class JournalStatus(StrEnum):
+    """Lifecycle status of a ``journal_txns`` row.
+
+    Surfaced on :class:`~ctxr.fsm.sqlite.repos_locks_journal.JournalTxn`
+    and on the API / MCP recovery surface. The lifecycle is strictly
+    monotonic: ``pending → ready_to_finalise → finalised`` (with
+    ``discard`` operations deleting the row outright rather than
+    transitioning it to a fourth state).
+    """
+
+    pending = "pending"
+    ready_to_finalise = "ready_to_finalise"
+    finalised = "finalised"
+
+
+class LockReleaseReason(StrEnum):
+    """Outcome reason returned by :class:`LocksRepo.release`.
+
+    Surfaced on :class:`~ctxr.fsm.sqlite.repos_locks_journal.ReleaseResult`
+    so callers can branch on the typed value rather than match a
+    free-form string. ``released`` is the success path; ``not_owner``
+    and ``not_held`` are the two refusal paths the engine policy
+    distinguishes.
+    """
+
+    released = "released"
+    not_owner = "not_owner"
+    not_held = "not_held"
+
+
+class LockAcquireReason(StrEnum):
+    """Outcome reason returned by :class:`LocksRepo.acquire`.
+
+    Surfaced on :class:`~ctxr.fsm.sqlite.repos_locks_journal.LockResult`:
+
+    * ``acquired`` — a fresh acquisition on a previously-unheld lock.
+    * ``replaced_stale`` — we took over an expired lease from another
+      session.
+    * ``already_held_by_same_session`` — re-entrant acquire (the
+      caller already held the lock; the row was refreshed in place).
+    * ``held`` — a live, foreign lock that we did not displace; the
+      caller did not acquire.
+    """
+
+    acquired = "acquired"
+    replaced_stale = "replaced_stale"
+    already_held_by_same_session = "already_held_by_same_session"
+    held = "held"
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +484,7 @@ class Transition(BaseModel):
     )
 
     to: str
-    when: Predicate | Literal["always", "otherwise"] | dict[str, Any]
+    when: Predicate | TransitionKind | dict[str, Any]
 
     @field_validator("to")
     @classmethod
@@ -394,8 +502,11 @@ class Transition(BaseModel):
 
         Accepted incoming shapes for ``when``:
 
-        * The string literals ``"always"`` and ``"otherwise"``.
-        * A ``Predicate`` instance (passes through).
+        * The string literals ``"always"`` and ``"otherwise"``
+          (normalised into :class:`TransitionKind` members; any other
+          bare string is lifted into a :class:`Predicate`).
+        * A :class:`TransitionKind` member (passes through).
+        * A :class:`Predicate` instance (passes through).
         * A dict with ``{"kind": "always"}``, ``{"kind": "otherwise"}``,
           ``{"kind": "deterministic", "expression": "..."}``, or
           ``{"kind": "judgement", "criteria": "...",
@@ -403,9 +514,10 @@ class Transition(BaseModel):
         * A dict that is just ``{"expression": "..."}`` — treated as
           deterministic.
 
-        Dicts are normalised but kept as dicts so the typed union
-        captures them; only ``deterministic`` is lifted into a
-        ``Predicate`` for convenience.
+        Judgement dicts are normalised but kept as dicts so the typed
+        union captures the criteria + evidence_required payload;
+        ``always`` / ``otherwise`` resolve to enum members and
+        ``deterministic`` is lifted into a :class:`Predicate`.
         """
         if not isinstance(data, dict):
             return data
@@ -413,24 +525,33 @@ class Transition(BaseModel):
         if when is None:
             return data
 
-        # String literals pass through unchanged.
-        if isinstance(when, str):
-            if when not in ("always", "otherwise"):
-                # treat any bare string as a deterministic expression
-                data["when"] = Predicate(when)
+        # Bare strings — map the two enum-vocabulary values onto enum
+        # members, lift anything else into a deterministic Predicate.
+        if isinstance(when, str) and not isinstance(when, TransitionKind):
+            if when == TransitionKind.always.value:
+                data["when"] = TransitionKind.always
+                return data
+            if when == TransitionKind.otherwise.value:
+                data["when"] = TransitionKind.otherwise
+                return data
+            data["when"] = Predicate(when)
+            return data
+
+        # Already a TransitionKind member — passes through unchanged.
+        if isinstance(when, TransitionKind):
             return data
 
         # Already a Predicate (or a mapping that pydantic will coerce
         # into one) — handle the dict-with-kind variants explicitly.
         if isinstance(when, dict):
             kind = when.get("kind")
-            if kind == "always":
-                data["when"] = "always"
+            if kind == TransitionKind.always.value:
+                data["when"] = TransitionKind.always
                 return data
-            if kind == "otherwise":
-                data["when"] = "otherwise"
+            if kind == TransitionKind.otherwise.value:
+                data["when"] = TransitionKind.otherwise
                 return data
-            if kind == "deterministic":
+            if kind == TransitionKind.deterministic.value:
                 expr = when.get("expression")
                 if not isinstance(expr, str) or not expr.strip():
                     raise ValueError(
@@ -438,7 +559,7 @@ class Transition(BaseModel):
                     )
                 data["when"] = Predicate(expr)
                 return data
-            if kind == "judgement":
+            if kind == TransitionKind.judgement.value:
                 criteria = when.get("criteria")
                 if not isinstance(criteria, str) or not criteria.strip():
                     raise ValueError(
@@ -448,7 +569,7 @@ class Transition(BaseModel):
                 if not isinstance(evidence_required, bool):
                     raise ValueError("evidence_required must be a bool")
                 data["when"] = {
-                    "kind": "judgement",
+                    "kind": TransitionKind.judgement.value,
                     "criteria": criteria,
                     "evidence_required": evidence_required,
                 }
@@ -492,30 +613,36 @@ class State(BaseModel):
         return value
 
     @property
-    def kind(self) -> Literal["loop", "inline", "worker", "terminal"]:
+    def kind(self) -> StateKind:
         """Return the derived kind of this state.
 
         The kind is derived from which body fields are set, not stored:
 
-        * ``"loop"``   — :attr:`loop` is non-None.
-        * ``"inline"`` — :attr:`inline` is non-None (and :attr:`loop` is None).
-        * ``"worker"`` — :attr:`worker` is non-None (and :attr:`loop` /
-          :attr:`inline` are None).
-        * ``"terminal"`` — all three body fields are None AND
-          :attr:`transitions` is empty.
+        * :attr:`StateKind.loop`     — :attr:`loop` is non-None.
+        * :attr:`StateKind.inline`   — :attr:`inline` is non-None
+          (and :attr:`loop` is None).
+        * :attr:`StateKind.worker`   — :attr:`worker` is non-None
+          (and :attr:`loop` / :attr:`inline` are None).
+        * :attr:`StateKind.terminal` — all three body fields are None
+          AND :attr:`transitions` is empty.
 
         A state with no body fields but a non-empty :attr:`transitions`
         list is structurally invalid (a "pass-through" worker would
         need somebody to produce its outputs) and raises ``ValueError``.
+
+        ``StateKind`` members are ``str`` subclasses (StrEnum), so any
+        legacy ``state.kind == "worker"`` comparison continues to work
+        — the property's typed return value is the canonical handle and
+        new call sites should compare against the enum directly.
         """
         if self.loop is not None:
-            return "loop"
+            return StateKind.loop
         if self.inline is not None:
-            return "inline"
+            return StateKind.inline
         if self.worker is not None:
-            return "worker"
+            return StateKind.worker
         if not self.transitions:
-            return "terminal"
+            return StateKind.terminal
         raise ValueError(
             f"state {self.id!r}: terminal-by-content but has transitions; "
             "set a worker / loop / inline body or remove the transitions"
@@ -767,24 +894,38 @@ class InlineExecutionResult(BaseModel):
 
     Returned by :func:`ctxr.fsm.core.engine.execute_inline`. The shape
     is a single envelope (not a discriminated union) so callers can
-    branch on the ``ok`` flag and consume ``fault_reason`` / ``outputs``
+    branch on the ``ok`` flag and consume
+    :attr:`fault_reason` / :attr:`fault_detail` / :attr:`outputs`
     accordingly:
 
     * ``ok=True``  — the handler ran, returned a dict, validated
       against any declared response schema and post-validations. The
-      handler's return value is in ``outputs``.
+      handler's return value is in :attr:`outputs`; :attr:`fault_reason`
+      and :attr:`fault_detail` are ``None``.
     * ``ok=False`` — the handler did not produce usable outputs.
-      ``fault_reason`` carries a short slug naming the failure mode
-      (``inline_handler_unregistered``, ``inline_handler_raised``,
-      ``inline_handler_bad_return_type``,
-      ``inline_handler_validation_failed``,
-      ``inline_handler_post_validation_failed``). ``validation`` always
-      carries the schema-validation report (vacuously valid when no
-      schema is declared); ``post_validations`` is populated only when
-      the inline spec declared post-validations.
+      :attr:`fault_reason` is one of the :class:`InlineFaultReason`
+      members (``unregistered``, ``raised``, ``bad_return_type``,
+      ``validation_failed``, ``post_validation_failed``).
+      :attr:`fault_detail` carries the human-readable diagnostic (the
+      raising exception's ``str()``, the offending return type's name,
+      the missing handler's ``(spec_id, handler_id)`` key — whatever the
+      consumer would want to log).
+
+    :attr:`validation` always carries the schema-validation report
+    (vacuously valid when no schema is declared);
+    :attr:`post_validations` is populated only when the inline spec
+    declared post-validations.
 
     The model is strict + frozen + extra-forbid like the surrounding
     domain envelopes; mis-typed kwargs surface immediately.
+
+    .. note::
+       The W14i refactor split the legacy free-form ``fault_reason``
+       string (e.g. ``"inline_handler_raised: RuntimeError: boom"``) into
+       a typed :class:`InlineFaultReason` member plus a separate
+       :attr:`fault_detail` payload. Wire JSON consumers that previously
+       grepped for the ``"inline_handler_"`` prefix should switch to the
+       typed field; the legacy prefix is no longer emitted.
     """
 
     model_config = _DOMAIN_CFG
@@ -794,11 +935,21 @@ class InlineExecutionResult(BaseModel):
     outputs: dict[str, Any] = Field(default_factory=dict)
     validation: ValidationResult
     post_validations: PostValidationResult | None = None
-    fault_reason: str | None = None
+    fault_reason: InlineFaultReason | None = None
+    fault_detail: str | None = None
 
 
 class TransitionEvaluation(BaseModel):
-    """The outcome of evaluating one transition guard at exit time."""
+    """The outcome of evaluating one transition guard at exit time.
+
+    ``kind`` carries the resolved guard shape: a :class:`TransitionKind`
+    member when the guard was structurally valid, or ``None`` when the
+    guard is missing / unresolved. Defensive ``"unknown"`` sentinels are
+    preserved as raw strings on the engine side and surfaced via
+    :attr:`error`, NOT as :class:`TransitionKind` members — the enum is
+    closed by design and an unknown guard is a programming bug, not a
+    new vocabulary entry.
+    """
 
     model_config = _DOMAIN_CFG
 
@@ -818,7 +969,7 @@ class LoopDecision(BaseModel):
 
     is_loop: bool
     terminate: bool = False
-    reason: Literal["done_field", "max_iterations"] | None = None
+    reason: LoopTerminationReason | None = None
     iteration_n: int | None = None
 
 
@@ -841,12 +992,18 @@ __all__ = [
     "CommitSignature",
     "CommitToken",
     "DeliveryStatus",
+    "EngineAdvanceKind",
     "EventKind",
     "FsmSpec",
     "InlineExecutionResult",
+    "InlineFaultReason",
     "InlineSpec",
+    "JournalStatus",
+    "LockAcquireReason",
+    "LockReleaseReason",
     "Loop",
     "LoopDecision",
+    "LoopTerminationReason",
     "PostValidationResult",
     "PostValidationResultEntry",
     "Predicate",
@@ -857,6 +1014,7 @@ __all__ = [
     "RunStatus",
     "SignalKind",
     "State",
+    "StateKind",
     "StateStatus",
     "Transition",
     "TransitionEvaluation",

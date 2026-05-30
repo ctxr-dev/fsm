@@ -5,16 +5,20 @@ Covers:
 * Happy path: a registered handler returns a schema-valid dict and the
   engine reports ``ok=True`` with the outputs.
 * Unregistered handler reports ``ok=False`` with
-  ``fault_reason="inline_handler_unregistered: ..."``.
+  ``fault_reason=InlineFaultReason.unregistered`` and a ``fault_detail``
+  carrying the missing ``(spec_id, handler_id)`` key.
 * Handler that raises is caught and reported as
-  ``fault_reason="inline_handler_raised: ..."``; the engine does not
-  re-raise.
-* Handler that returns a non-dict reports ``fault_reason="inline_handler_bad_return_type: ..."``.
+  ``fault_reason=InlineFaultReason.raised`` with the exception class +
+  message on ``fault_detail``; the engine does not re-raise.
+* Handler that returns a non-dict reports
+  ``fault_reason=InlineFaultReason.bad_return_type`` and names the
+  offending type in ``fault_detail``.
 * Handler returns a dict that fails the inline state's response schema
-  → ``fault_reason="inline_handler_validation_failed"`` and the
+  → ``fault_reason=InlineFaultReason.validation_failed`` and the
   validation errors are surfaced.
 * Handler returns a schema-valid dict but a post-validation predicate
-  evaluates ``False`` → ``fault_reason="inline_handler_post_validation_failed"``.
+  evaluates ``False`` →
+  ``fault_reason=InlineFaultReason.post_validation_failed``.
 * Multiple-handler registry: looking up a handler under one spec does
   not collide with the same handler_id under another spec.
 * Schema-less inline state: the engine accepts ANY dict and reports
@@ -39,6 +43,7 @@ from ctxr.fsm.core.inline_registry import (
     get_default_registry,
 )
 from ctxr.fsm.core.models import (
+    InlineFaultReason,
     InlineSpec,
     Predicate,
     ResponseSchema,
@@ -176,10 +181,10 @@ def test_execute_inline_unregistered_handler_returns_structured_fault() -> None:
     )
 
     assert result.ok is False
-    assert result.fault_reason is not None
-    assert result.fault_reason.startswith("inline_handler_unregistered:")
-    assert "spec-x" in result.fault_reason
-    assert "missing_one" in result.fault_reason
+    assert result.fault_reason is InlineFaultReason.unregistered
+    assert result.fault_detail is not None
+    assert "spec-x" in result.fault_detail
+    assert "missing_one" in result.fault_detail
     assert result.outputs == {}
 
 
@@ -207,10 +212,10 @@ def test_execute_inline_raising_handler_is_caught_and_reported() -> None:
     )
 
     assert result.ok is False
-    assert result.fault_reason is not None
-    assert result.fault_reason.startswith("inline_handler_raised:")
-    assert "RuntimeError" in result.fault_reason
-    assert "boom" in result.fault_reason
+    assert result.fault_reason is InlineFaultReason.raised
+    assert result.fault_detail is not None
+    assert "RuntimeError" in result.fault_detail
+    assert "boom" in result.fault_detail
     # Outputs are empty; the engine does not silently swallow partial data.
     assert result.outputs == {}
 
@@ -239,9 +244,9 @@ def test_execute_inline_bad_return_type_is_reported() -> None:
     )
 
     assert result.ok is False
-    assert result.fault_reason is not None
-    assert result.fault_reason.startswith("inline_handler_bad_return_type:")
-    assert "list" in result.fault_reason
+    assert result.fault_reason is InlineFaultReason.bad_return_type
+    assert result.fault_detail is not None
+    assert "list" in result.fault_detail
     assert result.outputs == {}
 
 
@@ -270,7 +275,7 @@ def test_execute_inline_schema_mismatch_is_reported() -> None:
     )
 
     assert result.ok is False
-    assert result.fault_reason == "inline_handler_validation_failed"
+    assert result.fault_reason is InlineFaultReason.validation_failed
     assert result.validation.valid is False
     assert result.validation.errors  # at least one error message present
     assert result.outputs == {}
@@ -305,7 +310,7 @@ def test_execute_inline_post_validation_failure_is_reported() -> None:
     )
 
     assert result.ok is False
-    assert result.fault_reason == "inline_handler_post_validation_failed"
+    assert result.fault_reason is InlineFaultReason.post_validation_failed
     assert result.validation.valid is True  # the schema part was fine
     assert result.post_validations is not None
     assert result.post_validations.valid is False

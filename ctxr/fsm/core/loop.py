@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ctxr.fsm.core.models import Loop, LoopDecision, State
+from ctxr.fsm.core.models import Loop, LoopDecision, LoopTerminationReason, State
 
 __all__ = ["LoopConfigError", "decide", "outputs_path_for"]
 
@@ -96,7 +96,7 @@ def decide(
         return LoopDecision(
             is_loop=True,
             terminate=True,
-            reason="done_field",
+            reason=LoopTerminationReason.done_field,
             iteration_n=iteration_n,
         )
 
@@ -104,7 +104,7 @@ def decide(
         return LoopDecision(
             is_loop=True,
             terminate=True,
-            reason="max_iterations",
+            reason=LoopTerminationReason.max_iterations,
             iteration_n=iteration_n,
         )
 

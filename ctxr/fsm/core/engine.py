@@ -32,7 +32,7 @@ it reports the fault so the caller can journal it.
 from __future__ import annotations
 
 import uuid
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -45,8 +45,10 @@ from ctxr.fsm.core.loop import decide as loop_decide
 from ctxr.fsm.core.loop import outputs_path_for
 from ctxr.fsm.core.models import (
     Brief,
+    EngineAdvanceKind,
     FsmSpec,
     InlineExecutionResult,
+    InlineFaultReason,
     Loop,
     LoopDecision,
     PostValidationResult,
@@ -57,6 +59,7 @@ from ctxr.fsm.core.models import (
     State,
     Transition,
     TransitionEvaluation,
+    TransitionKind,
     ValidationResult,
     Worker,
     WorkerOutput,
@@ -111,20 +114,24 @@ def _new_brief_id() -> uuid.UUID:
 class EngineAdvanceResult(BaseModel):
     """The outcome of a single :func:`advance` call.
 
-    This is a discriminated-union-like envelope keyed off ``kind``:
+    This is a discriminated-union-like envelope keyed off
+    :attr:`kind`, a :class:`~ctxr.fsm.core.models.EngineAdvanceKind`
+    member:
 
-    * ``"loop_continue"`` — the state is a loop and the most recent
-      iteration did not satisfy the done-field; ``iteration_n`` and
-      ``brief`` are populated with the next iteration's parameters.
-    * ``"fault"`` — validation, post-validation, or transition
-      resolution failed; ``reason`` plus one of ``errors``,
+    * :attr:`EngineAdvanceKind.loop_continue` — the state is a loop and
+      the most recent iteration did not satisfy the done-field;
+      ``iteration_n`` and ``brief`` are populated with the next
+      iteration's parameters.
+    * :attr:`EngineAdvanceKind.fault` — validation, post-validation, or
+      transition resolution failed; ``reason`` plus one of ``errors``,
       ``post_validations``, ``evaluations`` carries the diagnostic.
-    * ``"terminal"`` — the state has no outgoing transitions and the
-      run is therefore complete; ``verdict`` carries the optional
-      ``verdict`` field lifted from the merged env.
-    * ``"advance"`` — a transition matched; ``next_state`` plus
-      ``brief`` describe where the run goes next, and ``evaluations``
-      records the full evaluation trace.
+    * :attr:`EngineAdvanceKind.terminal` — the state has no outgoing
+      transitions and the run is therefore complete; ``verdict``
+      carries the optional ``verdict`` field lifted from the merged
+      env.
+    * :attr:`EngineAdvanceKind.advance` — a transition matched;
+      ``next_state`` plus ``brief`` describe where the run goes next,
+      and ``evaluations`` records the full evaluation trace.
 
     The model is strict and extra-forbid so a mistaken kwarg surfaces
     immediately instead of being silently dropped.
@@ -132,7 +139,7 @@ class EngineAdvanceResult(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
-    kind: Literal["loop_continue", "fault", "terminal", "advance"]
+    kind: EngineAdvanceKind
     brief: Brief | None = None
     iteration_n: int | None = None
     reason: str | None = None
@@ -303,29 +310,34 @@ def _evaluate_guard(
     """
     when = transition.when
 
-    # "always" or "otherwise" string literals.
-    if isinstance(when, str):
-        if when == "always":
+    # ``TransitionKind`` members — the always/otherwise literals.
+    # Checked BEFORE the bare-string branch because StrEnum members
+    # are also ``str`` subclasses, but we want the enum equality.
+    if isinstance(when, TransitionKind):
+        if when is TransitionKind.always:
             return TransitionEvaluation(
                 to=transition.to,
                 when=when,
                 result=True,
-                kind="always",
+                kind=TransitionKind.always.value,
             )
-        if when == "otherwise":
+        if when is TransitionKind.otherwise:
             return TransitionEvaluation(
                 to=transition.to,
                 when=when,
                 result=not any_earlier_matched,
-                kind="otherwise",
+                kind=TransitionKind.otherwise.value,
             )
-        # Defensive: pydantic only accepts the two literals above.
+        # Defensive: TransitionKind.deterministic and .judgement are
+        # carried as Predicate / dict shapes, not as raw enum members on
+        # ``Transition.when``. A bare enum member here for one of those
+        # kinds is a programming bug — surface it loudly.
         return TransitionEvaluation(
             to=transition.to,
             when=when,
             result=False,
             kind="unknown",
-            error=f"unrecognised string guard {when!r}",
+            error=f"transition `when` cannot be bare {when!r}",
         )
 
     # Predicate guard (deterministic).
@@ -338,7 +350,7 @@ def _evaluate_guard(
                 when={"expression": when.expression},
                 result=False,
                 expression=when.expression,
-                kind="deterministic",
+                kind=TransitionKind.deterministic.value,
                 error=str(exc),
             )
         return TransitionEvaluation(
@@ -346,34 +358,34 @@ def _evaluate_guard(
             when={"expression": when.expression},
             result=bool(result),
             expression=when.expression,
-            kind="deterministic",
+            kind=TransitionKind.deterministic.value,
         )
 
-    # Dict guards: kind == "always" / "otherwise" / "deterministic" / "judgement".
+    # Dict guards: kind == always / otherwise / deterministic / judgement.
     if isinstance(when, dict):
-        kind = when.get("kind")
-        if kind == "always":
+        kind_raw = when.get("kind")
+        if kind_raw == TransitionKind.always.value:
             return TransitionEvaluation(
                 to=transition.to,
                 when=when,
                 result=True,
-                kind="always",
+                kind=TransitionKind.always.value,
             )
-        if kind == "otherwise":
+        if kind_raw == TransitionKind.otherwise.value:
             return TransitionEvaluation(
                 to=transition.to,
                 when=when,
                 result=not any_earlier_matched,
-                kind="otherwise",
+                kind=TransitionKind.otherwise.value,
             )
-        if kind == "deterministic":
+        if kind_raw == TransitionKind.deterministic.value:
             expression = when.get("expression")
             if not isinstance(expression, str):
                 return TransitionEvaluation(
                     to=transition.to,
                     when=when,
                     result=False,
-                    kind="deterministic",
+                    kind=TransitionKind.deterministic.value,
                     error="deterministic guard missing string `expression`",
                 )
             try:
@@ -384,7 +396,7 @@ def _evaluate_guard(
                     when=when,
                     result=False,
                     expression=expression,
-                    kind="deterministic",
+                    kind=TransitionKind.deterministic.value,
                     error=str(exc),
                 )
             return TransitionEvaluation(
@@ -392,15 +404,15 @@ def _evaluate_guard(
                 when=when,
                 result=bool(result),
                 expression=expression,
-                kind="deterministic",
+                kind=TransitionKind.deterministic.value,
             )
-        if kind == "judgement":
+        if kind_raw == TransitionKind.judgement.value:
             criteria = when.get("criteria")
             return TransitionEvaluation(
                 to=transition.to,
                 when=when,
                 result=judgement_pick == transition.to,
-                kind="judgement",
+                kind=TransitionKind.judgement.value,
                 criteria=criteria if isinstance(criteria, str) else None,
             )
 
@@ -587,7 +599,7 @@ def advance(
     validation = validate_output(state, raw_outputs)
     if not validation.valid:
         return EngineAdvanceResult(
-            kind="fault",
+            kind=EngineAdvanceKind.fault,
             reason="output_schema_violation",
             errors=list(validation.errors),
         )
@@ -606,7 +618,7 @@ def advance(
                 iteration_n=next_iter,
             )
             return EngineAdvanceResult(
-                kind="loop_continue",
+                kind=EngineAdvanceKind.loop_continue,
                 brief=next_brief,
                 iteration_n=next_iter,
             )
@@ -615,7 +627,7 @@ def advance(
     post = run_post_validations(state, raw_outputs)
     if not post.valid:
         return EngineAdvanceResult(
-            kind="fault",
+            kind=EngineAdvanceKind.fault,
             reason="post_validation_failed",
             post_validations=list(post.results),
         )
@@ -629,7 +641,7 @@ def advance(
     # Step 7a: terminal state (no transitions at all).
     if transition is None and not state.transitions:
         return EngineAdvanceResult(
-            kind="terminal",
+            kind=EngineAdvanceKind.terminal,
             verdict=env_with_outputs.get("verdict"),
             evaluations=evaluations,
         )
@@ -637,7 +649,7 @@ def advance(
     # Step 7b: declared transitions but none matched.
     if transition is None:
         return EngineAdvanceResult(
-            kind="fault",
+            kind=EngineAdvanceKind.fault,
             reason="no_transition_matched",
             evaluations=evaluations,
         )
@@ -651,7 +663,7 @@ def advance(
         run_id=run_ctx.run_id,
     )
     return EngineAdvanceResult(
-        kind="advance",
+        kind=EngineAdvanceKind.advance,
         next_state=next_state.id,
         brief=next_brief,
         evaluations=evaluations,
@@ -711,24 +723,28 @@ def execute_inline(
     -------
     InlineExecutionResult
         ``ok=True`` and ``outputs`` populated on success. ``ok=False``
-        with a kebab-case ``fault_reason`` on every failure mode:
+        with a typed :class:`InlineFaultReason` on every failure mode:
 
-        * ``inline_handler_unregistered`` — no handler registered for
-          ``(ctx.fsm_id, state.inline.handler_id)``.
-        * ``inline_handler_raised`` — handler raised an exception.
-          The ``fault_reason`` includes the exception type name and
-          its ``str()`` representation; the full traceback is NOT
-          captured here (callers that want one log it from the
-          calling try/except at the SQLite-layer boundary).
-        * ``inline_handler_bad_return_type`` — handler returned
-          something other than ``dict[str, Any]``.
-        * ``inline_handler_validation_failed`` — handler returned a
-          dict but it did not validate against
-          ``state.inline.response_schema``.
-        * ``inline_handler_post_validation_failed`` — handler returned
-          a schema-valid dict but at least one
+        * :attr:`InlineFaultReason.unregistered` — no handler registered
+          for ``(ctx.fsm_id, state.inline.handler_id)``;
+          :attr:`InlineExecutionResult.fault_detail` carries the
+          missing key as ``"<fsm_id>/<handler_id>"``.
+        * :attr:`InlineFaultReason.raised` — handler raised an
+          exception; ``fault_detail`` carries the exception type name +
+          ``str()`` (full traceback is NOT captured here; SQLite-layer
+          callers log it from their own try/except boundary).
+        * :attr:`InlineFaultReason.bad_return_type` — handler returned
+          something other than ``dict[str, Any]``; ``fault_detail``
+          names the offending type.
+        * :attr:`InlineFaultReason.validation_failed` — handler returned
+          a dict but it did not validate against
+          ``state.inline.response_schema``; ``validation.errors``
+          carries the per-field messages.
+        * :attr:`InlineFaultReason.post_validation_failed` — handler
+          returned a schema-valid dict but at least one
           :attr:`~ctxr.fsm.core.models.InlineSpec.post_validations`
-          predicate evaluated to ``False``.
+          predicate evaluated to ``False``; ``post_validations``
+          carries the per-predicate trace.
     """
     if state.inline is None:
         raise TypeError(
@@ -747,9 +763,8 @@ def execute_inline(
             outputs={},
             validation=ValidationResult(valid=True, errors=[]),
             post_validations=None,
-            fault_reason=(
-                f"inline_handler_unregistered: {ctx.fsm_id}/{handler_id}"
-            ),
+            fault_reason=InlineFaultReason.unregistered,
+            fault_detail=f"{ctx.fsm_id}/{handler_id}",
         )
 
     # Build the handler's read-only context envelope.
@@ -772,9 +787,8 @@ def execute_inline(
             outputs={},
             validation=ValidationResult(valid=True, errors=[]),
             post_validations=None,
-            fault_reason=(
-                f"inline_handler_raised: {type(exc).__name__}: {exc}"
-            ),
+            fault_reason=InlineFaultReason.raised,
+            fault_detail=f"{type(exc).__name__}: {exc}",
         )
 
     # The handler MUST return a dict; anything else is a contract bug.
@@ -785,10 +799,8 @@ def execute_inline(
             outputs={},
             validation=ValidationResult(valid=True, errors=[]),
             post_validations=None,
-            fault_reason=(
-                "inline_handler_bad_return_type: expected dict, "
-                f"got {type(raw_output).__name__}"
-            ),
+            fault_reason=InlineFaultReason.bad_return_type,
+            fault_detail=f"expected dict, got {type(raw_output).__name__}",
         )
 
     # Validate against the optional response schema. A schema-less
@@ -808,7 +820,8 @@ def execute_inline(
                 outputs={},
                 validation=validation,
                 post_validations=None,
-                fault_reason="inline_handler_validation_failed",
+                fault_reason=InlineFaultReason.validation_failed,
+                fault_detail=None,
             )
 
     # Run the inline-state's post-validation predicates (if any). The
@@ -860,7 +873,8 @@ def execute_inline(
                 outputs={},
                 validation=validation,
                 post_validations=post_result,
-                fault_reason="inline_handler_post_validation_failed",
+                fault_reason=InlineFaultReason.post_validation_failed,
+                fault_detail=None,
             )
 
     # All-clear: handler returned a dict, the schema accepts it, and
@@ -872,4 +886,5 @@ def execute_inline(
         validation=validation,
         post_validations=post_result,
         fault_reason=None,
+        fault_detail=None,
     )

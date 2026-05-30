@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any
 
 import uuid_utils
 from pydantic import BaseModel, ConfigDict, Field
@@ -64,6 +64,11 @@ from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
+from ctxr.fsm.core.models import (
+    JournalStatus,
+    LockAcquireReason,
+    LockReleaseReason,
+)
 from ctxr.fsm.sqlite.models_core import LockTable
 from ctxr.fsm.sqlite.models_enforcement import JournalTxnTable
 
@@ -179,12 +184,7 @@ class LockResult(BaseModel):
 
     acquired: bool
     lock: Lock | None = None
-    reason: Literal[
-        "acquired",
-        "replaced_stale",
-        "already_held_by_same_session",
-        "held",
-    ]
+    reason: LockAcquireReason
 
 
 class ReleaseResult(BaseModel):
@@ -202,7 +202,7 @@ class ReleaseResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     released: bool
-    reason: Literal["released", "not_owner", "not_held"]
+    reason: LockReleaseReason
 
 
 class JournalTxn(BaseModel):
@@ -221,7 +221,7 @@ class JournalTxn(BaseModel):
 
     id: str
     run_id: str
-    status: Literal["pending", "ready_to_finalise", "finalised"]
+    status: JournalStatus
     staged_writes: list[dict[str, Any]] = Field(default_factory=list)
     started_at: datetime
     ready_at: datetime | None = None
@@ -297,7 +297,7 @@ class LocksRepo:
             session.flush()
             return LockResult(
                 acquired=True,
-                reason="acquired",
+                reason=LockAcquireReason.acquired,
                 lock=self._row_to_lock(row),
             )
 
@@ -309,7 +309,7 @@ class LocksRepo:
             session.flush()
             return LockResult(
                 acquired=True,
-                reason="already_held_by_same_session",
+                reason=LockAcquireReason.already_held_by_same_session,
                 lock=self._row_to_lock(existing),
             )
 
@@ -323,14 +323,14 @@ class LocksRepo:
             session.flush()
             return LockResult(
                 acquired=True,
-                reason="replaced_stale",
+                reason=LockAcquireReason.replaced_stale,
                 lock=self._row_to_lock(existing),
             )
 
         # Live lock held by a different session — refuse.
         return LockResult(
             acquired=False,
-            reason="held",
+            reason=LockAcquireReason.held,
             lock=self._row_to_lock(existing),
         )
 
@@ -356,12 +356,18 @@ class LocksRepo:
         """
         existing = session.get(LockTable, run_id)
         if existing is None:
-            return ReleaseResult(released=False, reason="not_held")
+            return ReleaseResult(
+                released=False, reason=LockReleaseReason.not_held
+            )
         if existing.holder_session_id != session_id:
-            return ReleaseResult(released=False, reason="not_owner")
+            return ReleaseResult(
+                released=False, reason=LockReleaseReason.not_owner
+            )
         session.delete(existing)
         session.flush()
-        return ReleaseResult(released=True, reason="released")
+        return ReleaseResult(
+            released=True, reason=LockReleaseReason.released
+        )
 
     def inspect(self, session: Session, *, run_id: str) -> Lock | None:
         """Return the current lock for ``run_id`` (or ``None`` if unheld).
@@ -421,7 +427,7 @@ class JournalRepo:
         row = JournalTxnTable(
             id=_new_uuid7(),
             run_id=run_id,
-            status="pending",
+            status=JournalStatus.pending.value,
             staged_writes_json=_canonical_json([]),
             started_at=now_iso,
             ready_at=None,
@@ -449,7 +455,7 @@ class JournalRepo:
         row = session.get(JournalTxnTable, txn_id)
         if row is None:
             raise KeyError(f"journal_txn not found: {txn_id!r}")
-        row.status = "ready_to_finalise"
+        row.status = JournalStatus.ready_to_finalise.value
         row.staged_writes_json = _canonical_json(staged_writes)
         row.ready_at = _utc_iso_millis()
         session.add(row)
@@ -469,7 +475,7 @@ class JournalRepo:
         row = session.get(JournalTxnTable, txn_id)
         if row is None:
             raise KeyError(f"journal_txn not found: {txn_id!r}")
-        row.status = "finalised"
+        row.status = JournalStatus.finalised.value
         row.finalised_at = _utc_iso_millis()
         session.add(row)
         session.flush()
@@ -502,10 +508,14 @@ class JournalRepo:
         ``ready_to_finalise``) or back (status=``pending``); if ``None`` the
         run was last seen in a quiescent state.
         """
+        unfinalised_statuses = (
+            JournalStatus.pending.value,
+            JournalStatus.ready_to_finalise.value,
+        )
         stmt = (
             select(JournalTxnTable)
             .where(JournalTxnTable.run_id == run_id)
-            .where(JournalTxnTable.status.in_(("pending", "ready_to_finalise")))
+            .where(JournalTxnTable.status.in_(unfinalised_statuses))
             .order_by(JournalTxnTable.started_at.desc(), JournalTxnTable.id.desc())
             .limit(1)
         )
@@ -539,14 +549,18 @@ class JournalRepo:
         # non-dict items would be a producer bug, but we still defend.
         staged_writes = [item for item in decoded if isinstance(item, dict)]
 
-        status = row.status
-        if status not in ("pending", "ready_to_finalise", "finalised"):
-            # Out-of-schema status values should be impossible because the
-            # repo controls every write, but if they slip through we surface
-            # them via a hard cast at the value-object boundary rather than
-            # silently coercing — the type system will then complain on the
-            # caller side, which is the right place to notice.
-            raise ValueError(f"unexpected journal txn status: {status!r}")
+        try:
+            status = JournalStatus(row.status)
+        except ValueError as exc:
+            # Out-of-schema status values should be impossible because
+            # the repo controls every write, but if they slip through we
+            # surface them as a typed error at the value-object boundary
+            # rather than silently coercing — the type system will then
+            # complain on the caller side, which is the right place to
+            # notice.
+            raise ValueError(
+                f"unexpected journal txn status: {row.status!r}"
+            ) from exc
 
         return JournalTxn(
             id=row.id,

@@ -85,7 +85,7 @@ class VerifierVote(BaseModel):
 
     model_config = _VO_CFG
 
-    verdict: Literal["passed", "rejected"]
+    verdict: Literal[VerifierVerdict.passed, VerifierVerdict.rejected]
     reason: str = ""
 
 
@@ -94,7 +94,7 @@ class VerifierOutcome(BaseModel):
 
     model_config = _VO_CFG
 
-    verdict: Literal["passed", "rejected"]
+    verdict: Literal[VerifierVerdict.passed, VerifierVerdict.rejected]
     votes: list[VerifierVote] = Field(default_factory=list)
     passed_count: int
     rejected_count: int
@@ -180,19 +180,24 @@ def _structural_verifier(
 
     if schema is None:
         return [
-            VerifierVote(verdict="passed", reason="no_response_schema_to_check")
+            VerifierVote(
+                verdict=VerifierVerdict.passed,
+                reason="no_response_schema_to_check",
+            )
             for _ in range(verifier.parallel_count)
         ]
 
     valid, errors = schema.model_validate_json_payload(outputs)
     if valid:
         return [
-            VerifierVote(verdict="passed", reason="structural_check_ok")
+            VerifierVote(
+                verdict=VerifierVerdict.passed, reason="structural_check_ok"
+            )
             for _ in range(verifier.parallel_count)
         ]
     reason = "; ".join(errors[:3]) if errors else "structural_check_failed"
     return [
-        VerifierVote(verdict="rejected", reason=reason)
+        VerifierVote(verdict=VerifierVerdict.rejected, reason=reason)
         for _ in range(verifier.parallel_count)
     ]
 
@@ -214,16 +219,27 @@ def _coerce_vote(raw: object) -> VerifierVote:
     if isinstance(raw, VerifierVote):
         return raw
     if isinstance(raw, dict):
-        verdict = raw.get("verdict")
+        verdict_raw = raw.get("verdict")
         reason = raw.get("reason", "")
-        if verdict in ("passed", "rejected") and isinstance(reason, str):
-            return VerifierVote(verdict=verdict, reason=reason)
-        # "inconclusive" / unknown collapses to rejected — fail closed.
+        if isinstance(reason, str):
+            # Match each accepted vote value explicitly so the type
+            # narrows down to the ``Literal[VerifierVerdict.passed,
+            # VerifierVerdict.rejected]`` shape ``VerifierVote.verdict``
+            # demands. ``VerifierVerdict(verdict)`` would type as the
+            # full enum, which is wider than the model accepts.
+            if verdict_raw == VerifierVerdict.passed.value:
+                return VerifierVote(verdict=VerifierVerdict.passed, reason=reason)
+            if verdict_raw == VerifierVerdict.rejected.value:
+                return VerifierVote(verdict=VerifierVerdict.rejected, reason=reason)
+        # ``inconclusive`` / unknown collapses to rejected — fail closed.
         return VerifierVote(
-            verdict="rejected",
+            verdict=VerifierVerdict.rejected,
             reason=f"malformed_vote: {raw!r}",
         )
-    return VerifierVote(verdict="rejected", reason=f"unknown_vote_type: {type(raw).__name__}")
+    return VerifierVote(
+        verdict=VerifierVerdict.rejected,
+        reason=f"unknown_vote_type: {type(raw).__name__}",
+    )
 
 
 def run_verifier(
@@ -251,10 +267,12 @@ def run_verifier(
     raw_votes = handler(verifier, brief, outputs)
     votes = [_coerce_vote(v) for v in raw_votes]
 
-    passed = sum(1 for v in votes if v.verdict == "passed")
-    rejected = sum(1 for v in votes if v.verdict == "rejected")
-    aggregate: Literal["passed", "rejected"] = (
-        "passed" if passed >= verifier.majority_threshold else "rejected"
+    passed = sum(1 for v in votes if v.verdict is VerifierVerdict.passed)
+    rejected = sum(1 for v in votes if v.verdict is VerifierVerdict.rejected)
+    aggregate: Literal[VerifierVerdict.passed, VerifierVerdict.rejected] = (
+        VerifierVerdict.passed
+        if passed >= verifier.majority_threshold
+        else VerifierVerdict.rejected
     )
 
     return VerifierOutcome(
