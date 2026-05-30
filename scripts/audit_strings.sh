@@ -55,7 +55,11 @@ _report() {
 # the user flagged on PR #39. Inline Literal narrowing is allowed only
 # when the value is a true one-off API parameter (justify with the
 # trailing marker so the audit walks over it).
-RULE1=$(grep -rn 'Literal\["' "${SRC_DIR}" 2>/dev/null | _filter_justified || true)
+#
+# Pattern covers both quote styles (double + single) and any amount of
+# whitespace between ``Literal[`` and the first quote, so contributors
+# can't sidestep the audit with ``Literal['x']`` or ``Literal[ "x"]``.
+RULE1=$(grep -rEn --include='*.py' 'Literal\[[[:space:]]*["'"'"']' "${SRC_DIR}" 2>/dev/null | _filter_justified || true)
 RULE1_HITS=$(echo -n "${RULE1}" | grep -c '^' || true)
 if [[ "${RULE1_HITS}" -gt 0 ]]; then
   echo "--- audit-strings: rule1 (inline Literal narrowings)"
@@ -66,9 +70,14 @@ fi
 # --- Rule 2: raw string equality on TransitionKind vocabulary ---------
 # Always / otherwise / deterministic / judgement are enum members; the
 # raw-string compare branch is a bug waiting to happen.
+#
+# Pattern covers four equivalence shapes: ``x == "v"``, ``x != "v"``,
+# ``"v" == x``, ``"v" != x``, with either quote style. A new raw-string
+# comparison written in any of those shapes lights up the gate.
 RULE2=""
 for value in always otherwise deterministic judgement; do
-  hits=$(grep -rn "== \"${value}\"" "${SRC_DIR}" 2>/dev/null | _filter_justified || true)
+  patt='([!=]=[[:space:]]*["'"'"']'"${value}"'["'"'"']|["'"'"']'"${value}"'["'"'"'][[:space:]]*[!=]=)'
+  hits=$(grep -rEn --include='*.py' "${patt}" "${SRC_DIR}" 2>/dev/null | _filter_justified || true)
   if [[ -n "${hits}" ]]; then
     RULE2="${RULE2}${hits}\n"
   fi
@@ -81,9 +90,12 @@ if [[ "${RULE2_HITS}" -gt 0 ]]; then
 fi
 
 # --- Rule 3: raw string equality on VerifierVerdict vocabulary --------
+# Same four-shape coverage as rule 2; matches the verdict name on
+# either side of ``==`` / ``!=`` with either quote style.
 RULE3=""
 for value in passed rejected inconclusive; do
-  hits=$(grep -rn "verdict == \"${value}\"" "${SRC_DIR}" 2>/dev/null | _filter_justified || true)
+  patt='([!=]=[[:space:]]*["'"'"']'"${value}"'["'"'"']|["'"'"']'"${value}"'["'"'"'][[:space:]]*[!=]=)'
+  hits=$(grep -rEn --include='*.py' "${patt}" "${SRC_DIR}" 2>/dev/null | _filter_justified || true)
   if [[ -n "${hits}" ]]; then
     RULE3="${RULE3}${hits}\n"
   fi
