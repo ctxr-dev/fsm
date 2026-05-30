@@ -57,9 +57,20 @@ from ctxr.fsm.core.engine import (
     EngineAdvanceResult,
     advance,
     build_brief,
+    execute_inline,
     resolve_transition,
     run_post_validations,
     validate_output,
+)
+
+# ---------------------------------------------------------------------------
+# Inline handler registry (W14a) — server-side deterministic state handlers
+# ---------------------------------------------------------------------------
+from ctxr.fsm.core.inline_registry import (
+    InlineContext,
+    InlineHandler,
+    InlineHandlerRegistry,
+    get_default_registry,
 )
 
 # ---------------------------------------------------------------------------
@@ -82,6 +93,8 @@ from ctxr.fsm.core.models import (
     DeliveryStatus,
     EventKind,
     FsmSpec,
+    InlineExecutionResult,
+    InlineSpec,
     Loop,
     LoopDecision,
     PostValidationResult,
@@ -168,6 +181,12 @@ __all__ = [
     "FsmSpec",
     # ── spec validation & hashing ─────────────────────────────────────
     "FsmValidationResult",
+    # ── inline handler registry (W14a) ────────────────────────────────
+    "InlineContext",
+    "InlineExecutionResult",
+    "InlineHandler",
+    "InlineHandlerRegistry",
+    "InlineSpec",
     "JournalProtocol",
     "Lock",
     "Loop",
@@ -207,7 +226,9 @@ __all__ = [
     "attach_methods",
     "build_brief",
     "evaluate_expression",
+    "execute_inline",
     "fsm_spec_hash",
+    "get_default_registry",
     "get_verifier_handler",
     "loop_decide",
     "outputs_path_for",

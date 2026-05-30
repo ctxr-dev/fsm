@@ -36,11 +36,17 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ctxr.fsm.core.inline_registry import (
+    InlineContext,
+    InlineHandlerRegistry,
+    get_default_registry,
+)
 from ctxr.fsm.core.loop import decide as loop_decide
 from ctxr.fsm.core.loop import outputs_path_for
 from ctxr.fsm.core.models import (
     Brief,
     FsmSpec,
+    InlineExecutionResult,
     Loop,
     LoopDecision,
     PostValidationResult,
@@ -66,6 +72,7 @@ __all__ = [
     "EngineAdvanceResult",
     "advance",
     "build_brief",
+    "execute_inline",
     "resolve_transition",
     "run_post_validations",
     "validate_output",
@@ -648,4 +655,221 @@ def advance(
         next_state=next_state.id,
         brief=next_brief,
         evaluations=evaluations,
+    )
+
+
+# ---------------------------------------------------------------------------
+# execute_inline — server-side deterministic state handler
+# ---------------------------------------------------------------------------
+
+
+def execute_inline(
+    state: State,
+    ctx: RunCtx,
+    args: dict[str, Any],
+    inputs: dict[str, Any],
+    registry: InlineHandlerRegistry | None = None,
+) -> InlineExecutionResult:
+    """Run an inline state's registered handler and report the outcome.
+
+    This function is the pure entry point the W2 SQLite repository
+    layer will call inside its ``@atomic`` transaction to advance
+    through inline states without an LLM round-trip. It is intentionally
+    side-effect-free: it does NOT mutate any persistence, does NOT
+    emit events, and does NOT call back into :func:`advance`. The
+    caller wraps the result in a transaction, persists the inline
+    state's outputs + emits ``inline_executed`` / ``inline_failed``
+    events, then calls :func:`advance` with the handler's outputs to
+    resolve the outgoing transition.
+
+    Parameters
+    ----------
+    state:
+        The inline state being executed. Must have ``state.inline``
+        non-None; otherwise the function raises ``TypeError`` because
+        the call site is a programming error.
+    ctx:
+        The current :class:`RunCtx`. ``ctx.iteration_n`` is passed
+        through to the handler via :class:`InlineContext` so handlers
+        embedded in loop bodies (a future capability) can see their
+        iteration index. ``ctx.env`` is not threaded into the inline
+        context — the handler's input surface is ``args`` + ``inputs``,
+        mirroring the worker brief's input shape.
+    args:
+        The owning run's startup ``args`` dict. Passed through verbatim
+        on the :class:`InlineContext`.
+    inputs:
+        The inputs dict resolved by the caller from prior-state outputs,
+        in the same shape :class:`~ctxr.fsm.core.models.Brief.inputs`
+        carries.
+    registry:
+        Optional :class:`InlineHandlerRegistry` to look up the handler
+        in. When ``None``, the module-level default returned by
+        :func:`get_default_registry` is used.
+
+    Returns
+    -------
+    InlineExecutionResult
+        ``ok=True`` and ``outputs`` populated on success. ``ok=False``
+        with a kebab-case ``fault_reason`` on every failure mode:
+
+        * ``inline_handler_unregistered`` — no handler registered for
+          ``(ctx.fsm_id, state.inline.handler_id)``.
+        * ``inline_handler_raised`` — handler raised an exception.
+          The ``fault_reason`` includes the exception type name and
+          its ``str()`` representation; the full traceback is NOT
+          captured here (callers that want one log it from the
+          calling try/except at the SQLite-layer boundary).
+        * ``inline_handler_bad_return_type`` — handler returned
+          something other than ``dict[str, Any]``.
+        * ``inline_handler_validation_failed`` — handler returned a
+          dict but it did not validate against
+          ``state.inline.response_schema``.
+        * ``inline_handler_post_validation_failed`` — handler returned
+          a schema-valid dict but at least one
+          :attr:`~ctxr.fsm.core.models.InlineSpec.post_validations`
+          predicate evaluated to ``False``.
+    """
+    if state.inline is None:
+        raise TypeError(
+            f"execute_inline called on state {state.id!r} which is not an inline state"
+        )
+
+    inline_spec = state.inline
+    handler_id = inline_spec.handler_id
+    chosen_registry = registry if registry is not None else get_default_registry()
+
+    handler = chosen_registry.lookup(ctx.fsm_id, handler_id)
+    if handler is None:
+        return InlineExecutionResult(
+            handler_id=handler_id,
+            ok=False,
+            outputs={},
+            validation=ValidationResult(valid=True, errors=[]),
+            post_validations=None,
+            fault_reason=(
+                f"inline_handler_unregistered: {ctx.fsm_id}/{handler_id}"
+            ),
+        )
+
+    # Build the handler's read-only context envelope.
+    inline_ctx = InlineContext(
+        run_id=ctx.run_id,
+        fsm_id=ctx.fsm_id,
+        state_id=state.id,
+        iteration_n=ctx.iteration_n,
+        args=dict(args),
+        inputs=dict(inputs),
+    )
+
+    # Invoke the handler; capture any raise as a structured fault.
+    try:
+        raw_output = handler(inline_ctx)
+    except Exception as exc:
+        return InlineExecutionResult(
+            handler_id=handler_id,
+            ok=False,
+            outputs={},
+            validation=ValidationResult(valid=True, errors=[]),
+            post_validations=None,
+            fault_reason=(
+                f"inline_handler_raised: {type(exc).__name__}: {exc}"
+            ),
+        )
+
+    # The handler MUST return a dict; anything else is a contract bug.
+    if not isinstance(raw_output, dict):
+        return InlineExecutionResult(
+            handler_id=handler_id,
+            ok=False,
+            outputs={},
+            validation=ValidationResult(valid=True, errors=[]),
+            post_validations=None,
+            fault_reason=(
+                "inline_handler_bad_return_type: expected dict, "
+                f"got {type(raw_output).__name__}"
+            ),
+        )
+
+    # Validate against the optional response schema. A schema-less
+    # inline state is treated as always-valid (same convention the
+    # worker path uses in ``validate_output``).
+    if inline_spec.response_schema is None:
+        validation = ValidationResult(valid=True, errors=[])
+    else:
+        valid, errors = inline_spec.response_schema.model_validate_json_payload(
+            raw_output
+        )
+        validation = ValidationResult(valid=valid, errors=errors)
+        if not valid:
+            return InlineExecutionResult(
+                handler_id=handler_id,
+                ok=False,
+                outputs={},
+                validation=validation,
+                post_validations=None,
+                fault_reason="inline_handler_validation_failed",
+            )
+
+    # Run the inline-state's post-validation predicates (if any). The
+    # shape mirrors ``run_post_validations`` on workers but evaluates
+    # against ``raw_output`` directly — same convention.
+    post_result: PostValidationResult | None = None
+    if inline_spec.post_validations:
+        entries: list[PostValidationResultEntry] = []
+        all_valid = True
+        for predicate in inline_spec.post_validations:
+            if not validate_expression(predicate.expression):
+                entries.append(
+                    PostValidationResultEntry(
+                        check="inline_post_validation",
+                        expression=predicate.expression,
+                        result=False,
+                        error="malformed predicate expression",
+                    )
+                )
+                all_valid = False
+                continue
+            try:
+                result = evaluate_expression(predicate.expression, raw_output)
+            except (PredicateParseError, PredicateEvalError) as exc:
+                entries.append(
+                    PostValidationResultEntry(
+                        check="inline_post_validation",
+                        expression=predicate.expression,
+                        result=False,
+                        error=str(exc),
+                    )
+                )
+                all_valid = False
+                continue
+            entries.append(
+                PostValidationResultEntry(
+                    check="inline_post_validation",
+                    expression=predicate.expression,
+                    result=bool(result),
+                )
+            )
+            if not result:
+                all_valid = False
+        post_result = PostValidationResult(valid=all_valid, results=entries)
+        if not all_valid:
+            return InlineExecutionResult(
+                handler_id=handler_id,
+                ok=False,
+                outputs={},
+                validation=validation,
+                post_validations=post_result,
+                fault_reason="inline_handler_post_validation_failed",
+            )
+
+    # All-clear: handler returned a dict, the schema accepts it, and
+    # every post-validation passed.
+    return InlineExecutionResult(
+        handler_id=handler_id,
+        ok=True,
+        outputs=dict(raw_output),
+        validation=validation,
+        post_validations=post_result,
+        fault_reason=None,
     )

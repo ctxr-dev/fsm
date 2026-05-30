@@ -216,6 +216,38 @@ def _check_loop_semantics(state: State) -> list[str]:
     return errors
 
 
+def _check_inline_semantics(state: State) -> list[str]:
+    """Return error strings for any inline-shape violations on ``state``.
+
+    Pydantic's :class:`State` validator already raises on construction
+    when an inline state with outgoing transitions has no
+    ``inline.response_schema`` (transition guards need a defined output
+    shape to read), so a well-constructed :class:`FsmSpec` cannot
+    reach this function with a violation. The check is repeated here
+    as a *defensive* invariant: it documents the rule, runs cheaply,
+    and survives any future relaxation of the constructor-time
+    validator.
+
+    Inline handler REGISTRATION is intentionally NOT validated here:
+    handlers register at runtime via
+    :class:`~ctxr.fsm.core.inline_registry.InlineHandlerRegistry` and
+    a missing handler surfaces at engine advance time as a structured
+    :class:`~ctxr.fsm.core.models.InlineExecutionResult` fault — not
+    as a spec-load error. The contract is documented on
+    :func:`validate_fsm_spec`.
+    """
+    errors: list[str] = []
+    if state.inline is None:
+        return errors
+    if state.transitions and state.inline.response_schema is None:
+        errors.append(
+            f"state {state.id!r}: inline state with transitions must declare "
+            "inline.response_schema so transition guards have a defined output "
+            "shape to read"
+        )
+    return errors
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -233,11 +265,29 @@ def validate_fsm_spec(spec: FsmSpec) -> FsmValidationResult:
     3. **Loop semantics.** For each state with a :attr:`State.loop`,
        :attr:`Loop.done_field` must appear in the loop worker's
        response schema properties.
-    4. **Predicate parsability.** Every Predicate expression embedded
+    4. **Inline semantics.** For each state with a
+       :attr:`State.inline`, declaring outgoing transitions requires
+       :attr:`~ctxr.fsm.core.models.InlineSpec.response_schema` to be
+       set (so transition guards have a defined output shape to read).
+       Inline states with no transitions are valid terminals.
+    5. **Predicate parsability.** Every Predicate expression embedded
        in a transition guard or a post-validation must parse via
        :func:`ctxr.fsm.core.predicates.validate_expression`. If the
        predicates module is not importable in the current environment
        (e.g. early bootstrap), this check is skipped silently.
+
+    What is **not** validated here:
+
+    * Inline handler **registration** is intentionally out of scope.
+      Inline handlers register at runtime against
+      :class:`~ctxr.fsm.core.inline_registry.InlineHandlerRegistry`;
+      a missing registration surfaces at engine advance time as a
+      structured :class:`~ctxr.fsm.core.models.InlineExecutionResult`
+      fault with ``fault_reason="inline_handler_unregistered: ..."``.
+      Validating the registry at spec-load time would couple this
+      module to runtime state and break the
+      ``Project.register_spec`` → ``Project.register_inline_handlers``
+      ordering that consumers are free to interleave.
 
     Returns a :class:`FsmValidationResult` whose ``valid`` field is
     ``True`` iff no errors were collected.
@@ -274,7 +324,11 @@ def validate_fsm_spec(spec: FsmSpec) -> FsmValidationResult:
     for state in spec.states:
         errors.extend(_check_loop_semantics(state))
 
-    # --- (4) Predicate parsability ------------------------------------------
+    # --- (4) Inline semantics -----------------------------------------------
+    for state in spec.states:
+        errors.extend(_check_inline_semantics(state))
+
+    # --- (5) Predicate parsability ------------------------------------------
     validator = _resolve_predicate_validator()
     if validator is not None:
         for location, expression in _iter_predicate_expressions(spec):

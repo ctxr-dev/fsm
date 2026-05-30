@@ -59,6 +59,7 @@ def _sha256_hex(payload: bytes) -> str:
 
 
 _STATE_ID_RE = re_compile(r"^[a-z][a-z0-9_]*$")
+_HANDLER_ID_RE = re_compile(r"^[a-z][a-z0-9_]*$")
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +125,8 @@ class EventKind(StrEnum):
     commit_token_issued = "commit_token_issued"
     commit_token_consumed = "commit_token_consumed"
     commit_token_expired = "commit_token_expired"
+    inline_executed = "inline_executed"
+    inline_failed = "inline_failed"
 
 
 class DeliveryStatus(StrEnum):
@@ -316,6 +319,55 @@ class Predicate(BaseModel):
         return value
 
 
+class InlineSpec(BaseModel):
+    """A deterministic, server-side state handler specification.
+
+    An inline state is the fourth state kind alongside ``worker``,
+    ``loop``, and ``terminal``. Where a worker state pauses the engine
+    so an out-of-process LLM (or any other dispatcher) can produce the
+    state's outputs, an inline state runs a registered Python callable
+    in-process during ``engine.advance()`` — in the SAME atomic
+    transaction as the surrounding state transition, with no LLM round
+    trip.
+
+    Fields
+    ------
+    handler_id:
+        Snake-case slug identifying which registered callable to invoke
+        for this state. The engine looks this id up in the inline
+        handler registry at advance time; registration is the consumer's
+        responsibility and is NOT validated at spec-load time.
+    response_schema:
+        Optional JSON Schema (wrapped in :class:`ResponseSchema`) the
+        handler's return dict is validated against. When the inline
+        state has outgoing transitions, a schema is required so the
+        transition guards have a defined output shape to read.
+    post_validations:
+        Optional :class:`Predicate` list evaluated against the handler's
+        output. Same semantics as :attr:`State.post_validations`, except
+        these are scoped to the inline handler's return value.
+    purpose:
+        Human-readable description shown in briefs/dashboards alongside
+        the surrounding state's :attr:`State.purpose`.
+    """
+
+    model_config = _DOMAIN_CFG
+
+    handler_id: str
+    response_schema: ResponseSchema | None = None
+    post_validations: list[Predicate] = Field(default_factory=list)
+    purpose: str = ""
+
+    @field_validator("handler_id")
+    @classmethod
+    def _handler_id_shape(cls, value: str) -> str:
+        if not _HANDLER_ID_RE.match(value):
+            raise ValueError(
+                "InlineSpec.handler_id must match ^[a-z][a-z0-9_]*$"
+            )
+        return value
+
+
 class Transition(BaseModel):
     """A single transition out of a state, with a guard."""
 
@@ -425,6 +477,7 @@ class State(BaseModel):
     preconditions: list[str] = Field(default_factory=list)
     worker: Worker | None = None
     loop: Loop | None = None
+    inline: InlineSpec | None = None
     outputs: list[str] = Field(default_factory=list)
     post_validations: list[Predicate] = Field(default_factory=list)
     transitions: list[Transition] = Field(default_factory=list)
@@ -438,11 +491,49 @@ class State(BaseModel):
             raise ValueError("state id must match ^[a-z][a-z0-9_]*$")
         return value
 
+    @property
+    def kind(self) -> Literal["loop", "inline", "worker", "terminal"]:
+        """Return the derived kind of this state.
+
+        The kind is derived from which body fields are set, not stored:
+
+        * ``"loop"``   — :attr:`loop` is non-None.
+        * ``"inline"`` — :attr:`inline` is non-None (and :attr:`loop` is None).
+        * ``"worker"`` — :attr:`worker` is non-None (and :attr:`loop` /
+          :attr:`inline` are None).
+        * ``"terminal"`` — all three body fields are None AND
+          :attr:`transitions` is empty.
+
+        A state with no body fields but a non-empty :attr:`transitions`
+        list is structurally invalid (a "pass-through" worker would
+        need somebody to produce its outputs) and raises ``ValueError``.
+        """
+        if self.loop is not None:
+            return "loop"
+        if self.inline is not None:
+            return "inline"
+        if self.worker is not None:
+            return "worker"
+        if not self.transitions:
+            return "terminal"
+        raise ValueError(
+            f"state {self.id!r}: terminal-by-content but has transitions; "
+            "set a worker / loop / inline body or remove the transitions"
+        )
+
     @model_validator(mode="after")
     def _consistency(self) -> State:
         if self.worker is not None and self.loop is not None:
             raise ValueError(
                 f"state {self.id!r}: cannot have both `worker` and `loop` set"
+            )
+        if self.inline is not None and self.worker is not None:
+            raise ValueError(
+                f"state {self.id!r}: cannot have both `inline` and `worker` set"
+            )
+        if self.inline is not None and self.loop is not None:
+            raise ValueError(
+                f"state {self.id!r}: cannot have both `inline` and `loop` set"
             )
         if self.loop is not None:
             schema = (
@@ -456,6 +547,16 @@ class State(BaseModel):
                     f"state {self.id!r}: loop.done_field {self.loop.done_field!r} "
                     "must be declared in loop.worker.response_schema.properties"
                 )
+        if (
+            self.inline is not None
+            and self.transitions
+            and self.inline.response_schema is None
+        ):
+            raise ValueError(
+                f"state {self.id!r}: inline state with transitions must declare "
+                "inline.response_schema so transition guards have a defined "
+                "output shape to read"
+            )
         return self
 
 
@@ -661,6 +762,41 @@ class PostValidationResult(BaseModel):
     results: list[PostValidationResultEntry]
 
 
+class InlineExecutionResult(BaseModel):
+    """The outcome of executing an inline state handler.
+
+    Returned by :func:`ctxr.fsm.core.engine.execute_inline`. The shape
+    is a single envelope (not a discriminated union) so callers can
+    branch on the ``ok`` flag and consume ``fault_reason`` / ``outputs``
+    accordingly:
+
+    * ``ok=True``  — the handler ran, returned a dict, validated
+      against any declared response schema and post-validations. The
+      handler's return value is in ``outputs``.
+    * ``ok=False`` — the handler did not produce usable outputs.
+      ``fault_reason`` carries a short slug naming the failure mode
+      (``inline_handler_unregistered``, ``inline_handler_raised``,
+      ``inline_handler_bad_return_type``,
+      ``inline_handler_validation_failed``,
+      ``inline_handler_post_validation_failed``). ``validation`` always
+      carries the schema-validation report (vacuously valid when no
+      schema is declared); ``post_validations`` is populated only when
+      the inline spec declared post-validations.
+
+    The model is strict + frozen + extra-forbid like the surrounding
+    domain envelopes; mis-typed kwargs surface immediately.
+    """
+
+    model_config = _DOMAIN_CFG
+
+    handler_id: str
+    ok: bool
+    outputs: dict[str, Any] = Field(default_factory=dict)
+    validation: ValidationResult
+    post_validations: PostValidationResult | None = None
+    fault_reason: str | None = None
+
+
 class TransitionEvaluation(BaseModel):
     """The outcome of evaluating one transition guard at exit time."""
 
@@ -707,6 +843,8 @@ __all__ = [
     "DeliveryStatus",
     "EventKind",
     "FsmSpec",
+    "InlineExecutionResult",
+    "InlineSpec",
     "Loop",
     "LoopDecision",
     "PostValidationResult",
