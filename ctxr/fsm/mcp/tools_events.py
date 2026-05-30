@@ -73,8 +73,8 @@ from ctxr.fsm.core.models import JournalStatus
 from ctxr.fsm.mcp import mcp
 from ctxr.fsm.mcp._drain_decorator import drain_aware
 from ctxr.fsm.mcp._errors import McpToolError, as_error
+from ctxr.fsm.mcp._shared_enums import JournalAction
 from ctxr.fsm.mcp._state import get_project
-from ctxr.fsm.mcp.tools_runs import JournalAction
 from ctxr.fsm.sqlite.repos_events import Consumer, Event, Producer
 from ctxr.fsm.sqlite.repos_locks_journal import JournalTxn
 

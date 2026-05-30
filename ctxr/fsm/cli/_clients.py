@@ -28,7 +28,6 @@ from __future__ import annotations
 from enum import StrEnum
 
 __all__ = [
-    "ConfigFormat",
     "EnsureActionStatus",
     "EnsureMode",
     "EnsureStatus",
@@ -172,25 +171,16 @@ class EnsureMode(StrEnum):
       is part of the deliverable).
     * ``mcp_only`` — headless CI mode: bring up the MCP server only.
 
-    Wire-format note: the legacy ``--mode mcp-only`` (hyphenated) is
-    replaced by ``--mode mcp_only`` (underscored) so the CLI flag value
-    matches the enum member's ``.value``. The Typer command keeps
-    accepting the underscore form; the colloquial hyphen form is no
-    longer recognised.
+    Wire-format note: the canonical CLI flag value is the underscored
+    ``--mode mcp_only`` so it matches the enum member's ``.value``. The
+    Typer command continues to accept the legacy hyphenated form
+    ``--mode mcp-only`` through ``ensure_cmd._MODE_ALIASES`` and emits
+    a one-line deprecation warning to stderr when it sees it; the
+    hyphen form is slated for removal in a future minor release. Docs
+    + tests + new code should always use the underscore form.
     """
 
     full = "full"
     mcp_only = "mcp_only"
 
 
-class ConfigFormat(StrEnum):
-    """Discriminator for the per-client config file format.
-
-    Used by the generic merge helper in
-    :mod:`ctxr.fsm.cli.install_mcp_cmd` so a single
-    ``merge_idempotent`` knows whether to dispatch the JSON merge path
-    (Claude, Cursor) or the TOML splice path (Codex).
-    """
-
-    json = "json"
-    toml = "toml"

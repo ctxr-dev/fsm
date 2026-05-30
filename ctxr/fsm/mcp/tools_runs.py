@@ -71,6 +71,7 @@ from ctxr.fsm.core.verifier import VerifierOutcome, run_verifier
 from ctxr.fsm.mcp import mcp
 from ctxr.fsm.mcp._drain_decorator import drain_aware
 from ctxr.fsm.mcp._errors import McpToolError, as_error
+from ctxr.fsm.mcp._shared_enums import JournalAction
 from ctxr.fsm.mcp._state import get_project
 from ctxr.fsm.sqlite import Project
 from ctxr.fsm.sqlite.models_core import RunTable, StateTable, TransitionTable
@@ -111,18 +112,6 @@ class CommitResultKind(StrEnum):
     loop_continued = "loop_continued"
     terminal = "terminal"
     fault = "fault"
-
-
-class JournalAction(StrEnum):
-    """Action a resume / journal-recovery call may take on a pending tx.
-
-    Surfaced on ``ResumeRunInput.journal`` and on the dedicated
-    journal-recovery MCP/CLI surface. ``discard`` rolls the pending
-    journal_txn back; ``replay`` finalises its staged writes.
-    """
-
-    discard = "discard"
-    replay = "replay"
 
 
 # Module logger. The server entry-point configures the root logger to

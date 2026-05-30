@@ -143,7 +143,7 @@ uv run ctxr-fsm ensure --json
 
 ### Run the MCP server standalone (for Claude Code stdio integration)
 
-When you want JUST the MCP child (no FastAPI, no UI), `ctxr-fsm ensure --mode mcp-only --json` is the supervisor-managed path. For a raw standalone process (debugging, one-off connection):
+When you want JUST the MCP child (no FastAPI, no UI), `ctxr-fsm ensure --mode mcp_only --json` is the supervisor-managed path (the legacy hyphenated form `mcp-only` is still accepted with a deprecation warning). For a raw standalone process (debugging, one-off connection):
 
 ```bash
 uv run ctxr-fsm mcp --db ./.ctxr-fsm/fsm.db
