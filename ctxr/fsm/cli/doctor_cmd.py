@@ -66,7 +66,7 @@ from ctxr.fsm.cli._common import (
     open_project_for_cli,
     resolve_db_path,
 )
-from ctxr.fsm.cli._render import _portable_project_repr, render_subsystem_table
+from ctxr.fsm.cli._render import portable_project_repr, render_subsystem_table
 from ctxr.fsm.cli.lifecycle.primitives import (
     _probe_healthz,
     pid_is_alive,
@@ -352,7 +352,7 @@ def _print_pretty_report(
     byte-identical to ``ctxr-fsm ensure`` and the supervisor banner.
     """
     console = Console()
-    db_repr = _portable_project_repr(db_path)
+    db_repr = portable_project_repr(db_path)
     revision_line = revision or "(no alembic_version row)"
     panel = Panel.fit(
         f"[bold]DB[/bold]       {db_repr}\n"

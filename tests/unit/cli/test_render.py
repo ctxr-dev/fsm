@@ -5,8 +5,9 @@ The renderer (:mod:`ctxr.fsm.cli._render`) is shared by ``ensure``,
 column ordering, the project-row content, the swagger-derivation
 rule for the ``api`` row, the "skip missing subsystems" semantics
 (``--mode mcp_only`` only ships an ``mcp`` block; W14i renamed the
-wire value from the hyphenated ``mcp-only``), and the colour mapping
-per status.
+wire value from the legacy hyphenated form, which Typer still accepts
+with a deprecation warning via ``ensure_cmd._MODE_ALIASES``), and the
+colour mapping per status.
 
 ANSI capture pattern
 --------------------
@@ -29,7 +30,7 @@ from pathlib import Path
 from rich.console import Console
 
 from ctxr.fsm.cli._render import (
-    _portable_project_repr,
+    portable_project_repr,
     render_subsystem_table,
 )
 
@@ -123,7 +124,7 @@ def test_render_subsystem_table_includes_project_row(tmp_path: Path) -> None:
     idx_mcp = output.index("mcp")
     assert idx_project < idx_mcp
     # The portable repr appears verbatim in the project row.
-    expected_repr = _portable_project_repr(tmp_path)
+    expected_repr = portable_project_repr(tmp_path)
     assert expected_repr in output
 
 
@@ -199,15 +200,47 @@ def test_render_subsystem_table_status_colours(tmp_path: Path) -> None:
     """Each closed-vocabulary status maps to its expected Rich colour.
 
     Rich uses ANSI escape codes for colours; we ``force_terminal``
-    so they survive the StringIO capture. Specific colour codes:
-
-    * green: ``\\x1b[1;32m`` (bold green)
-    * yellow: ``\\x1b[1;33m``
-    * red: ``\\x1b[1;31m``
-
-    We capture three rendered tables (one per colour-class) and
-    assert the matching ANSI prefix appears in the captured string.
+    so they survive the StringIO capture. We assert on the SGR
+    PARAMETER tokens (``1`` for bold, ``32`` / ``33`` / ``31`` for the
+    8-colour green / yellow / red foregrounds) regex-matched inside a
+    ``CSI ... m`` escape sequence, NOT on a fixed concatenation like
+    ``\\x1b[1;32m``. Rich's emit format varies across versions and
+    color-system settings (combined ``\\x1b[1;32m`` vs split
+    ``\\x1b[1m\\x1b[32m`` vs reordered parameters), so a regex that
+    accepts either ordering survives Rich upgrades while still pinning
+    the actual SGR intent (bold AND the specific colour code on the
+    same status row, not just any digit pair that happens to appear).
     """
+    # Helper: parse out every SGR escape's parameter set into a frozenset.
+    # An SGR escape is ``CSI <params> m`` where params is a ``;``-joined
+    # decimal list. We collect every SGR set that appears in the output
+    # so the assertion can ask "did some SGR include both 1 (bold) and N
+    # (the target colour code)?" without caring about parameter order or
+    # whether Rich split bold + colour into two consecutive escapes.
+    import re as _re
+    from itertools import pairwise as _pairwise
+
+    sgr_re = _re.compile(r"\x1b\[([\d;]*)m")
+
+    def _styling_sets(output: str) -> list[frozenset[str]]:
+        """Return one parameter-set per SGR escape in ``output``."""
+        return [frozenset(m.group(1).split(";")) for m in sgr_re.finditer(output)]
+
+    def _has_bold_color(output: str, color: str) -> bool:
+        """True iff some SGR includes BOTH the bold flag (1) AND ``color``.
+
+        Covers the combined form (``\\x1b[1;32m`` -> ``{1, 32}``) AND the
+        split form (``\\x1b[1m\\x1b[32m`` -> ``{1}`` then ``{32}``,
+        which we accept when adjacent in the output's SGR sequence).
+        """
+        sets = _styling_sets(output)
+        for params in sets:
+            if "1" in params and color in params:
+                return True
+        # Split form: find a ``{1}``-only SGR immediately followed by a
+        # ``{color}``-only SGR.
+        return any("1" in prev and color in curr for prev, curr in _pairwise(sets))
+
     # Green (ready / spawned).
     green_payload = {
         "subsystems": {
@@ -220,14 +253,7 @@ def test_render_subsystem_table_status_colours(tmp_path: Path) -> None:
         }
     }
     green_output = _render_to_string(green_payload, project_root=tmp_path, force_terminal=True)
-    # Rich emits a specific SGR sequence for ``bold green`` on a
-    # truecolor terminal: ``\x1b[1;32m``. Pinning the full sequence
-    # rather than just ``"32"`` keeps the test from passing silently
-    # when any other column happens to contain the digits 32 (a PID,
-    # a port number, a future timestamp); a colour regression that
-    # drops the bold-green styling cannot accidentally still satisfy
-    # the assertion.
-    assert "\x1b[1;32m" in green_output
+    assert _has_bold_color(green_output, "32"), "expected bold-green SGR"
 
     # Yellow (reused / degraded).
     yellow_payload = {
@@ -241,7 +267,7 @@ def test_render_subsystem_table_status_colours(tmp_path: Path) -> None:
         }
     }
     yellow_output = _render_to_string(yellow_payload, project_root=tmp_path, force_terminal=True)
-    assert "\x1b[1;33m" in yellow_output
+    assert _has_bold_color(yellow_output, "33"), "expected bold-yellow SGR"
 
     # Red (missing / unreachable / failed).
     red_payload = {
@@ -255,7 +281,7 @@ def test_render_subsystem_table_status_colours(tmp_path: Path) -> None:
         }
     }
     red_output = _render_to_string(red_payload, project_root=tmp_path, force_terminal=True)
-    assert "\x1b[1;31m" in red_output
+    assert _has_bold_color(red_output, "31"), "expected bold-red SGR"
 
 
 def test_render_subsystem_table_unknown_status_falls_back(tmp_path: Path) -> None:
@@ -308,19 +334,19 @@ def test_render_subsystem_table_missing_pid_shows_dash(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_portable_project_repr_under_cwd(tmp_path: Path) -> None:
+def testportable_project_repr_under_cwd(tmp_path: Path) -> None:
     """``project_root`` under ``base`` renders as ``./<rel>``."""
     nested = tmp_path / "inner" / "project"
     nested.mkdir(parents=True)
-    assert _portable_project_repr(nested, base=tmp_path) == "./inner/project"
+    assert portable_project_repr(nested, base=tmp_path) == "./inner/project"
 
 
-def test_portable_project_repr_equal_to_base(tmp_path: Path) -> None:
+def testportable_project_repr_equal_to_base(tmp_path: Path) -> None:
     """``project_root`` equal to ``base`` collapses to ``.`` (not ``./``)."""
-    assert _portable_project_repr(tmp_path, base=tmp_path) == "."
+    assert portable_project_repr(tmp_path, base=tmp_path) == "."
 
 
-def test_portable_project_repr_absolute_fallback(tmp_path: Path) -> None:
+def testportable_project_repr_absolute_fallback(tmp_path: Path) -> None:
     """An outside-of-base + outside-of-home path renders as an absolute path."""
     # tmp_path is typically under /private/var or /tmp — but we pass a
     # base that's *under* tmp_path so tmp_path itself becomes "outside"
@@ -328,7 +354,7 @@ def test_portable_project_repr_absolute_fallback(tmp_path: Path) -> None:
     # so the absolute fallback kicks in.
     inner = tmp_path / "inner"
     inner.mkdir()
-    rendered = _portable_project_repr(tmp_path, base=inner)
+    rendered = portable_project_repr(tmp_path, base=inner)
     # When tmp_path is also under Path.home() (some test runners),
     # the ``~``-prefixed form wins; otherwise the absolute path.
     assert rendered.startswith("~/") or rendered == str(tmp_path)

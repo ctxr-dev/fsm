@@ -148,29 +148,6 @@ if [[ "${RULE5_HITS}" -gt 0 ]]; then
   HITS=$((HITS + RULE5_HITS))
 fi
 
-# --- Rule 7: flat-folder log/artefact paths ---------------------------
-# Any directory that ACCUMULATES files over time (logs, exports, audit
-# trails, telemetry dumps) MUST live under a YYYY/MM/DD sharded tree
-# (use ``sharded_log_path`` from lifecycle.primitives) so the folder
-# doesn't grow into a flat bottleneck (ext4 / APFS / NTFS all degrade
-# past ~10k–100k entries per directory; even ``ls`` and tab-completion
-# crawl). The user flagged this on W14j when ensure_cmd wrote
-# ``.ctxr-fsm/logs/supervisor-YYYYMMDD.log`` directly.
-#
-# Patterns flagged: any literal ``.ctxr-fsm/logs/`` followed by a
-# filename token (not by a sub-shard name like a year, ``${category}``,
-# or a typed Path expression).
-#
-# This rule looks at the SOURCE tree (ctxr/fsm/); test fixtures that
-# hand-craft a path to assert the layout are justified.
-RULE7=$(grep -rn '\.ctxr-fsm/logs/[a-z]\{1,\}-' "${SRC_DIR}" 2>/dev/null | _filter_justified || true)
-RULE7_HITS=$(echo -n "${RULE7}" | grep -c '^' || true)
-if [[ "${RULE7_HITS}" -gt 0 ]]; then
-  echo "--- audit-strings: rule7 (flat .ctxr-fsm/logs/<file> bypasses sharded_log_path)"
-  _report "rule7-flat-logs-folder" "${RULE7}"
-  HITS=$((HITS + RULE7_HITS))
-fi
-
 # --- Rule 6: argparse / click in CLI surface --------------------------
 # Every CLI command in ctxr-fsm is a typer subcommand. Other parsers
 # fragment the CLI shape; bespoke pretty-print primitives fragment the
@@ -191,6 +168,29 @@ if [[ "${RULE6_HITS}" -gt 0 ]]; then
   echo "--- audit-strings: rule6 (argparse/click forbidden in cli/)"
   echo -ne "${RULE6}" | _report "rule6-non-typer-parser" "$(cat)"
   HITS=$((HITS + RULE6_HITS))
+fi
+
+# --- Rule 7: flat-folder log/artefact paths ---------------------------
+# Any directory that ACCUMULATES files over time (logs, exports, audit
+# trails, telemetry dumps) MUST live under a YYYY/MM/DD sharded tree
+# (use ``sharded_log_path`` from lifecycle.primitives) so the folder
+# doesn't grow into a flat bottleneck (ext4 / APFS / NTFS all degrade
+# past ~10k to 100k entries per directory; even ``ls`` and tab-completion
+# crawl). The user flagged this on W14j when ensure_cmd wrote
+# ``.ctxr-fsm/logs/supervisor-YYYYMMDD.log`` directly.
+#
+# Patterns flagged: any literal ``.ctxr-fsm/logs/`` followed by a
+# filename token (not by a sub-shard name like a year, ``${category}``,
+# or a typed Path expression).
+#
+# This rule looks at the SOURCE tree (ctxr/fsm/); test fixtures that
+# hand-craft a path to assert the layout are justified.
+RULE7=$(grep -rn '\.ctxr-fsm/logs/[a-z]\{1,\}-' "${SRC_DIR}" 2>/dev/null | _filter_justified || true)
+RULE7_HITS=$(echo -n "${RULE7}" | grep -c '^' || true)
+if [[ "${RULE7_HITS}" -gt 0 ]]; then
+  echo "--- audit-strings: rule7 (flat .ctxr-fsm/logs/<file> bypasses sharded_log_path)"
+  _report "rule7-flat-logs-folder" "${RULE7}"
+  HITS=$((HITS + RULE7_HITS))
 fi
 
 if [[ "${HITS}" -gt 0 ]]; then

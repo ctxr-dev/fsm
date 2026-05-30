@@ -19,6 +19,7 @@ choices.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -26,24 +27,29 @@ from rich.console import Console
 from rich.table import Table
 
 __all__ = [
+    "portable_project_repr",
     "print_subsystem_table",
     "render_subsystem_table",
 ]
 
 
 # Status display + Rich style mapping. Closed vocabulary, hosted here
-# so call sites never reach for ad-hoc colour strings. New subsystem
-# statuses must be added here (and only here) — the renderer falls
-# back to ``unknown`` for anything outside the table so a typo in a
-# caller surfaces visibly rather than silently.
+# so call sites never reach for ad-hoc colour strings.
 #
-# We deliberately do NOT introduce a ``Literal[...]`` typing on the
-# input ``status`` field: the renderer accepts whatever the per-call
-# site supplies (``EnsureActionStatus`` values, the supervisor's
-# ``"ready"`` literal, the doctor's ``"unreachable"``) and falls back
-# to ``unknown`` instead of raising. Keeping the surface forgiving
-# means a future caller can add a new status word without breaking
-# the renderer, and the per-call site keeps owning its own enum.
+# Canonical input vocabulary: ``EnsureActionStatus`` members
+# (``applied``, ``current``, ``skipped``, ``unchanged``, ``reused``,
+# ``spawned``, ``failed``, ``missing``) PLUS the supervisor's
+# ``"ready"`` post-boot literal and the doctor's ``"unreachable"``
+# probe outcome. Every member of that set MUST have an entry below.
+#
+# Soft-validation policy: the renderer never raises on a status word
+# outside the table — it falls back to the ``unknown`` row (dim white).
+# That keeps the renderer forgiving so a future caller can add a new
+# status word without breaking the table, BUT every unknown lookup
+# fires a one-line stderr warning so a typo in a caller surfaces
+# visibly during development rather than getting silently absorbed.
+# Adding a new permanent status word means adding it to the table
+# below; the warning is the alarm that says "do that now".
 _STATUS_GLYPHS: dict[str, tuple[str, str]] = {
     "ready": ("ready", "bold green"),
     "reused": ("reused", "bold yellow"),
@@ -62,12 +68,24 @@ def _format_status(status: str) -> tuple[str, str]:
     Falls back to the ``unknown`` row so a brand-new status word from
     a caller renders visibly (dim white) rather than crashing the
     renderer. The fallback is the only place the renderer tolerates
-    drift; everything else is data-in / data-out.
+    drift; everything else is data-in / data-out. An unknown lookup
+    also fires a one-line stderr warning so a typo in a caller's
+    status string is visible during development instead of being
+    silently absorbed — see the module-level ``_STATUS_GLYPHS``
+    comment for the soft-validation rationale.
     """
-    return _STATUS_GLYPHS.get(status, _STATUS_GLYPHS["unknown"])
+    glyph = _STATUS_GLYPHS.get(status)
+    if glyph is None:
+        sys.stderr.write(
+            f"_render: warning: status {status!r} not in _STATUS_GLYPHS; "
+            "falling back to 'unknown'. Add the new status word to the "
+            "table if it is a permanent vocabulary extension.\n"
+        )
+        return _STATUS_GLYPHS["unknown"]
+    return glyph
 
 
-def _portable_project_repr(project_root: Path, *, base: Path | None = None) -> str:
+def portable_project_repr(project_root: Path, *, base: Path | None = None) -> str:
     """Render ``project_root`` in the most-portable form for the table.
 
     Mirrors :func:`ctxr.fsm.cli.install_mcp_cmd._portable_repr` so the
@@ -91,9 +109,15 @@ def _portable_project_repr(project_root: Path, *, base: Path | None = None) -> s
         return "." if rel_str == "." else f"./{rel_str}"
     home = Path.home()
     try:
-        return "~/" + str(project_root.relative_to(home))
+        rel_home = project_root.relative_to(home)
     except ValueError:
         return str(project_root)
+    # ``project_root == home`` collapses ``relative_to(home)`` to
+    # ``Path(".")``; render that as a bare ``~`` instead of ``~/.``
+    # so the cell stays idiomatic (matching the cwd branch's bare
+    # ``.`` collapse above).
+    rel_home_str = str(rel_home)
+    return "~" if rel_home_str == "." else "~/" + rel_home_str
 
 
 def render_subsystem_table(
@@ -155,7 +179,7 @@ def render_subsystem_table(
     # Leading project row — structural context, not a subsystem.
     table.add_row(
         "Project",
-        _portable_project_repr(project_root),
+        portable_project_repr(project_root),
         "",
         "",
         "",
