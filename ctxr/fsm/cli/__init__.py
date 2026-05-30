@@ -139,9 +139,13 @@ app.command(
     name="mcp",
     help="Run the Model Context Protocol server (stdio or http transport).",
 )(mcp_cmd.mcp)
-app.command(name="api", help="(Stub) FastAPI HTTP / SSE surface — ships in W5.")(
-    api_cmd.api
-)
+# ``api`` is the W5 entry point — boots the FastAPI HTTP / SSE
+# server. The help string mentions both surfaces (HTTP + SSE) so
+# operators see the shape on ``ctxr-fsm --help`` without drilling in.
+app.command(
+    name="api",
+    help="Run the FastAPI HTTP / SSE server (binds --host/--port).",
+)(api_cmd.api)
 app.command(name="ui", help="(Stub) local UI launcher — ships in W6/W7.")(
     ui_cmd.ui
 )

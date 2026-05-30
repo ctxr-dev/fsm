@@ -183,39 +183,64 @@ def test_mcp_rejects_out_of_range_port() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ``api`` — FastAPI stub (W5)
+# ``api`` — FastAPI server (W5, now implemented)
 # ---------------------------------------------------------------------------
+#
+# These tests used to assert on the W3 stub's deferral message. W5
+# replaced the stub with a real boot path that takes over the process
+# until uvicorn returns, so we can no longer ``invoke(app, ["api"])``
+# from a unit test — that would actually start the FastAPI / uvicorn
+# loop and block. Instead we exercise the surface via ``--help`` (which
+# the Typer runner can render without entering the command body) and
+# assert that every documented flag (``--host``, ``--port``,
+# ``--reload``, ``--db``) is listed. Real end-to-end coverage of the
+# boot sequence is a W5 integration test that drives the server in a
+# subprocess with an HTTP client; that lives outside this stub-shaped
+# file.
 
 
-def test_api_stub_exits_nonzero_with_deferral_message() -> None:
-    """``ctxr-fsm api`` must defer to W5 and exit non-zero."""
+def test_api_help_lists_host_port_reload_and_db_options() -> None:
+    """``ctxr-fsm api --help`` documents the W5 flag surface."""
+    result = runner.invoke(app, ["api", "--help"])
+
+    # ``--help`` always exits 0 — anything else means a registration
+    # regression (e.g. the import in cli/__init__.py was dropped).
+    assert result.exit_code == 0, (
+        f"`api --help` must exit 0 (got {result.exit_code}); "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    # Each flag must be visible by name so operator scripts and the
+    # docs site can reliably parse the help text. We assert on the
+    # long-form name with the leading double-dash because Typer's
+    # rich help renderer can wrap descriptions but always prints the
+    # flag token verbatim on its own line.
+    assert "--host" in result.stdout
+    assert "--port" in result.stdout
+    assert "--reload" in result.stdout
+
+    # ``--db`` is shared across every subcommand — also documented here
+    # so callers see the full surface in one screen. Asserting on it
+    # too pins the wiring against an accidental drop of ``DB_OPTION``.
+    assert "--db" in result.stdout
+
+
+def test_api_rejects_out_of_range_port() -> None:
+    """``--port`` outside 0-65535 fails Typer's bound check.
+
+    We allow ``port=0`` (let the OS pick a free ephemeral port) so the
+    lower bound is ``0``, not ``1``; the upper bound is the canonical
+    TCP maximum. Going past either trips Typer's range validation
+    before the server boots.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         _project_db(tmpdir)
-        result = runner.invoke(app, ["api"])
+        result = runner.invoke(app, ["api", "--port", "70000"])
 
-    assert result.exit_code != 0
-    assert "FastAPI server lands in W5" in result.stderr
-
-
-def test_api_stub_accepts_valid_host_and_port() -> None:
-    """Custom ``--host`` / ``--port`` values reach the stub body."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        _project_db(tmpdir)
-        result = runner.invoke(
-            app,
-            ["api", "--host", "0.0.0.0", "--port", "9090"],
-        )
-
-    assert result.exit_code == 1
-    assert "lands in W5" in result.stderr
-
-
-def test_api_stub_rejects_out_of_range_port() -> None:
-    """``--port`` outside 1-65535 fails Typer's bound check."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        _project_db(tmpdir)
-        result = runner.invoke(app, ["api", "--port", "808080"])
-
+    # ``typer.BadParameter`` renders through Click's usage-error path,
+    # which exits with code 2. We assert "non-zero, not 1" so the
+    # distinction between validation failure (2) and any future stub-
+    # style deferral (1) stays explicit.
     assert result.exit_code != 0
     assert result.exit_code != 1
 
@@ -264,11 +289,11 @@ def test_ui_stub_rejects_out_of_range_port() -> None:
     ("subcommand", "marker"),
     [
         # Stub commands carry an explicit "ships in W{N}" marker in
-        # their registered help line. ``mcp`` is now the real W4
-        # implementation, so its top-level help string no longer
-        # advertises a workstream — see the dedicated case below.
+        # their registered help line. ``mcp`` (W4) and ``api`` (W5)
+        # are now real implementations, so their top-level help
+        # strings no longer advertise a workstream — see the
+        # dedicated cases below.
         ("serve", "W7"),
-        ("api", "W5"),
         ("ui", "W6"),
     ],
 )
@@ -307,3 +332,22 @@ def test_mcp_registered_and_visible_in_help() -> None:
     # distinctive token — far less likely to false-match than "MCP"
     # which could collide with another command's description.
     assert "Protocol" in result.stdout
+
+
+def test_api_registered_and_visible_in_help() -> None:
+    """The real ``api`` command must appear on the top-level help screen.
+
+    Mirrors :func:`test_mcp_registered_and_visible_in_help` for the
+    now-implemented W5 command — the parametrised case above can't
+    cover it because ``api``'s help line no longer carries a
+    workstream marker. Asserting on the subcommand name plus a stable
+    token from the registered help text pins both the registration
+    and the documented purpose.
+    """
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "api" in result.stdout
+    # "FastAPI" is the stable, distinctive token in the registered
+    # help line — unlikely to false-match against any other command's
+    # description.
+    assert "FastAPI" in result.stdout

@@ -65,6 +65,28 @@ target-version = "py312"
 select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF"]
 ignore = ["E501"]
 
+[tool.ruff.lint.per-file-ignores]
+# The FastAPI app intentionally imports its feature routers at the
+# bottom of ``ctxr/fsm/api/__init__.py`` so each router attaches to a
+# fully-constructed ``app`` (with CORS, lifespan, and always-on
+# endpoints already in place). The trailing import block is the
+# documented FastAPI pattern for avoiding circular imports between
+# the app module and its routes.
+"ctxr/fsm/api/__init__.py" = ["E402"]
+# FastAPI's idiomatic ``Query(...)`` / ``Depends(...)`` defaults trip
+# ``B008`` ("do not perform function call in argument defaults"). The
+# defaults are sentinel marker objects, not values — replacing them
+# with module-level singletons would lose the parameter metadata
+# (descriptions, validation bounds) that FastAPI reads to build the
+# OpenAPI schema.
+"ctxr/fsm/api/routes_*.py" = ["B008"]
+# Test cleanup paths intentionally use ``try / except: pass`` so the
+# comment block documenting *why* the swallow is safe stays attached
+# to the suppressed call. Rewriting to ``contextlib.suppress`` would
+# either drop the comment or split it across the ``with`` line.
+"tests/integration/api/test_api_auth.py" = ["SIM105"]
+"tests/integration/api/test_api_events_sse.py" = ["SIM105"]
+
 [tool.mypy]
 strict = true
 python_version = "3.12"
@@ -117,6 +139,44 @@ module = [
     "ctxr.fsm.mcp.tools_meta",
 ]
 disable_error_code = ["arg-type", "attr-defined", "call-overload"]
+
+[[tool.mypy.overrides]]
+# HTTP route handlers under ``ctxr.fsm.api.*`` hit two flavours of
+# typing friction that have nothing to do with the routes themselves:
+#
+# 1. They occasionally fall through to ad-hoc SQLAlchemy queries
+#    (``select(...).where(Table.col == x)``, ``.order_by(Table.col.desc())``)
+#    against the W2 SQLModel tables, which run into the same column-
+#    descriptor-as-value friction documented on the repository override
+#    block above. That produces ``arg-type`` / ``attr-defined``.
+# 2. The ``EventsRepo`` / ``EventDeliveriesRepo`` bus exposes a value
+#    object named ``Event`` that overlaps the lifecycle ``Event`` we
+#    re-export from ``ctxr.fsm.sqlite`` (see the docstring in that
+#    package's ``__init__``). The route handlers list the lifecycle
+#    type as their response model and feed bus rows back through, so
+#    mypy sees a ``misc`` / ``arg-type`` mismatch on every handoff.
+# 3. ``Project.runs`` returns repository payloads whose interior
+#    fields are typed ``Any`` in a few places (engine-level state
+#    tree, event-journal iterator), so handlers that return the value
+#    unchanged trip ``no-any-return`` even though the runtime shape
+#    matches the declared response model.
+#
+# Suppress ONLY the codes those three issues produce — every other
+# surface in the route modules stays strictly typed (request /
+# response models, dependency wiring, control flow).
+module = [
+    "ctxr.fsm.api.routes_admin",
+    "ctxr.fsm.api.routes_events",
+    "ctxr.fsm.api.routes_runs",
+    "ctxr.fsm.api.routes_specs",
+]
+disable_error_code = [
+    "arg-type",
+    "attr-defined",
+    "call-overload",
+    "misc",
+    "no-any-return",
+]
 
 [tool.pytest.ini_options]
 addopts = "-ra -q --strict-markers"
