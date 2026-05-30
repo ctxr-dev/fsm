@@ -1,0 +1,823 @@
+"""``ctxr-fsm install-mcp`` — register ctxr-fsm as an MCP server in client configs.
+
+This command wires the ctxr-fsm stdio MCP entry into whichever AI-client
+config files we can find:
+
+* **Claude Code project-local** — ``<target>/.mcp.json`` (the
+  workspace-scoped MCP server map) and/or
+  ``<target>/.claude/settings.json`` (the project-scoped settings
+  block with an ``mcpServers`` key). Both are JSON and we only OWN
+  the ``mcpServers.ctxr-fsm`` key — every other top-level key and
+  every other server in ``mcpServers`` passes through unmodified.
+* **Codex user-level** — ``~/.codex/config.toml`` ``[mcp_servers.ctxr-fsm]``
+  table. We prefer ``codex mcp add`` when the ``codex`` binary is on
+  PATH; otherwise we hand-edit the TOML directly. Our table is the
+  only one we touch.
+* **Cursor user-level** — ``~/.cursor/mcp.json`` ``mcpServers.ctxr-fsm``.
+
+The stdio entry written is the same in every shape:
+
+* JSON: ``{"command":"ctxr-fsm","args":["mcp","--transport","stdio"],"env":{}}``
+* TOML: ``command = "ctxr-fsm"\\nargs = ["mcp", "--transport", "stdio"]``
+
+The MCP server learns its DB path at startup by walking up from the
+inherited cwd looking for ``.ctxr-fsm/`` (see ``ctxr.fsm.cli.mcp_cmd``
+— that walk-up is what makes the stdio entry portable across
+projects).
+
+Modes
+-----
+
+* ``run_install_mcp(target_dir, client="auto")`` — apply patches.
+* ``run_install_mcp(target_dir, client=..., check=True)`` — read-only
+  probe; returns ``status: installed|missing|out-of-date`` per detected
+  client.
+* ``run_install_mcp(target_dir, client=..., dry_run=True)`` — describe
+  the patches that would be written; no filesystem mutation.
+
+Idempotency
+-----------
+
+* If the existing on-disk file already contains an entry deep-equal to
+  ours, we do not rewrite the file at all (``action="unchanged"``).
+* Otherwise the merge preserves every other key verbatim, writes via
+  tmp+rename, and indents output to match the file's existing style
+  (2-space / 4-space / tab; defaults to 2-space when undetermined or
+  empty).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal
+
+import typer
+
+from ctxr.fsm.cli._common import json_or_pretty
+
+__all__ = ["install_mcp", "run_install_mcp"]
+
+
+# ---------------------------------------------------------------------------
+# Constants — entry shape + supported clients
+# ---------------------------------------------------------------------------
+
+# Allowed values for the ``--client`` flag. ``auto`` is a meta-value
+# that fans out to every detected client. ``none`` short-circuits to a
+# no-op — useful for ``ctxr-fsm ensure --no-mcp-config`` plumbing.
+_CLIENT_CHOICES: tuple[str, ...] = ("auto", "claude", "codex", "cursor", "none")
+
+# The MCP entry's logical name as it appears in every client config.
+# Kept as a constant so a rename only touches one place + every
+# matching test can grep for the same literal.
+_ENTRY_NAME: str = "ctxr-fsm"
+
+# The stdio entry payload (JSON-shape). Codex's TOML emit is derived
+# from this dict so the two surfaces stay in lockstep.
+_STDIO_ENTRY_JSON: dict[str, Any] = {
+    "command": "ctxr-fsm",
+    "args": ["mcp", "--transport", "stdio"],
+    "env": {},
+}
+
+
+# ---------------------------------------------------------------------------
+# Indent detection (JSON files)
+# ---------------------------------------------------------------------------
+
+
+def _detect_indent(text: str) -> str:
+    """Return the indent unit used by the file's first nested line.
+
+    The merge path preserves whatever style the user already had so
+    a re-write does not balloon a diff with whitespace-only noise. We
+    look at the first line that begins with whitespace and try to
+    classify it:
+
+    * Starts with a tab → ``"\\t"``.
+    * Starts with N spaces (1 ≤ N ≤ 8) → ``"  "`` or ``"    "`` etc.
+    * Anything else (empty file, single-line JSON, unknown form) →
+      default to 2 spaces.
+
+    We deliberately default to 2-space rather than ``json.dumps``'s
+    default of "no indent / single line" so a fresh file we create
+    is human-readable straight away.
+    """
+    for line in text.splitlines():
+        if not line:
+            continue
+        if line[0] == "\t":
+            return "\t"
+        if line[0] == " ":
+            count = 0
+            for ch in line:
+                if ch != " ":
+                    break
+                count += 1
+            if 1 <= count <= 8:
+                return " " * count
+            return "  "
+    return "  "
+
+
+# ---------------------------------------------------------------------------
+# JSON read / merge / write
+# ---------------------------------------------------------------------------
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Atomic write via tmp + rename, ensuring trailing newline.
+
+    Same idiom as :func:`ctxr.fsm.cli.lifecycle.primitives._atomic_write_text`;
+    duplicated here to avoid pulling the lifecycle module into the
+    install path. Both files are stable enough that the drift cost is
+    near zero.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _load_json_or_empty(path: Path) -> tuple[dict[str, Any], str | None]:
+    """Return ``(dict, original_text)``; both empty when file is missing.
+
+    A bare list / number / string at the JSON root is treated as a
+    malformed file for our purposes (we own a key inside an object
+    layer) and raises so the caller can surface a friendly error
+    rather than silently overwriting.
+    """
+    if not path.exists():
+        return {}, None
+    text = path.read_text(encoding="utf-8")
+    stripped = text.strip()
+    if not stripped:
+        return {}, text
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{path} exists but is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise ValueError(
+            f"{path} top-level must be a JSON object; got {type(loaded).__name__}"
+        )
+    return loaded, text
+
+
+def _ensure_mcp_servers_block(
+    doc: dict[str, Any], *, source_path: Path
+) -> dict[str, Any]:
+    """Return ``doc['mcpServers']``, creating it as an empty dict if absent.
+
+    Refuses to overwrite a non-object ``mcpServers`` value: that
+    indicates the file was written by a different tool with a
+    different contract, and silently clobbering it would be a much
+    worse failure mode than a loud error. The brief explicitly calls
+    out this guard.
+    """
+    block = doc.get("mcpServers")
+    if block is None:
+        new_block: dict[str, Any] = {}
+        doc["mcpServers"] = new_block
+        return new_block
+    if not isinstance(block, dict):
+        raise ValueError(
+            f"{source_path}: 'mcpServers' must be a JSON object; "
+            f"got {type(block).__name__}. Aborting to avoid clobbering "
+            "the existing config."
+        )
+    return block
+
+
+def _merge_json_entry(
+    *, path: Path, dry_run: bool, check: bool
+) -> dict[str, Any]:
+    """JSON merger shared by Claude .mcp.json / Cursor mcp.json.
+
+    Returns a per-client outcome dict with keys:
+
+    * ``path`` — the file we read/wrote.
+    * ``action`` — one of ``applied`` | ``unchanged`` | ``would-apply`` |
+      ``would-create`` | ``check:installed`` | ``check:missing`` |
+      ``check:out-of-date``.
+    * ``status`` (check mode only) — same as the suffix of ``action``.
+    * ``detail`` — short human-readable note for diagnostics.
+    """
+    existing, original_text = _load_json_or_empty(path)
+    indent = _detect_indent(original_text or "")
+
+    existing_servers = (
+        _ensure_mcp_servers_block(existing, source_path=path)
+        if path.exists()
+        else {}
+    )
+    current_entry = existing_servers.get(_ENTRY_NAME)
+    desired_entry = dict(_STDIO_ENTRY_JSON)
+    is_installed = current_entry == desired_entry
+
+    if check:
+        if current_entry is None:
+            status = "missing"
+        elif is_installed:
+            status = "installed"
+        else:
+            status = "out-of-date"
+        return {
+            "path": str(path),
+            "action": f"check:{status}",
+            "status": status,
+            "detail": (
+                "entry matches desired stdio shape"
+                if status == "installed"
+                else "entry absent" if status == "missing"
+                else "entry present but differs from desired shape"
+            ),
+        }
+
+    if is_installed:
+        return {
+            "path": str(path),
+            "action": "unchanged",
+            "detail": "ctxr-fsm entry already matches; no write needed",
+        }
+
+    # Build the patched document for both dry-run preview + write.
+    patched = existing if path.exists() else {}
+    servers = (
+        _ensure_mcp_servers_block(patched, source_path=path)
+        if path.exists()
+        else {}
+    )
+    if not path.exists():
+        # Fresh file: single block, single entry.
+        patched = {"mcpServers": {_ENTRY_NAME: desired_entry}}
+        servers = patched["mcpServers"]
+    else:
+        servers[_ENTRY_NAME] = desired_entry
+        patched["mcpServers"] = servers
+
+    new_text = json.dumps(patched, indent=indent, sort_keys=False) + "\n"
+
+    if dry_run:
+        return {
+            "path": str(path),
+            "action": ("would-create" if not path.exists() else "would-apply"),
+            "detail": (
+                f"would write {len(new_text)} bytes "
+                f"({'create' if not path.exists() else 'update'})"
+            ),
+            "preview": new_text,
+        }
+
+    _atomic_write(path, new_text)
+    return {
+        "path": str(path),
+        "action": "applied",
+        "detail": "ctxr-fsm entry merged into mcpServers",
+    }
+
+
+# ---------------------------------------------------------------------------
+# TOML read / merge / write (Codex)
+# ---------------------------------------------------------------------------
+
+
+def _emit_codex_toml_block() -> str:
+    """Return the canonical ``[mcp_servers.ctxr-fsm]`` block as text.
+
+    Hand-rolled (rather than via ``tomli-w``) because we only own a
+    single, fixed-shape table with two string-array values; the cost
+    of a third-party write-dependency for this one case is not worth
+    it. The format we emit is the TOML canonical form (``key = ...``,
+    arrays bracketed, strings double-quoted).
+    """
+    # ``json.dumps`` is the easiest way to emit a JSON-style string
+    # array that also happens to be valid TOML for an array of
+    # quoted strings.
+    args_arr = json.dumps(_STDIO_ENTRY_JSON["args"])
+    return (
+        "[mcp_servers.ctxr-fsm]\n"
+        f'command = "{_STDIO_ENTRY_JSON["command"]}"\n'
+        f"args = {args_arr}\n"
+    )
+
+
+def _read_codex_toml(path: Path) -> dict[str, Any] | None:
+    """Return the parsed TOML doc, or ``None`` if absent.
+
+    Malformed TOML raises (caller surfaces a friendly error) so we
+    never silently overwrite hand-edited content we can't parse.
+    """
+    if not path.exists():
+        return None
+    return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+def _codex_current_entry(doc: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Extract ``mcp_servers.ctxr-fsm`` from a parsed Codex doc."""
+    if doc is None:
+        return None
+    block = doc.get("mcp_servers")
+    if not isinstance(block, dict):
+        return None
+    entry = block.get(_ENTRY_NAME)
+    if isinstance(entry, dict):
+        return entry
+    return None
+
+
+def _codex_entry_matches_desired(entry: dict[str, Any] | None) -> bool:
+    """Compare an existing Codex TOML entry to the desired stdio shape.
+
+    We compare only the keys we own (``command`` and ``args``). Codex
+    users sometimes add their own ``env`` / ``cwd`` keys; preserving
+    those (rather than wiping them) is the polite default.
+    """
+    if entry is None:
+        return False
+    matches: bool = (
+        entry.get("command") == _STDIO_ENTRY_JSON["command"]
+        and entry.get("args") == _STDIO_ENTRY_JSON["args"]
+    )
+    return matches
+
+
+def _splice_codex_toml_block(*, original: str, new_block: str) -> str:
+    """Replace ``[mcp_servers.ctxr-fsm]`` in ``original`` with ``new_block``.
+
+    A minimal hand-rolled splicer that only touches our own table.
+    Algorithm:
+
+    1. Scan the file line by line.
+    2. Locate the ``[mcp_servers.ctxr-fsm]`` header.
+    3. Drop every line from that header up to (but not including) the
+       NEXT line that begins with ``[`` (the next table header) — that
+       is the slice of the document our table owns.
+    4. Insert ``new_block`` at the header's start position.
+    5. If the header was not present, append ``new_block`` to the END
+       of the file (preceded by a blank line if the file is non-empty
+       and doesn't already end with one).
+
+    The result preserves every other table, comment, and blank line.
+    """
+    header = "[mcp_servers.ctxr-fsm]"
+    lines = original.splitlines(keepends=True)
+    start_idx: int | None = None
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        if line.strip() == header:
+            start_idx = i
+            # Find the next table header (any ``[...]`` at column 0).
+            for j in range(i + 1, len(lines)):
+                stripped = lines[j].lstrip()
+                if stripped.startswith("[") and not stripped.startswith("[["):
+                    # New table header. Backtrack over any
+                    # immediately-preceding blank lines so we don't
+                    # leave a double-blank where the table used to be.
+                    end_idx = j
+                    while end_idx > start_idx + 1 and lines[end_idx - 1].strip() == "":
+                        end_idx -= 1
+                    break
+            else:
+                end_idx = len(lines)
+            break
+
+    if start_idx is None:
+        # Append at the end. Pad with blank lines so the new table is
+        # visually separated from whatever ended the file.
+        prefix = original
+        if prefix and not prefix.endswith("\n"):
+            prefix += "\n"
+        if prefix.strip():
+            prefix += "\n"
+        return prefix + new_block
+
+    # Splice: keep [0:start_idx) + new block + [end_idx:).
+    head = "".join(lines[:start_idx])
+    tail = "".join(lines[end_idx or start_idx + 1 :])
+    return head + new_block + tail
+
+
+def _can_use_codex_cli() -> bool:
+    """``True`` iff the ``codex`` binary is on PATH.
+
+    Probed via :func:`shutil.which` so we never spawn the binary just
+    to see whether it exists. The CLI path is preferred because it
+    keeps Codex's own validation in the loop (the CLI rejects bad
+    args / writes the canonical TOML form).
+    """
+    return shutil.which("codex") is not None
+
+
+def _invoke_codex_cli_add(*, dry_run: bool) -> dict[str, Any]:
+    """Run ``codex mcp add ctxr-fsm -- ctxr-fsm mcp --transport stdio``.
+
+    Returns the same outcome dict shape JSON merger returns so callers
+    can treat both paths uniformly. ``dry_run`` short-circuits to a
+    "would-invoke" record without spawning Codex.
+    """
+    cmd = [
+        "codex",
+        "mcp",
+        "add",
+        _ENTRY_NAME,
+        "--",
+        "ctxr-fsm",
+        "mcp",
+        "--transport",
+        "stdio",
+    ]
+    if dry_run:
+        return {
+            "path": "~/.codex/config.toml",
+            "action": "would-apply",
+            "detail": f"would invoke: {' '.join(cmd)}",
+        }
+    res = subprocess.run(
+        cmd, capture_output=True, text=True, check=False
+    )
+    if res.returncode != 0:
+        return {
+            "path": "~/.codex/config.toml",
+            "action": "failed",
+            "detail": (
+                f"codex mcp add exited {res.returncode}: "
+                f"stdout={res.stdout!r} stderr={res.stderr!r}"
+            ),
+        }
+    return {
+        "path": "~/.codex/config.toml",
+        "action": "applied",
+        "detail": "codex mcp add succeeded",
+    }
+
+
+def _merge_codex_toml_direct(
+    *, path: Path, dry_run: bool, check: bool
+) -> dict[str, Any]:
+    """TOML merger fallback when the ``codex`` binary is absent."""
+    try:
+        existing_doc = _read_codex_toml(path)
+    except tomllib.TOMLDecodeError as exc:
+        return {
+            "path": str(path),
+            "action": "failed",
+            "detail": f"{path} exists but is not valid TOML: {exc}",
+        }
+
+    current_entry = _codex_current_entry(existing_doc)
+    matches = _codex_entry_matches_desired(current_entry)
+
+    if check:
+        if current_entry is None:
+            status = "missing"
+        elif matches:
+            status = "installed"
+        else:
+            status = "out-of-date"
+        return {
+            "path": str(path),
+            "action": f"check:{status}",
+            "status": status,
+            "detail": (
+                "entry matches desired stdio shape"
+                if status == "installed"
+                else "entry absent" if status == "missing"
+                else "entry present but differs from desired shape"
+            ),
+        }
+
+    if matches:
+        return {
+            "path": str(path),
+            "action": "unchanged",
+            "detail": "ctxr-fsm table already matches; no write needed",
+        }
+
+    original_text = path.read_text(encoding="utf-8") if path.exists() else ""
+    patched_text = _splice_codex_toml_block(
+        original=original_text, new_block=_emit_codex_toml_block()
+    )
+
+    if dry_run:
+        return {
+            "path": str(path),
+            "action": "would-create" if not path.exists() else "would-apply",
+            "detail": f"would write {len(patched_text)} bytes",
+            "preview": patched_text,
+        }
+
+    _atomic_write(path, patched_text)
+    return {
+        "path": str(path),
+        "action": "applied",
+        "detail": "ctxr-fsm TOML table spliced",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Client detection + dispatch
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _ClientTask:
+    """One concrete (client, target_path) pair the dispatcher will act on."""
+
+    client: Literal["claude", "codex", "cursor"]
+    path: Path
+    # For Claude only: the workspace .mcp.json AND the settings.json
+    # block can BOTH be present; the dispatcher emits one task per
+    # path so the per-task report is still a single outcome dict.
+    label: str = ""
+
+    # Keep mypy happy with field()
+    _: tuple[()] = field(default=())
+
+
+def _claude_targets(target_dir: Path) -> list[Path]:
+    """Return the Claude config paths to act on.
+
+    Per the brief:
+
+    * ``<target_dir>/.mcp.json`` is preferred when it already exists OR
+      when ``target_dir`` looks like a workspace root (has ``.git/`` or
+      a ``CLAUDE.md``).
+    * ``<target_dir>/.claude/settings.json`` is also probed; if its
+      ``mcpServers`` block exists we also touch it.
+
+    Both are appended so a project that uses both surfaces stays in
+    sync. If neither exists and the dir doesn't look like a workspace,
+    we still default to ``.mcp.json`` (fresh-create) when the explicit
+    client is ``claude`` — the brief is explicit about this contract
+    for the "auto" path (workspace-root heuristic) and the "claude"
+    explicit path (always emit).
+    """
+    out: list[Path] = []
+    workspace_marker = (
+        (target_dir / ".git").exists() or (target_dir / "CLAUDE.md").exists()
+    )
+    mcp_json = target_dir / ".mcp.json"
+    if mcp_json.exists() or workspace_marker:
+        out.append(mcp_json)
+    settings_json = target_dir / ".claude" / "settings.json"
+    if settings_json.exists():
+        out.append(settings_json)
+    if not out:
+        # Caller asked us about Claude explicitly but neither file
+        # exists and the dir isn't obviously a workspace; fall back to
+        # the .mcp.json convention so a fresh-create still happens.
+        out.append(mcp_json)
+    return out
+
+
+def _cursor_target() -> Path:
+    """Return ``~/.cursor/mcp.json``.
+
+    Cursor's MCP config lives in the user home, not per-project.
+    """
+    return Path.home() / ".cursor" / "mcp.json"
+
+
+def _codex_target() -> Path:
+    """Return ``~/.codex/config.toml`` (Codex user-level config)."""
+    return Path.home() / ".codex" / "config.toml"
+
+
+def _resolve_tasks(target_dir: Path, client: str) -> list[_ClientTask]:
+    """Resolve the ``--client`` value into concrete (client, path) tasks.
+
+    ``auto`` probes each client and includes those whose config file
+    exists OR (for Claude) whose target dir is a workspace root.
+    Explicit names always emit a task even when the file is absent
+    (the merger will create it).
+    """
+    tasks: list[_ClientTask] = []
+
+    if client in ("auto", "claude"):
+        # Auto includes Claude only when SOMETHING points at it
+        # (existing file or workspace marker); explicit always emits.
+        if client == "claude":
+            for path in _claude_targets(target_dir):
+                tasks.append(_ClientTask(client="claude", path=path))
+        else:
+            workspace = (
+                (target_dir / ".git").exists()
+                or (target_dir / "CLAUDE.md").exists()
+            )
+            mcp_json = target_dir / ".mcp.json"
+            settings_json = target_dir / ".claude" / "settings.json"
+            if mcp_json.exists() or workspace:
+                tasks.append(_ClientTask(client="claude", path=mcp_json))
+            if settings_json.exists():
+                tasks.append(_ClientTask(client="claude", path=settings_json))
+
+    if client in ("auto", "codex"):
+        codex_path = _codex_target()
+        if client == "codex" or codex_path.exists():
+            tasks.append(_ClientTask(client="codex", path=codex_path))
+
+    if client in ("auto", "cursor"):
+        cursor_path = _cursor_target()
+        if client == "cursor" or cursor_path.exists():
+            tasks.append(_ClientTask(client="cursor", path=cursor_path))
+
+    return tasks
+
+
+def _dispatch_one(
+    task: _ClientTask, *, dry_run: bool, check: bool
+) -> dict[str, Any]:
+    """Run one task and return its outcome dict.
+
+    Dispatches by client kind: Claude + Cursor share the JSON merger;
+    Codex uses the CLI path when available and the TOML splicer
+    otherwise.
+    """
+    if task.client in ("claude", "cursor"):
+        try:
+            outcome = _merge_json_entry(
+                path=task.path, dry_run=dry_run, check=check
+            )
+        except ValueError as exc:
+            outcome = {
+                "path": str(task.path),
+                "action": "failed",
+                "detail": str(exc),
+            }
+        outcome["client"] = task.client
+        return outcome
+
+    # Codex.
+    if not check and not dry_run and _can_use_codex_cli():
+        outcome = _invoke_codex_cli_add(dry_run=False)
+        outcome["client"] = "codex"
+        return outcome
+    if dry_run and _can_use_codex_cli():
+        outcome = _invoke_codex_cli_add(dry_run=True)
+        outcome["client"] = "codex"
+        return outcome
+    outcome = _merge_codex_toml_direct(
+        path=task.path, dry_run=dry_run, check=check
+    )
+    outcome["client"] = "codex"
+    return outcome
+
+
+# ---------------------------------------------------------------------------
+# Public entry point — used by both Typer command and ``ctxr-fsm ensure``
+# ---------------------------------------------------------------------------
+
+
+def run_install_mcp(
+    target_dir: Path,
+    client: Literal["auto", "claude", "codex", "cursor", "none"] = "auto",
+    dry_run: bool = False,
+    check: bool = False,
+) -> dict[str, Any]:
+    """Apply (or probe) the ctxr-fsm stdio MCP entry across detected clients.
+
+    Pure function: never prints, never raises typer.Exit — callers
+    layer that on top. Returns a JSON-serialisable summary dict::
+
+        {
+          "target": "/abs/path",
+          "client": "auto",
+          "dry_run": False,
+          "check": False,
+          "results": [
+            {"client": "claude", "path": "...", "action": "applied", ...},
+            ...
+          ],
+        }
+    """
+    if client not in _CLIENT_CHOICES:
+        raise ValueError(
+            f"client must be one of {_CLIENT_CHOICES!r}; got {client!r}"
+        )
+
+    target_dir = target_dir.expanduser().resolve()
+
+    summary: dict[str, Any] = {
+        "target": str(target_dir),
+        "client": client,
+        "dry_run": dry_run,
+        "check": check,
+        "results": [],
+    }
+
+    if client == "none":
+        summary["results"] = []
+        return summary
+
+    tasks = _resolve_tasks(target_dir, client)
+    if not tasks:
+        summary["results"] = []
+        summary["detail"] = (
+            "no client config files detected (looked for .mcp.json, "
+            ".claude/settings.json, ~/.codex/config.toml, ~/.cursor/mcp.json)"
+        )
+        return summary
+
+    results: list[dict[str, Any]] = []
+    for task in tasks:
+        results.append(_dispatch_one(task, dry_run=dry_run, check=check))
+    summary["results"] = results
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Typer entry point
+# ---------------------------------------------------------------------------
+
+
+def install_mcp(
+    target: Path | None = typer.Option(  # noqa: B008 — typer sentinel
+        None,
+        "--target",
+        help=(
+            "Directory containing project-local MCP client config "
+            "(.mcp.json, .claude/settings.json). Defaults to the "
+            "current working directory."
+        ),
+        resolve_path=True,
+    ),
+    client: str = typer.Option(
+        "auto",
+        "--client",
+        help=(
+            "Which MCP client config to patch: 'auto' (detect), 'claude', "
+            "'codex', 'cursor', or 'none' (no-op)."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Print the patches that would be written without touching "
+            "the filesystem."
+        ),
+    ),
+    check: bool = typer.Option(
+        False,
+        "--check",
+        help=(
+            "Read-only probe: report status per client without applying. "
+            "Exits non-zero if any client is missing or out-of-date."
+        ),
+    ),
+    json_mode: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit machine-readable JSON instead of pretty-printed output.",
+    ),
+) -> None:
+    """Register ctxr-fsm as a stdio MCP server in detected client configs.
+
+    See the module docstring for the full per-client behaviour and
+    idempotency guarantees.
+    """
+    if client not in _CLIENT_CHOICES:
+        raise typer.BadParameter(
+            f"--client must be one of {', '.join(_CLIENT_CHOICES)}, "
+            f"got {client!r}"
+        )
+
+    resolved_target = (target if target is not None else Path.cwd()).resolve()
+
+    try:
+        # Typer narrows ``client`` at the str level; cast to the literal
+        # union the pure function expects without re-validating here.
+        summary = run_install_mcp(
+            target_dir=resolved_target,
+            client=client,  # type: ignore[arg-type]
+            dry_run=dry_run,
+            check=check,
+        )
+    except ValueError as exc:
+        # _resolve_tasks doesn't raise ValueError but the JSON parser
+        # underneath does on a malformed existing file. Surface that
+        # as a non-zero exit with a friendly stderr message.
+        sys.stderr.write(f"error: {exc}\n")
+        raise typer.Exit(1) from exc
+
+    json_or_pretty(summary, json_mode)
+
+    # In --check mode: exit non-zero if any client is missing /
+    # out-of-date so CI scripts can detect drift.
+    if check:
+        bad = [
+            r for r in summary.get("results", [])
+            if r.get("status") in ("missing", "out-of-date")
+        ]
+        if bad:
+            raise typer.Exit(1)

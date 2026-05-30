@@ -67,6 +67,7 @@ from ctxr.fsm.cli._common import (
 from ctxr.fsm.cli.lifecycle.primitives import (
     _probe_healthz,
     pid_is_alive,
+    read_active_mcp_file,
     read_pid_file,
     recall_port,
 )
@@ -230,16 +231,25 @@ def _supervisor_subsystem_report(
 def _supervisor_report(project_root: Path) -> dict[str, Any]:
     """Aggregate per-subsystem reports into one stable map.
 
-    Returns ``{"subsystems": {name: report, ...}}`` so the JSON output
-    can grow additional supervisor-level keys (e.g. an ``active_run``
-    section once W12 lands) without breaking the existing
+    Returns ``{"subsystems": {name: report, ...},
+    "active_mcp": <discovery-doc> | None}`` so the JSON output can grow
+    additional supervisor-level keys (e.g. an ``active_run`` section
+    once W12 lands) without breaking the existing
     ``payload["supervisor"]["subsystems"]["mcp"]`` access path.
+
+    The ``active_mcp`` block is the W14c discovery document — verbatim
+    if present, ``None`` when no supervisor has booted yet (or the
+    last one shut down cleanly). Operators reach for this when a
+    skill complains about the HTTP-SSE MCP URL — the doctor's surface
+    is the canonical "what URL would the bootstrap fall back to right
+    now" answer.
     """
     return {
         "subsystems": {
             name: _supervisor_subsystem_report(name, project_root=project_root)
             for name in _SUPERVISOR_SUBSYSTEMS
-        }
+        },
+        "active_mcp": read_active_mcp_file(project_root),
     }
 
 

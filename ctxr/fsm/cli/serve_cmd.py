@@ -61,6 +61,16 @@ def serve(
             "operator's job (systemd, nohup, container PID 1)."
         ),
     ),
+    mcp_only: bool = typer.Option(
+        False,
+        "--mcp-only",
+        help=(
+            "Boot ONLY the MCP child; skip the API and UI subsystems. "
+            "Useful for headless CI and for ``ctxr-fsm ensure --mode "
+            "mcp-only``. The active-mcp.json discovery file still lands "
+            "with only the mcp block populated."
+        ),
+    ),
 ) -> None:
     """Run the unified ``ctxr-fsm serve`` supervisor.
 
@@ -86,4 +96,4 @@ def serve(
     # wraps :func:`anyio.run` around the async ``run_supervisor`` body
     # and handles the SIGINT/SIGTERM translation internally, so this
     # call only returns once every child has been drained.
-    main(mode=mode, db_path=db)
+    main(mode=mode, db_path=db, mcp_only=mcp_only)

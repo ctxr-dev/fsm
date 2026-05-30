@@ -70,6 +70,21 @@ _DEFAULT_DB_RELATIVE: Path = Path(".ctxr-fsm") / "fsm.db"
 _ENV_VAR_NAME: str = "CTXR_FSM_DB"
 
 
+def _walk_up_for_state_dir(start: Path) -> Path | None:
+    """Return the nearest ancestor of ``start`` containing ``.ctxr-fsm``.
+
+    Walk-up tier of :func:`resolve_db_path` — see that function's
+    docstring for the rationale. Returns ``None`` if no ancestor has a
+    ``.ctxr-fsm`` directory so the caller can fall back to the cwd
+    default.
+    """
+    current = start.resolve()
+    for candidate in [current, *current.parents]:
+        if (candidate / ".ctxr-fsm").is_dir():
+            return candidate
+    return None
+
+
 def resolve_db_path(db_opt: Path | None) -> Path:
     """Apply the CLI's layered precedence to produce a concrete DB path.
 
@@ -78,8 +93,18 @@ def resolve_db_path(db_opt: Path | None) -> Path:
     1. ``--db`` / ``-d`` (the ``db_opt`` argument).
     2. ``$CTXR_FSM_DB`` (read live from ``os.environ`` so the lookup
        reflects any test ``monkeypatch.setenv`` call).
-    3. ``$(pwd) / .ctxr-fsm / fsm.db`` — the canonical project-local
+    3. Walk up from the current working directory looking for an
+       ancestor that contains ``.ctxr-fsm/``; return that ancestor's
+       ``.ctxr-fsm/fsm.db``.
+    4. ``$(pwd) / .ctxr-fsm / fsm.db`` — the canonical project-local
        location, matching the directory that ``ctxr-fsm init`` creates.
+
+    The walk-up tier (step 3) was added in W14d so the stdio MCP entry
+    written by ``ctxr-fsm install-mcp`` stays portable across
+    projects: a client (Claude Code, Cursor, Codex) spawns
+    ``ctxr-fsm mcp`` with the user's CURRENT cwd inherited; the
+    walk-up finds the right project root even when the user is
+    several directories deep.
 
     The returned path is always absolute (resolved against the current
     working directory) so downstream code can compare and log paths
@@ -90,6 +115,9 @@ def resolve_db_path(db_opt: Path | None) -> Path:
     env_value = os.environ.get(_ENV_VAR_NAME)
     if env_value:
         return Path(env_value).expanduser().resolve()
+    found_root = _walk_up_for_state_dir(Path.cwd())
+    if found_root is not None:
+        return (found_root / _DEFAULT_DB_RELATIVE).resolve()
     return (Path.cwd() / _DEFAULT_DB_RELATIVE).resolve()
 
 

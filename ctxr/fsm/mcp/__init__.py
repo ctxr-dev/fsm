@@ -107,6 +107,42 @@ mcp: FastMCP = FastMCP(
 )
 
 
+# ----------------------------------------------------------------------
+# Health probe (W14c)
+# ----------------------------------------------------------------------
+#
+# FastMCP's HTTP-SSE transport runs under a Starlette app; we mount a
+# trivial ``/healthz`` route there so the W7 supervisor (and ``ctxr-fsm
+# ensure``) can probe the same liveness URL we expose on every other
+# subsystem. Without this the supervisor would never publish the
+# discovery file (``active-mcp.json`` only lands once MCP healthz hits
+# 200) and ensure would time out.
+#
+# Stdio transport has no HTTP surface; the route is harmless there
+# (FastMCP simply ignores custom_route registrations when the
+# transport is stdio).
+
+
+@mcp.custom_route("/healthz", methods=["GET"])  # type: ignore[untyped-decorator]
+async def _healthz(_request: object) -> object:  # pragma: no cover - trivial
+    """Return 200 OK; the W7 supervisor probes this to gate readiness.
+
+    Body is the same one-word ``"ok"`` the FastAPI side returns so a
+    grep across log lines doesn't have to special-case the MCP
+    subsystem. Starlette's PlainTextResponse is the lightest carrier;
+    we import lazily so a CLI invocation that never boots the HTTP
+    transport doesn't pay the import cost.
+
+    ``type: ignore[untyped-decorator]`` on the decorator: FastMCP's
+    ``custom_route`` is typed loosely (it accepts Any callable) and
+    mypy flags it as an untyped decorator. The body itself is fully
+    typed; the ignore is purely about FastMCP's decorator signature.
+    """
+    from starlette.responses import PlainTextResponse
+
+    return PlainTextResponse("ok", status_code=200)
+
+
 # Import the tools module for its decorator side effects. This must
 # happen AFTER ``mcp`` is constructed because the decorators reach for
 # the live instance. Local import to avoid the top-of-file cycle that

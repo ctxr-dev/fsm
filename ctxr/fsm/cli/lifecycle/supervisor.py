@@ -73,7 +73,7 @@ import sys
 from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import anyio
 import httpx
@@ -83,11 +83,15 @@ from ctxr.fsm.cli.lifecycle.primitives import (
     PidLock,
     ReusedSubsystem,
     acquire_singleton,
+    now_iso_ms,
     pick_port,
     pid_file_for,
+    read_pid_file,
     recall_port,
     release_singleton,
+    remember_active_mcp_file,
     remember_port,
+    remove_active_mcp_file,
     write_pid_file,
 )
 from ctxr.fsm.sqlite.drift import (
@@ -415,16 +419,23 @@ async def _boot_subsystem(
     db_path: Path | None,
     task_group: anyio.abc.TaskGroup,
     is_ui: bool = False,
-) -> tuple[PidLock | None, int | None, anyio.abc.Process | None]:
+) -> tuple[PidLock | None, int | None, anyio.abc.Process | None, bool]:
     """Acquire the singleton for ``name`` and (maybe) spawn the child.
 
-    Returns ``(lock, port, proc)`` where any element may be ``None``:
+    Returns ``(lock, port, proc, healthz_ok)`` where any element except
+    ``healthz_ok`` may be ``None``:
 
     * ``lock is None`` when :func:`acquire_singleton` returned a
       :class:`ReusedSubsystem` — we skipped spawning entirely.
     * ``proc is None`` likewise indicates "reuse" (no child of ours).
     * ``port`` is the bound port whether we spawned or reused; the
       banner needs both cases.
+    * ``healthz_ok`` is ``True`` on the reuse path (the singleton
+      probe just succeeded) or whenever our own ``/healthz`` poll
+      returned 200. ``False`` for spawn paths where the probe ran out
+      its budget. UI children skip the probe entirely (Vite has no
+      ``/healthz``) and the value collapses to ``True`` so callers can
+      treat "no probe expected" as a non-failure.
 
     On the spawn path we:
 
@@ -447,12 +458,15 @@ async def _boot_subsystem(
         )
         # Even on reuse the operator wants the URL in the banner, so
         # we return the existing port (parsed back from the probe URL
-        # to avoid divergence with the live singleton).
+        # to avoid divergence with the live singleton). Reuse implies
+        # the singleton's own /healthz probe just succeeded, so the
+        # ``healthz_ok`` channel collapses to True without needing
+        # a second poll here.
         try:
             reused_port = int(acq.probe_url.rsplit(":", 1)[-1].rstrip("/"))
         except (ValueError, AttributeError):
             reused_port = port
-        return None, reused_port, None
+        return None, reused_port, None, True
 
     # Build the right command for this subsystem.
     if name == "mcp":
@@ -504,9 +518,10 @@ async def _boot_subsystem(
 
     # Health probe (best-effort). We only run it for HTTP children;
     # the UI's "ready" signal is Vite's banner, not a /healthz route.
+    healthz_ok = True
     if not is_ui:
-        ok = await _poll_healthz(probe_url)
-        if not ok:
+        healthz_ok = await _poll_healthz(probe_url)
+        if not healthz_ok:
             _log(
                 f"[ctxr-fsm supervisor] {name} did not answer /healthz within "
                 f"{_HEALTH_PROBE_BUDGET_SECONDS:.0f}s — continuing anyway."
@@ -516,7 +531,7 @@ async def _boot_subsystem(
     # the next restart prefers it.
     remember_port(name, port, project_root=project_root)
 
-    return acq, port, proc
+    return acq, port, proc, healthz_ok
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +597,7 @@ async def _reload_loop(
         # get the same health-probe + port-memory treatment as the
         # initial boot.
         for name in ("mcp", "api"):
-            new_lock, _new_port, new_proc = await _boot_subsystem(
+            new_lock, _new_port, new_proc, _ok = await _boot_subsystem(
                 name,
                 project_root=project_root,
                 db_path=db_path,
@@ -592,6 +607,14 @@ async def _reload_loop(
             locks[name] = new_lock
 
         _log("[ctxr-fsm supervisor] respawned mcp + api")
+
+        # After respawn the MCP child has a new pid + (possibly) port;
+        # rewrite the discovery file so any skill that just spawned a
+        # reader between drain and respawn does not latch onto the now-
+        # dead pid. We re-read the supervisor's pid files for the truth
+        # of which pid currently owns each subsystem (the reload above
+        # rewrote them via ``_record_child_pid``).
+        _publish_active_mcp_file_from_disk(project_root=project_root)
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +680,153 @@ async def _signal_scope(cancel_scope: anyio.CancelScope) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Active-MCP discovery file (W14c)
+# ---------------------------------------------------------------------------
+
+
+def _subsystem_payload(
+    name: str,
+    *,
+    project_root: Path,
+    port: int | None,
+    fallback_healthz: bool,
+) -> dict[str, Any] | None:
+    """Build the per-subsystem block for ``active-mcp.json`` or None.
+
+    Returns ``None`` when ``port`` is ``None`` (the subsystem was not
+    booted in this mode) so the caller can simply drop unset slots.
+
+    Healthz URL convention:
+
+    * MCP: ``http://127.0.0.1:<port>/healthz`` (FastMCP exposes one).
+    * API: ``http://127.0.0.1:<port>/healthz`` (FastAPI mount).
+    * UI: no /healthz — Vite has none. Field set to ``None`` so a
+      consumer that wants to probe falls through to its own waiter
+      (the UI's "ready" signal is the dev banner, not a route).
+
+    ``pid`` is read straight from the singleton pid file the supervisor
+    just rewrote with the child's pid (see ``_record_child_pid``).
+    Missing or malformed pid file leaves the field as ``None``;
+    consumers should treat that as "supervisor still booting".
+    """
+    if port is None:
+        return None
+    pid_path = pid_file_for(name, project_root=project_root)
+    pid_record = read_pid_file(pid_path)
+    pid: int | None = None
+    if pid_record is not None:
+        raw = pid_record.get("pid")
+        if isinstance(raw, int):
+            pid = raw
+
+    base_url = f"http://127.0.0.1:{port}"
+    payload: dict[str, Any] = {
+        "http_url": base_url + ("/sse" if name == "mcp" else ""),
+        "healthz_url": (
+            f"{base_url}/healthz" if (fallback_healthz or name != "ui") else None
+        ),
+        "pid": pid,
+    }
+    if name == "api":
+        # The API child mounts OpenAPI docs at ``/docs``; surfaced here
+        # so a browser-first consumer doesn't have to know the FastAPI
+        # default off by heart.
+        payload["docs_url"] = f"{base_url}/docs"
+    return payload
+
+
+def _publish_active_mcp_file(
+    *,
+    project_root: Path,
+    ports: dict[str, int | None],
+    include_ui: bool,
+) -> None:
+    """Write the W14c discovery document for the supervisor's current state.
+
+    Schema (per the plan):
+
+    .. code-block:: json
+
+        {
+          "started_at": "ISO-8601 UTC ms",
+          "supervisor_pid": 1234,
+          "version": "0.2.0",
+          "subsystems": {
+            "mcp": {"http_url": ..., "healthz_url": ..., "pid": 1},
+            "api": {"http_url": ..., "healthz_url": ..., "pid": 2,
+                     "docs_url": ...},
+            "ui":  {"http_url": ..., "healthz_url": null, "pid": 3}
+          }
+        }
+
+    Subsystems whose port is ``None`` are omitted (``--mcp-only`` runs
+    omit api + ui; prod mode omits ui). The MCP entry is always
+    present at call time because the publish call is gated on a
+    successful MCP healthz; this helper does not re-check.
+    """
+    # Lazy import to avoid pulling ``ctxr.fsm`` (which transitively
+    # imports the entire engine surface) at supervisor module-import
+    # time. ``ctxr-fsm --help`` should stay cheap.
+    from ctxr.fsm import __version__ as _pkg_version
+
+    subsystems: dict[str, Any] = {}
+    mcp_block = _subsystem_payload(
+        "mcp", project_root=project_root, port=ports.get("mcp"), fallback_healthz=False
+    )
+    if mcp_block is not None:
+        subsystems["mcp"] = mcp_block
+    api_block = _subsystem_payload(
+        "api", project_root=project_root, port=ports.get("api"), fallback_healthz=False
+    )
+    if api_block is not None:
+        subsystems["api"] = api_block
+    if include_ui:
+        ui_block = _subsystem_payload(
+            "ui", project_root=project_root, port=ports.get("ui"), fallback_healthz=False
+        )
+        if ui_block is not None:
+            subsystems["ui"] = ui_block
+
+    payload: dict[str, Any] = {
+        "started_at": now_iso_ms(),
+        "supervisor_pid": os.getpid(),
+        "version": _pkg_version,
+        "subsystems": subsystems,
+    }
+    remember_active_mcp_file(payload, project_root=project_root)
+
+
+def _publish_active_mcp_file_from_disk(*, project_root: Path) -> None:
+    """Re-publish ``active-mcp.json`` after a reload, reading ports from disk.
+
+    The reload loop's contract is "drain + respawn MCP + API, leave UI
+    alone". The fresh pids land in the singleton pid files via
+    ``_record_child_pid``, and the per-subsystem ports stay the same
+    (we ``remember_port`` after every spawn and the new spawn prefers
+    the remembered port). So a faithful "what's running right now"
+    document just needs to ask :func:`recall_port` for each subsystem
+    and let :func:`_subsystem_payload` walk the pid files.
+
+    If the MCP port can't be recalled (something pathological happened
+    during the reload), we skip the publish rather than write a
+    document with a missing critical key — better to keep the previous
+    document live than to lie about the state.
+    """
+    ports: dict[str, int | None] = {
+        "mcp": recall_port("mcp", project_root=project_root),
+        "api": recall_port("api", project_root=project_root),
+        "ui": recall_port("ui", project_root=project_root),
+    }
+    if ports["mcp"] is None:
+        return
+    _publish_active_mcp_file(
+        project_root=project_root,
+        ports=ports,
+        include_ui=ports["ui"] is not None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------
 
@@ -665,6 +835,7 @@ async def run_supervisor(
     mode: Literal["dev", "prod"] = "dev",
     db_path: Path | None = None,
     project_root: Path | None = None,
+    mcp_only: bool = False,
 ) -> None:
     """Boot the unified ``ctxr-fsm serve`` supervisor.
 
@@ -699,9 +870,13 @@ async def run_supervisor(
 
             # Boot order: API first so the UI child can see the API
             # port the moment Vite starts. MCP last because it has
-            # the slowest cold-start (FastMCP import graph).
-            for name in ("api", "mcp"):
-                lock, port, proc = await _boot_subsystem(
+            # the slowest cold-start (FastMCP import graph). When
+            # ``mcp_only`` is set we skip the API entirely (W14b's
+            # headless-CI path), leaving only MCP in the subsystem set.
+            mcp_healthz_ok = False
+            boot_order = ("mcp",) if mcp_only else ("api", "mcp")
+            for name in boot_order:
+                lock, port, proc, healthz_ok = await _boot_subsystem(
                     name,
                     project_root=project_root,
                     db_path=db_path,
@@ -710,9 +885,11 @@ async def run_supervisor(
                 children[name] = proc
                 locks[name] = lock
                 ports[name] = port
+                if name == "mcp":
+                    mcp_healthz_ok = healthz_ok
 
-            if mode == "dev":
-                lock, port, proc = await _boot_subsystem(
+            if mode == "dev" and not mcp_only:
+                lock, port, proc, _ok = await _boot_subsystem(
                     "ui",
                     project_root=project_root,
                     db_path=db_path,
@@ -722,6 +899,19 @@ async def run_supervisor(
                 children["ui"] = proc
                 locks["ui"] = lock
                 ports["ui"] = port
+
+            # W14c: publish ``.ctxr-fsm/active-mcp.json`` once the MCP
+            # child has answered /healthz. Skips the write when MCP
+            # never came up — pointing skills at a dead URL would just
+            # make their fallback path noisier. Includes whatever
+            # subsystems we actually booted (UI omitted in prod mode
+            # or mcp_only; API omitted in mcp_only).
+            if mcp_healthz_ok and ports["mcp"] is not None:
+                _publish_active_mcp_file(
+                    project_root=project_root,
+                    ports=ports,
+                    include_ui=(mode == "dev" and not mcp_only),
+                )
 
             # Banner. We render even-when-skipped URLs because the
             # operator's mental model is "here are the three things
@@ -790,16 +980,26 @@ async def run_supervisor(
             for _name, lock in locks.items():
                 if lock is not None:
                     release_singleton(lock, project_root=project_root)
+            # W14c: drop the discovery file so a later ``ensure`` /
+            # skill bootstrap doesn't try to talk to a stopped
+            # supervisor. Best-effort: a stray file is annoying, not
+            # broken (the healthz probes will fail anyway).
+            remove_active_mcp_file(project_root=project_root)
         _log("[ctxr-fsm supervisor] stopped.")
 
 
-def main(mode: str = "dev", db_path: Path | None = None) -> None:
+def main(
+    mode: str = "dev",
+    db_path: Path | None = None,
+    mcp_only: bool = False,
+) -> None:
     """Synchronous entry point for the Typer CLI.
 
     Validates ``mode`` against the documented set so we never pass an
     unknown literal into the async body (where the :class:`Literal`
     annotation would be silently lost at runtime). Any other parameter
-    is forwarded verbatim.
+    is forwarded verbatim. ``mcp_only=True`` makes the supervisor boot
+    ONLY the MCP child (W14b's headless-CI / ensure-mcp-only path).
     """
     if mode not in ("dev", "prod"):
         raise ValueError(f"mode must be 'dev' or 'prod' (got {mode!r})")
@@ -809,4 +1009,6 @@ def main(mode: str = "dev", db_path: Path | None = None) -> None:
     # call site stays type-safe without sprinkling ``cast`` at the
     # entry point.
     runner: Literal["dev", "prod"] = "prod" if mode == "prod" else "dev"
-    anyio.run(functools.partial(run_supervisor, runner, db_path, None))
+    anyio.run(
+        functools.partial(run_supervisor, runner, db_path, None, mcp_only)
+    )

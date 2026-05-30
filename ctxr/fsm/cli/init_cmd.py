@@ -42,7 +42,7 @@ from ctxr.fsm.cli._common import (
 )
 from ctxr.fsm.sqlite.project import run_migrations
 
-__all__ = ["init"]
+__all__ = ["init", "run_init"]
 
 
 _GITIGNORE_ENTRY: str = ".ctxr-fsm/"
@@ -110,6 +110,73 @@ def _read_alembic_revision(db_path: Path) -> str | None:
     return str(row[0])
 
 
+def run_init(
+    *,
+    db_path: Path,
+    no_memory: bool = False,
+    cwd: Path | None = None,
+) -> dict[str, Any]:
+    """Pure (non-printing) core of ``ctxr-fsm init``.
+
+    Used both by the Typer command :func:`init` and by
+    ``ctxr-fsm ensure`` (W14b), which calls this directly so the
+    bootstrap pipeline can compose init + install-memory +
+    install-mcp + supervisor into a single per-call summary.
+
+    Parameters
+    ----------
+    db_path:
+        Concrete SQLite DB path. The caller resolved it via
+        :func:`resolve_db_path` (no env-var or precedence work
+        happens here).
+    no_memory:
+        When ``True``, skip the W11 memory installer call (matches
+        the CLI ``--no-memory`` flag).
+    cwd:
+        Directory used for the ``.gitignore`` check + memory
+        installer target. Defaults to :func:`Path.cwd`. The ensure
+        command passes the resolved project root explicitly so a
+        deeper invocation cwd doesn't end up patching the wrong tree.
+    """
+    project_dir = db_path.parent
+    project_dir.mkdir(parents=True, exist_ok=True)
+    pids_dir = project_dir / "pids"
+    pids_dir.mkdir(parents=True, exist_ok=True)
+
+    run_migrations(db_path)
+
+    effective_cwd = cwd if cwd is not None else Path.cwd()
+    gitignore_updated = False
+    if (effective_cwd / ".git").is_dir():
+        gitignore_updated = _ensure_gitignore_entry(effective_cwd)
+
+    revision = _read_alembic_revision(db_path)
+
+    memory_installer: dict[str, Any] | str
+    if no_memory:
+        memory_installer = "skipped (--no-memory)"
+    else:
+        try:
+            from ctxr.fsm.cli.install_memory_cmd import run_install_memory
+
+            memory_installer = run_install_memory(
+                target=effective_cwd, client="auto"
+            )
+        except Exception as exc:
+            memory_installer = f"failed: {type(exc).__name__}: {exc}"
+
+    return {
+        "db_path": str(db_path),
+        "project_dir": str(project_dir),
+        "pids_dir": str(pids_dir),
+        "alembic_revision": revision,
+        "gitignore_updated": gitignore_updated,
+        "ports_json": str(project_dir / "ports.json")
+        + " (placeholder — populated by the serve subcommand in W7)",
+        "memory_installer": memory_installer,
+    }
+
+
 def init(
     db: Path | None = DB_OPTION,
     json_mode: bool = JSON_OPTION,
@@ -134,65 +201,5 @@ def init(
     Finishes by printing a summary.
     """
     db_path = resolve_db_path(db)
-    project_dir = db_path.parent
-    project_dir.mkdir(parents=True, exist_ok=True)
-    pids_dir = project_dir / "pids"
-    pids_dir.mkdir(parents=True, exist_ok=True)
-
-    # Run migrations directly — never via subprocess. ``run_migrations``
-    # handles the env-var dance so the alembic env.py picks up the
-    # right URL.
-    run_migrations(db_path)
-
-    cwd = Path.cwd()
-    gitignore_updated = False
-    if (cwd / ".git").is_dir():
-        gitignore_updated = _ensure_gitignore_entry(cwd)
-
-    revision = _read_alembic_revision(db_path)
-
-    # ---- Memory installer (W11) ----------------------------------
-    #
-    # We invoke the in-process function (not the CLI command) so any
-    # side effects happen in the same Python process and we don't need
-    # to spawn a subprocess. Auto-detect mode is the right default —
-    # it patches CLAUDE.md / AGENTS.md / .cursor/rules/ only if those
-    # files exist, leaving a project with none of them untouched.
-    #
-    # We catch broad exceptions so a failed memory install never
-    # bricks ``ctxr-fsm init``; the summary surfaces the error so the
-    # operator can re-run ``ctxr-fsm install-memory`` directly to see
-    # the full traceback.
-    memory_installer: dict[str, Any] | str
-    if no_memory:
-        memory_installer = "skipped (--no-memory)"
-    else:
-        try:
-            # Local import to keep ``init`` startup cheap when
-            # ``--no-memory`` is passed — and to avoid a hard import
-            # cycle if the install-memory module ever wants to import
-            # init helpers.
-            from ctxr.fsm.cli.install_memory_cmd import run_install_memory
-
-            # ``run_install_memory`` is the non-printing core of
-            # ``install-memory``; we embed its summary as a sub-field
-            # so init's own JSON output remains a single valid
-            # document.
-            memory_installer = run_install_memory(target=cwd, client="auto")
-        except Exception as exc:
-            # Surface failures as a field rather than crashing init —
-            # the operator can re-run ``ctxr-fsm install-memory`` to
-            # get the full traceback.
-            memory_installer = f"failed: {type(exc).__name__}: {exc}"
-
-    summary: dict[str, Any] = {
-        "db_path": str(db_path),
-        "project_dir": str(project_dir),
-        "pids_dir": str(pids_dir),
-        "alembic_revision": revision,
-        "gitignore_updated": gitignore_updated,
-        "ports_json": str(project_dir / "ports.json")
-        + " (placeholder — populated by the serve subcommand in W7)",
-        "memory_installer": memory_installer,
-    }
+    summary = run_init(db_path=db_path, no_memory=no_memory, cwd=Path.cwd())
     json_or_pretty(summary, json_mode)

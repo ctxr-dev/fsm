@@ -52,13 +52,18 @@ __all__ = [
     "PidLock",
     "ReusedSubsystem",
     "acquire_singleton",
+    "active_mcp_file_path",
+    "now_iso_ms",
     "pick_port",
     "pid_file_for",
     "pid_is_alive",
+    "read_active_mcp_file",
     "read_pid_file",
     "recall_port",
     "release_singleton",
+    "remember_active_mcp_file",
     "remember_port",
+    "remove_active_mcp_file",
     "write_active_run_marker",
     "write_pid_file",
 ]
@@ -81,6 +86,12 @@ _STATE_DIR_NAME: str = ".ctxr-fsm"
 _PORTS_FILE_NAME: str = "ports.json"
 _PIDS_DIR_NAME: str = "pids"
 _ACTIVE_RUN_FILE_NAME: str = "active-run.json"
+# W14c: discovery file the supervisor writes once its MCP child is
+# answering /healthz. Skills + ``ctxr-fsm ensure`` read it to find the
+# HTTP-SSE MCP URL when the stdio entry is not registered with the
+# active client yet. Removed on graceful supervisor shutdown so a stale
+# document never points a skill at a dead port.
+_ACTIVE_MCP_FILE_NAME: str = "active-mcp.json"
 
 
 def _state_dir(project_root: Path) -> Path:
@@ -137,6 +148,26 @@ def _now_iso() -> str:
     diff-friendly when a human inspects them.
     """
     return datetime.now(UTC).isoformat()
+
+
+def now_iso_ms() -> str:
+    """Return the current UTC time as ISO-8601 with millisecond precision.
+
+    Project convention (per the plan): every timestamp the FSM
+    substrate persists is ISO-8601 in UTC with millisecond precision so
+    cross-row sort is total and the printed form fits in a fixed
+    column. Python's :meth:`datetime.isoformat` defaults to microsecond
+    precision when a microsecond component is non-zero, so we truncate
+    explicitly to keep the surface stable.
+
+    Returned shape: ``"2026-05-29T12:34:56.789+00:00"``.
+    """
+    now = datetime.now(UTC)
+    # Truncate microseconds → milliseconds (Python's stdlib has no
+    # nicer hook). We multiply-then-int to round-down rather than risk
+    # banker's rounding on the boundary.
+    truncated_us = (now.microsecond // 1000) * 1000
+    return now.replace(microsecond=truncated_us).isoformat(timespec="milliseconds")
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +515,89 @@ def release_singleton(lock: PidLock, *, project_root: Path) -> None:
 # ---------------------------------------------------------------------------
 # Active-run marker
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Active-MCP discovery file (W14c)
+# ---------------------------------------------------------------------------
+
+
+def active_mcp_file_path(project_root: Path) -> Path:
+    """Return ``<project_root>/.ctxr-fsm/active-mcp.json`` (no I/O).
+
+    Pure path helper exposed so callers that want to ``stat()`` the
+    file or remove it manually (tests, ``ensure --check``) reach the
+    same location the writer uses without duplicating the constant.
+    We deliberately do NOT go through :func:`_state_dir` — that
+    helper has a side effect (``mkdir(exist_ok=True)``) which would
+    violate the "read-only probe" contract :func:`ensure --check`
+    relies on. The bare ``project_root / .ctxr-fsm / ...`` join is
+    semantically identical for reads.
+    """
+    return project_root / _STATE_DIR_NAME / _ACTIVE_MCP_FILE_NAME
+
+
+def remember_active_mcp_file(
+    payload: dict[str, Any], *, project_root: Path
+) -> None:
+    """Atomically write the supervisor's active-MCP discovery document.
+
+    Sole writer is the W7 supervisor, once its MCP child's ``/healthz``
+    is answering. The skill bootstrap discipline (W14e) tells agents to
+    parse this file when the stdio MCP entry is not registered with
+    the active client yet, so the contents MUST match the
+    documented schema:
+
+    ``{started_at, supervisor_pid, version, subsystems: {<name>:
+    {http_url, healthz_url, pid, docs_url?}}}``.
+
+    The write goes through :func:`_atomic_write_text` (tmp + rename)
+    so a concurrent reader either sees the previous document or the
+    new one in full — never a half-written file that JSON would
+    reject. ``_state_dir`` is called explicitly here (rather than via
+    :func:`active_mcp_file_path`) so the ``.ctxr-fsm/`` directory is
+    created on the write path even though the read-only path-helper
+    is now side-effect-free.
+    """
+    path = _state_dir(project_root) / _ACTIVE_MCP_FILE_NAME
+    _atomic_write_text(path, json.dumps(payload, sort_keys=True, indent=2))
+
+
+def read_active_mcp_file(project_root: Path) -> dict[str, Any] | None:
+    """Return the parsed active-MCP document, or ``None`` if absent / bad.
+
+    Mirror of :func:`read_pid_file`: missing file and malformed file
+    collapse to the same return value because every caller's natural
+    reaction in both cases is the same — "treat the supervisor as not
+    ready, fall through to a spawn-or-wait branch".
+    """
+    path = active_mcp_file_path(project_root)
+    if not path.exists():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    return loaded
+
+
+def remove_active_mcp_file(project_root: Path) -> None:
+    """Best-effort removal of the active-MCP discovery document.
+
+    Called by the supervisor's graceful shutdown path so a stopped
+    project never leaves a stale document pointing at a now-dead
+    port. ``FileNotFoundError`` is the post-condition we want
+    (file gone) so we swallow it; any other OSError surfaces as a
+    log line elsewhere — the supervisor is already shutting down
+    and a noisy crash would just confuse the operator.
+    """
+    path = active_mcp_file_path(project_root)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
 
 
 def write_active_run_marker(

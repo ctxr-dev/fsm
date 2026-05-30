@@ -84,6 +84,24 @@ _DEFAULT_DB_RELATIVE: Path = Path(".ctxr-fsm") / "fsm.db"
 _DB_ENV_VAR: str = "CTXR_FSM_DB"
 
 
+def _walk_up_for_state_dir(start: Path) -> Path | None:
+    """Return the nearest ancestor of ``start`` that contains ``.ctxr-fsm``.
+
+    Walk-up makes the stdio MCP entry portable across projects: the
+    client (Claude Code / Cursor / Codex) spawns ``ctxr-fsm mcp`` with
+    the user's CURRENT cwd, and we walk up to find the project root
+    even when the user is several directories deep. Returns ``None``
+    when no ancestor contains the marker, so the caller can fall back
+    to the cwd default (and surface a helpful "did you run init?"
+    error if the file is missing too).
+    """
+    current = start.resolve()
+    for candidate in [current, *current.parents]:
+        if (candidate / ".ctxr-fsm").is_dir():
+            return candidate
+    return None
+
+
 def resolve_db_path(db_opt: Path | None) -> Path:
     """Apply the project's layered precedence to produce a concrete DB path.
 
@@ -91,17 +109,32 @@ def resolve_db_path(db_opt: Path | None) -> Path:
 
     1. The explicit ``db_opt`` argument (e.g. ``--db``).
     2. ``$CTXR_FSM_DB`` from the process environment.
-    3. ``./.ctxr-fsm/fsm.db`` relative to the current working directory.
+    3. Walk up from the current working directory looking for an
+       ancestor that contains ``.ctxr-fsm/``; return that ancestor's
+       ``.ctxr-fsm/fsm.db``.
+    4. Fall back to ``./.ctxr-fsm/fsm.db`` relative to the current
+       working directory. This may not exist yet; the caller surfaces
+       a helpful "did you run ``ctxr-fsm init``?" error.
 
-    Identical contract to :func:`ctxr.fsm.cli._common.resolve_db_path`;
-    kept independent so the MCP package does not transitively depend on
-    the Typer-based CLI module.
+    The walk-up tier (step 3) is what makes the stdio MCP entry
+    portable across projects (W14d). A client (Claude Code, Cursor,
+    Codex) launches ``ctxr-fsm mcp`` with the user's CURRENT cwd
+    inherited; the walk-up finds the right project root even when the
+    user is several directories deep.
+
+    Identical contract to :func:`ctxr.fsm.cli._common.resolve_db_path`
+    (which also gained the walk-up tier); kept independent so the MCP
+    package does not transitively depend on the Typer-based CLI
+    module.
     """
     if db_opt is not None:
         return db_opt.expanduser().resolve()
     env_value = os.environ.get(_DB_ENV_VAR)
     if env_value:
         return Path(env_value).expanduser().resolve()
+    found_root = _walk_up_for_state_dir(Path.cwd())
+    if found_root is not None:
+        return (found_root / _DEFAULT_DB_RELATIVE).resolve()
     return (Path.cwd() / _DEFAULT_DB_RELATIVE).resolve()
 
 

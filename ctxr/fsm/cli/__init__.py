@@ -47,9 +47,11 @@ import typer
 from ctxr.fsm.cli import (
     api_cmd,
     doctor_cmd,
+    ensure_cmd,
     export_cmd,
     import_cmd,
     init_cmd,
+    install_mcp_cmd,
     install_memory_cmd,
     mcp_cmd,
     migrate_cmd,
@@ -98,6 +100,25 @@ app.command(
     name="install-memory",
     help="Install (or check) FSM-usage principles into AI-client memory.",
 )(install_memory_cmd.install_memory)
+# ``install-mcp`` (W14d) registers ctxr-fsm as a stdio MCP server in
+# each detected client's config file: .mcp.json / .claude/settings.json
+# (Claude Code project-local), ~/.codex/config.toml (Codex user-level,
+# preferring the ``codex mcp add`` CLI when available), and
+# ~/.cursor/mcp.json (Cursor user-level). Idempotent: only the
+# ``ctxr-fsm`` entry is owned; every other entry passes through.
+app.command(
+    name="install-mcp",
+    help="Register (or check) ctxr-fsm as a stdio MCP server in client configs.",
+)(install_mcp_cmd.install_mcp)
+# ``ensure`` (W14b) is the single bootstrap entry point every skill
+# invokes from its SKILL.md preamble. Idempotent, fast on the warm
+# path (<500ms), self-heals init + memory + mcp-config + supervisor.
+# Emits a JSON document on stdout (default when piped; --no-json for
+# interactive pretty output).
+app.command(
+    name="ensure",
+    help="Ensure the project is bootstrapped and the supervisor is up.",
+)(ensure_cmd.ensure)
 
 # The ``spec`` group bundles spec validate / register / list under one
 # namespace so the top-level help screen stays short. Adding it via
