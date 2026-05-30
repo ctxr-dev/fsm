@@ -11,6 +11,7 @@ dependencies = [
   "pydantic>=2.7",
   "uuid-utils>=0.9",
   "typer>=0.12",
+  "rich>=13.7",
   "anyio>=4.4",
   "watchfiles>=0.22",
   "jsonschema>=4.23",
@@ -86,6 +87,21 @@ module = [
     "ctxr.fsm.sqlite.repos_enforcement",
 ]
 disable_error_code = ["arg-type", "attr-defined", "union-attr", "operator", "call-overload"]
+
+[[tool.mypy.overrides]]
+# CLI modules that hand-roll SQLAlchemy queries against the W2 SQLModel
+# tables hit the same descriptor-as-value friction described above — the
+# export/import round-trip needs ``select(Table).where(Table.col == x)``
+# clauses outside the repository layer, and ``spec.validate()`` is a
+# monkey-patched method whose return type mypy cannot reconcile against
+# the BaseModel.validate classmethod it shadows. Suppress ONLY the codes
+# those two issues produce; everything else in the CLI is strictly typed.
+module = [
+    "ctxr.fsm.cli.export_cmd",
+    "ctxr.fsm.cli.import_cmd",
+    "ctxr.fsm.cli.spec_cmd",
+]
+disable_error_code = ["arg-type", "attr-defined", "union-attr", "call-overload", "call-arg"]
 
 [tool.pytest.ini_options]
 addopts = "-ra -q --strict-markers"
