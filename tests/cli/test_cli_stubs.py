@@ -105,35 +105,78 @@ def test_serve_stub_rejects_invalid_mode_flag() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ``mcp`` — MCP server stub (W4)
+# ``mcp`` — MCP server (W4, now implemented)
 # ---------------------------------------------------------------------------
+#
+# These tests used to assert on the W3 stub's deferral message. W4
+# replaced the stub with a real boot path that takes over the process
+# until the transport returns, so we can no longer ``invoke(app, ["mcp"])``
+# from a unit test — that would actually start the FastMCP stdio loop
+# and block. Instead we exercise the surface via ``--help`` (which the
+# Typer runner can render without entering any tool body) and assert
+# that every documented flag (``--transport``, ``--host``, ``--port``)
+# is listed. Real end-to-end coverage of the boot sequence is a W4
+# integration test that drives the server in a subprocess with a
+# wire-level MCP client; that lives outside this stub-shaped file.
 
 
-def test_mcp_stub_exits_nonzero_with_deferral_message() -> None:
-    """``ctxr-fsm mcp`` must defer to W4 and exit non-zero."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        _project_db(tmpdir)
-        result = runner.invoke(app, ["mcp"])
+def test_mcp_help_lists_transport_host_and_port_options() -> None:
+    """``ctxr-fsm mcp --help`` documents the W4 flag surface."""
+    result = runner.invoke(app, ["mcp", "--help"])
 
-    assert result.exit_code != 0
-    assert "MCP server lands in W4" in result.stderr
+    # ``--help`` always exits 0 — anything else means a registration
+    # regression (e.g. the import in cli/__init__.py was dropped).
+    assert result.exit_code == 0, (
+        f"`mcp --help` must exit 0 (got {result.exit_code}); "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    # Each flag must be visible by name so operator scripts and the
+    # docs site can reliably parse the help text. We assert on the
+    # long-form name with the leading double-dash because Typer's
+    # rich help renderer can wrap descriptions but always prints the
+    # flag token verbatim on its own line.
+    assert "--transport" in result.stdout
+    assert "--host" in result.stdout
+    assert "--port" in result.stdout
+
+    # ``--db`` is shared across every subcommand — also documented here
+    # so callers see the full surface in one screen. Asserting on it
+    # too pins the wiring against an accidental drop of ``DB_OPTION``.
+    assert "--db" in result.stdout
 
 
-def test_mcp_stub_accepts_valid_transport_flag() -> None:
-    """``--transport http`` reaches the stub body."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        _project_db(tmpdir)
-        result = runner.invoke(app, ["mcp", "--transport", "http"])
+def test_mcp_rejects_invalid_transport_flag() -> None:
+    """An out-of-set ``--transport`` value fails Typer validation.
 
-    assert result.exit_code == 1
-    assert "lands in W4" in result.stderr
-
-
-def test_mcp_stub_rejects_invalid_transport_flag() -> None:
-    """An out-of-set ``--transport`` value fails Typer validation."""
+    The transport allowlist (``stdio``, ``http``) is enforced up-front
+    in the CLI shim, before the server's heavyweight boot sequence
+    runs, so this test can safely invoke the command without ever
+    entering the FastMCP loop.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         _project_db(tmpdir)
         result = runner.invoke(app, ["mcp", "--transport", "websocket"])
+
+    # ``typer.BadParameter`` renders through Click's usage-error path,
+    # which exits with code 2. We assert "non-zero, not 1" so the
+    # distinction between validation failure (2) and any future stub-
+    # style deferral (1) stays explicit.
+    assert result.exit_code != 0
+    assert result.exit_code != 1
+
+
+def test_mcp_rejects_out_of_range_port() -> None:
+    """``--port`` outside 0-65535 fails Typer's bound check.
+
+    We allow ``port=0`` (let the OS pick a free ephemeral port) so the
+    lower bound is ``0``, not ``1``; the upper bound is the canonical
+    TCP maximum. Going past either trips Typer's range validation
+    before the server boots.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _project_db(tmpdir)
+        result = runner.invoke(app, ["mcp", "--port", "70000"])
 
     assert result.exit_code != 0
     assert result.exit_code != 1
@@ -220,8 +263,11 @@ def test_ui_stub_rejects_out_of_range_port() -> None:
 @pytest.mark.parametrize(
     ("subcommand", "marker"),
     [
+        # Stub commands carry an explicit "ships in W{N}" marker in
+        # their registered help line. ``mcp`` is now the real W4
+        # implementation, so its top-level help string no longer
+        # advertises a workstream — see the dedicated case below.
         ("serve", "W7"),
-        ("mcp", "W4"),
         ("api", "W5"),
         ("ui", "W6"),
     ],
@@ -243,3 +289,21 @@ def test_all_stubs_registered_and_visible_in_help(
     # ships in the per-command help line registered in the app factory.
     assert subcommand in result.stdout
     assert marker in result.stdout
+
+
+def test_mcp_registered_and_visible_in_help() -> None:
+    """The real ``mcp`` command must appear on the top-level help screen.
+
+    Mirrors :func:`test_all_stubs_registered_and_visible_in_help` for
+    the now-implemented W4 command — the parametrised case above can't
+    cover it because ``mcp``'s help line no longer carries a workstream
+    marker. Asserting on the subcommand name plus the word "Protocol"
+    pins both the registration and the documented purpose.
+    """
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "mcp" in result.stdout
+    # "Protocol" appears in the registered help text and is a stable,
+    # distinctive token — far less likely to false-match than "MCP"
+    # which could collide with another command's description.
+    assert "Protocol" in result.stdout

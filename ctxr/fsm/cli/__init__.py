@@ -20,11 +20,16 @@ Command surface (W3 scope)
 * ``import`` — re-insert a run from a JSON dump (with ``--replace``
   for clobber semantics).
 
+Implemented (W4)
+----------------
+
+* ``mcp`` — Model Context Protocol server. Boots the FastMCP
+  instance over stdio (default) or HTTP-SSE.
+
 Stubbed commands (filled in later workstreams)
 ----------------------------------------------
 
 * ``serve`` — long-running orchestrator (W7).
-* ``mcp`` — Model Context Protocol server (W4).
 * ``api`` — FastAPI HTTP / SSE surface (W5).
 * ``ui`` — local UI launcher (W6 / W7).
 
@@ -117,17 +122,23 @@ app.command(
 # Stubs for future workstreams
 # ---------------------------------------------------------------------------
 
-# These four commands appear in --help today so the surface is
-# stable, but each one delegates to a sibling stub module that prints
-# a deferral message and exits non-zero. Moving the bodies out of this
-# file means a later workstream (W4/W5/W6/W7) can flesh them out
-# without touching the top-level wiring at all.
+# These commands appear in --help today so the surface is stable.
+# The ``mcp`` body is the real W4 implementation; the others remain
+# stubs (each delegates to a sibling module that prints a deferral
+# message and exits non-zero) until the workstream that owns them
+# lands. Moving the bodies out of this file means a later workstream
+# (W5/W6/W7) can flesh them out without touching the top-level wiring
+# at all.
 app.command(name="serve", help="(Stub) long-running orchestrator — ships in W7.")(
     serve_cmd.serve
 )
-app.command(name="mcp", help="(Stub) Model Context Protocol server — ships in W4.")(
-    mcp_cmd.mcp
-)
+# ``mcp`` is the W4 entry point — boots the FastMCP server over the
+# selected transport. The help string mentions both transports so
+# operators see the shape on ``ctxr-fsm --help`` without drilling in.
+app.command(
+    name="mcp",
+    help="Run the Model Context Protocol server (stdio or http transport).",
+)(mcp_cmd.mcp)
 app.command(name="api", help="(Stub) FastAPI HTTP / SSE surface — ships in W5.")(
     api_cmd.api
 )

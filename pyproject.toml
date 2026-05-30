@@ -103,6 +103,21 @@ module = [
 ]
 disable_error_code = ["arg-type", "attr-defined", "union-attr", "call-overload", "call-arg"]
 
+[[tool.mypy.overrides]]
+# MCP tool modules occasionally drop below the repository layer to issue
+# ad-hoc SQLAlchemy ``select(...).where(Table.col == ...)`` queries — the
+# ``_current_state_pk`` helper in tools_runs.py and the joined spec-summary
+# listing in tools_meta.py both need them. They run into the same
+# descriptor-as-value typing friction described in the repository override
+# block above (column attributes typed as their Python value rather than
+# ``InstrumentedAttribute[T]``). Suppress ONLY the codes that friction
+# produces — every other surface in these files stays strictly typed.
+module = [
+    "ctxr.fsm.mcp.tools_runs",
+    "ctxr.fsm.mcp.tools_meta",
+]
+disable_error_code = ["arg-type", "attr-defined", "call-overload"]
+
 [tool.pytest.ini_options]
 addopts = "-ra -q --strict-markers"
 testpaths = ["tests"]
