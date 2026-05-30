@@ -1,0 +1,56 @@
+# Tag-on-main workflow for the Python @ctxr/fsm package.
+#
+# IMPORTANT: This workflow ONLY creates a git tag when pyproject.toml's
+# version changes on main. It DOES NOT publish to PyPI.
+#
+# Per Principle 2 (Manual publish + sibling linking), PyPI publishing is
+# always manual (workflow_dispatch only) and lives in a separate workflow.
+# CI may build, test, and tag — CI MUST NOT publish.
+
+name: Python — Tag on main
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'pyproject.toml'
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Extract version
+        id: extract
+        run: |
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "CTXR_FSM_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Current version: $VERSION"
+
+      - name: Check if version changed
+        id: changed
+        run: |
+          PREV_VERSION=$(git show HEAD~1:pyproject.toml | python -c "import tomllib,sys; print(tomllib.load(sys.stdin.buffer)['project']['version'])")
+          echo "Previous version: $PREV_VERSION"
+          echo "Current version:  $CTXR_FSM_VERSION"
+          if [ "$PREV_VERSION" = "$CTXR_FSM_VERSION" ]; then
+            echo "Version unchanged; skipping tag."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version changed; will tag."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create tag
+        if: steps.changed.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$CTXR_FSM_VERSION" -m "Release v$CTXR_FSM_VERSION"
+          git push origin "v$CTXR_FSM_VERSION"

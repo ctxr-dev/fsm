@@ -1,0 +1,182 @@
+# WARNING: This workflow publishes ctxr-fsm to PyPI. It is MANUAL ONLY
+# (workflow_dispatch). It is intentionally NOT triggered by push or tag.
+# See: docs/architecture.md (manual-publish discipline) and the
+# workspace-wide Principle 2 in common-dev-principles/.
+
+name: Publish ctxr-fsm to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: 'Semver bump'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      dry_run:
+        description: 'Dry run (build + upload to TestPyPI only)'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  publish:
+    name: Build and publish ctxr-fsm
+    runs-on: ubuntu-latest
+    # PyPI Trusted Publishing — no API token stored in the repo.
+    # The `pypi` environment is bound to ctxr-fsm on pypi.org via OIDC.
+    environment: pypi
+    permissions:
+      # Required for PyPI Trusted Publishing via OIDC.
+      id-token: write
+      # Required to push the version-bump commit and tag.
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Need full history so we can push a tag back to origin.
+          fetch-depth: 0
+          # Use the default GITHUB_TOKEN to push the bump commit + tag.
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --all-extras --dev
+
+      # ---------------- Pre-flight checks ----------------
+      - name: Run tests
+        run: uv run pytest tests/ -q
+
+      - name: Lint with ruff
+        run: uv run ruff check ctxr/ tests/ examples/
+
+      - name: Type-check with mypy
+        run: uv run mypy ctxr/fsm/
+
+      # ---------------- Bump version ----------------
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version in pyproject.toml
+        id: bump
+        env:
+          BUMP_KIND: ${{ inputs.version_bump }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import pathlib
+          import sys
+
+          bump_kind = os.environ["BUMP_KIND"]
+          pyproject_path = pathlib.Path("pyproject.toml")
+          text = pyproject_path.read_text(encoding="utf-8")
+
+          # Match the FIRST `version = "..."` under [project].
+          # We deliberately keep this simple: scan line by line within the
+          # [project] section until we hit the next [section] header.
+          lines = text.splitlines()
+          in_project = False
+          new_lines = []
+          current_version = None
+          new_version = None
+
+          version_re = re.compile(r'^version\s*=\s*"([^"]+)"\s*$')
+
+          def bump(version: str, kind: str) -> str:
+              # Strip pre-release / build metadata for the bump; we always
+              # release a clean X.Y.Z from this workflow.
+              core = re.split(r'[-+a]', version, maxsplit=1)[0]
+              parts = core.split(".")
+              if len(parts) != 3 or not all(p.isdigit() for p in parts):
+                  print(f"ERROR: unsupported version format: {version!r}", file=sys.stderr)
+                  sys.exit(1)
+              major, minor, patch = (int(p) for p in parts)
+              if kind == "major":
+                  major, minor, patch = major + 1, 0, 0
+              elif kind == "minor":
+                  minor, patch = minor + 1, 0
+              elif kind == "patch":
+                  patch = patch + 1
+              else:
+                  print(f"ERROR: unknown bump kind: {kind!r}", file=sys.stderr)
+                  sys.exit(1)
+              return f"{major}.{minor}.{patch}"
+
+          for line in lines:
+              stripped = line.strip()
+              if stripped.startswith("[") and stripped.endswith("]"):
+                  in_project = (stripped == "[project]")
+                  new_lines.append(line)
+                  continue
+              if in_project and current_version is None:
+                  m = version_re.match(line)
+                  if m:
+                      current_version = m.group(1)
+                      new_version = bump(current_version, bump_kind)
+                      new_lines.append(f'version = "{new_version}"')
+                      continue
+              new_lines.append(line)
+
+          if current_version is None or new_version is None:
+              print("ERROR: could not find version under [project]", file=sys.stderr)
+              sys.exit(1)
+
+          pyproject_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+          gh_out = os.environ.get("GITHUB_OUTPUT")
+          if gh_out:
+              with open(gh_out, "a", encoding="utf-8") as fh:
+                  fh.write(f"old_version={current_version}\n")
+                  fh.write(f"new_version={new_version}\n")
+                  fh.write(f"tag=v{new_version}\n")
+          print(f"Bumped {current_version} -> {new_version}")
+          PY
+
+      - name: Commit and tag the release
+        run: |
+          git add pyproject.toml
+          git commit -m "chore: release ${{ steps.bump.outputs.tag }}"
+          git tag -a "${{ steps.bump.outputs.tag }}" -m "ctxr-fsm ${{ steps.bump.outputs.tag }}"
+
+      # ---------------- Build distributions ----------------
+      - name: Build sdist + wheel
+        run: |
+          rm -rf dist
+          uv build
+
+      - name: Show built artifacts
+        run: ls -la dist/
+
+      # ---------------- Publish ----------------
+      - name: Publish to TestPyPI (dry run)
+        if: ${{ inputs.dry_run == true }}
+        run: uv publish --repository testpypi dist/*
+
+      - name: Publish to PyPI (Trusted Publishing via OIDC)
+        if: ${{ inputs.dry_run != true }}
+        run: uv publish dist/*
+
+      # ---------------- Push tag + commit ----------------
+      # We push the bump + tag for BOTH real and dry-run flows so that the
+      # repo history reflects the version that was actually built. If you
+      # want to keep dry-run truly side-effect-free, gate this step on
+      # `if: ${{ inputs.dry_run != true }}` instead.
+      - name: Push commit and tag to origin
+        run: git push origin HEAD --follow-tags
