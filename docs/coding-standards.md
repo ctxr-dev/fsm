@@ -51,9 +51,15 @@ a new string-keyed JSON field OR a new CLI flag value:
 - **`ctxr/fsm/cli/_clients.py`** — vocabularies shared across
   `ensure`, `install-mcp`, and `install-memory` (the W14 bootstrap
   pipeline). Examples: `McpClient`, `EnsureStatus`, `EnsureActionStatus`,
-  `McpConfigStatus`, `EnsureMode`, `ConfigFormat`.
+  `McpConfigStatus`, `EnsureMode`.
+- **`ctxr/fsm/mcp/_shared_enums.py`** — MCP tool vocabularies that
+  escape a single tool module. Example: `JournalAction` is read by
+  both `tools_runs` and `tools_events`, so it lives in this shared
+  home rather than in either tool module (importing across tool
+  modules just to share an enum would drag the producing module's
+  whole import graph into the consumer's boot path).
 - **Per-tool modules** — vocabularies that genuinely don't escape
-  their module (e.g. `CommitResultKind` and `JournalAction` in
+  their module (e.g. `CommitResultKind` in
   `ctxr/fsm/mcp/tools_runs.py`). When a second module reaches for
   them, promote to one of the canonical homes above.
 

@@ -28,7 +28,6 @@ from __future__ import annotations
 from enum import StrEnum
 
 __all__ = [
-    "ConfigFormat",
     "EnsureActionStatus",
     "EnsureMode",
     "EnsureStatus",
@@ -183,14 +182,3 @@ class EnsureMode(StrEnum):
     mcp_only = "mcp_only"
 
 
-class ConfigFormat(StrEnum):
-    """Discriminator for the per-client config file format.
-
-    Used by the generic merge helper in
-    :mod:`ctxr.fsm.cli.install_mcp_cmd` so a single
-    ``merge_idempotent`` knows whether to dispatch the JSON merge path
-    (Claude, Cursor) or the TOML splice path (Codex).
-    """
-
-    json = "json"
-    toml = "toml"

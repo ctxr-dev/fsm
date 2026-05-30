@@ -80,6 +80,17 @@ __all__ = ["ensure", "run_ensure"]
 _CLIENT_CHOICES: tuple[str, ...] = tuple(member.value for member in McpClient)
 _MODE_CHOICES: tuple[str, ...] = tuple(member.value for member in EnsureMode)
 
+# Legacy alias map for ``--mode``. W14i renamed the hyphenated wire
+# value ``mcp-only`` to the underscored ``mcp_only`` (StrEnum members
+# cannot contain hyphens). The hyphenated form is still accepted at the
+# CLI boundary so any shipped script / README copy / muscle memory that
+# uses the old spelling keeps working; we normalise it into the
+# canonical underscored value before validation and emit a one-line
+# deprecation warning so the operator knows to update their scripts.
+_MODE_ALIASES: dict[str, str] = {
+    "mcp-only": EnsureMode.mcp_only.value,
+}
+
 # How often (seconds) we poll between healthz attempts while waiting
 # for a freshly-spawned supervisor to come up. 100ms is short enough
 # to make the warm-path fast (the discovery file lands inside one or
@@ -493,6 +504,10 @@ def run_ensure(
         raise ValueError(
             f"client must be one of {_CLIENT_CHOICES!r}; got {client!r}"
         ) from exc
+    # Accept the legacy hyphenated form (W14i wire-rename) as an alias
+    # so programmatic callers do not break either.
+    if isinstance(mode, str) and mode in _MODE_ALIASES:
+        mode = _MODE_ALIASES[mode]
     try:
         mode_enum = mode if isinstance(mode, EnsureMode) else EnsureMode(mode)
     except ValueError as exc:
@@ -680,7 +695,10 @@ def ensure(
         "--mode",
         help=(
             "Bootstrap scope: 'full' (MCP + API + UI; default) or "
-            "'mcp-only' (just the MCP server; useful for headless CI)."
+            "'mcp_only' (just the MCP server; useful for headless CI). "
+            "The legacy hyphenated form 'mcp-only' is still accepted "
+            "and silently normalised to 'mcp_only' with a deprecation "
+            "warning."
         ),
     ),
     no_memory: bool = typer.Option(
@@ -733,6 +751,14 @@ def ensure(
         raise typer.BadParameter(
             f"--client must be one of {_CLIENT_CHOICES!r} (got {client!r})"
         )
+    if mode in _MODE_ALIASES:
+        canonical = _MODE_ALIASES[mode]
+        typer.echo(
+            f"warning: --mode {mode!r} is the legacy hyphenated form; "
+            f"please pass {canonical!r} instead. Accepting it for now.",
+            err=True,
+        )
+        mode = canonical
     if mode not in _MODE_CHOICES:
         raise typer.BadParameter(
             f"--mode must be one of {_MODE_CHOICES!r} (got {mode!r})"

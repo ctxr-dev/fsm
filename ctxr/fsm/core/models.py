@@ -537,8 +537,24 @@ class Transition(BaseModel):
             data["when"] = Predicate(when)
             return data
 
-        # Already a TransitionKind member — passes through unchanged.
+        # Already a TransitionKind member — only ``always`` and
+        # ``otherwise`` are valid bare guards. ``deterministic`` and
+        # ``judgement`` carry payloads (expression / criteria) and MUST
+        # come in as the dict form below; passing them bare would silently
+        # accept a guard with no expression and fault later in the engine.
+        # Reject at the boundary with a message that points the author
+        # at the dict form.
         if isinstance(when, TransitionKind):
+            if when not in (TransitionKind.always, TransitionKind.otherwise):
+                raise ValueError(
+                    f"Transition.when={when.value!r} cannot be used as a bare "
+                    "guard. Only `always` and `otherwise` are valid bare "
+                    "TransitionKind members; for `deterministic` use "
+                    "`{\"kind\": \"deterministic\", \"expression\": \"...\"}` "
+                    "and for `judgement` use "
+                    "`{\"kind\": \"judgement\", \"criteria\": \"...\", "
+                    "\"evidence_required\": <bool>}`."
+                )
             return data
 
         # Already a Predicate (or a mapping that pydantic will coerce
@@ -942,13 +958,20 @@ class InlineExecutionResult(BaseModel):
 class TransitionEvaluation(BaseModel):
     """The outcome of evaluating one transition guard at exit time.
 
-    ``kind`` carries the resolved guard shape: a :class:`TransitionKind`
-    member when the guard was structurally valid, or ``None`` when the
-    guard is missing / unresolved. Defensive ``"unknown"`` sentinels are
-    preserved as raw strings on the engine side and surfaced via
-    :attr:`error`, NOT as :class:`TransitionKind` members — the enum is
-    closed by design and an unknown guard is a programming bug, not a
-    new vocabulary entry.
+    ``kind`` is a plain string (a :class:`TransitionKind` member's
+    ``.value``, or the defensive sentinel ``"unknown"`` when the engine
+    could not resolve the guard shape), or ``None`` when the guard was
+    missing entirely. It is intentionally NOT typed as
+    :class:`TransitionKind` because the ``"unknown"`` sentinel must be
+    representable (an unknown guard is a programming bug surfaced via
+    :attr:`error`, not a new enum entry), and pinning the field to the
+    enum would force every consumer through ``TransitionKind(value)``
+    coercion at the boundary. Callers that need an enum member should
+    use ``TransitionKind(eval.kind) if eval.kind in {m.value for m in
+    TransitionKind} else None`` (or guard on ``eval.kind != "unknown"``
+    first); identity checks like ``eval.kind is TransitionKind.always``
+    will always be ``False`` because the field carries the string value,
+    not the member.
     """
 
     model_config = _DOMAIN_CFG
