@@ -557,6 +557,35 @@ class SpecsRepo:
         rows = session.execute(stmt).scalars().all()
         return [_spec_from_row(row) for row in rows]
 
+    @staticmethod
+    def get_latest_by_slug(
+        session: Session,
+        slug: str,
+        project_id: str | None = None,
+    ) -> RegisteredSpec | None:
+        """Return the highest-version registered spec for ``slug``.
+
+        Used by the MCP / API surface to let consumers reference a spec
+        by its human-readable slug (``"code-reviewer"``) instead of its
+        UUID primary key. The MCP ``fsm.start_run`` tool accepts either
+        shape because SKILL.md authors don't know the UUID at write
+        time.
+
+        When ``project_id`` is omitted, the lookup is global — there's
+        a single registered spec per slug in single-project deployments,
+        which is the dominant case today. When ``project_id`` is
+        supplied, the lookup is scoped to that project (forward-compat
+        with the multi-project schema).
+
+        Returns ``None`` when no row matches.
+        """
+        stmt = select(FsmSpecTable).where(FsmSpecTable.slug == slug)
+        if project_id is not None:
+            stmt = stmt.where(FsmSpecTable.project_id == project_id)
+        stmt = stmt.order_by(FsmSpecTable.version.desc()).limit(1)
+        row = session.execute(stmt).scalar_one_or_none()
+        return _spec_from_row(row) if row is not None else None
+
 
 # ---------------------------------------------------------------------------
 # RunsRepo

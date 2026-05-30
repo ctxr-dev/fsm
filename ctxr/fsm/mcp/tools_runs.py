@@ -75,7 +75,7 @@ from ctxr.fsm.mcp._shared_enums import JournalAction
 from ctxr.fsm.mcp._state import get_project
 from ctxr.fsm.sqlite import Project
 from ctxr.fsm.sqlite.models_core import RunTable, StateTable, TransitionTable
-from ctxr.fsm.sqlite.repos_core import RunSummary, _iso_now_ms
+from ctxr.fsm.sqlite.repos_core import RegisteredSpec, RunSummary, _iso_now_ms
 from ctxr.fsm.sqlite.repos_locks_journal import JournalTxn, Lock
 
 __all__ = [
@@ -212,8 +212,16 @@ class StartRunInput(BaseModel):
 
     model_config = _IN_CFG
 
-    spec_id: uuid.UUID = Field(
-        ..., description="UUID of a registered FSM spec to start a run for."
+    spec_id: str = Field(
+        ...,
+        description=(
+            "Identifier for a registered FSM spec. Accepts EITHER the "
+            "spec row's UUID primary key OR the human-readable slug the "
+            "spec was registered with (e.g. 'code-reviewer'). Slug "
+            "resolution picks the highest-version row for that slug; "
+            "UUID resolution is exact. SKILL.md authors usually pass "
+            "the slug because the UUID is unknown at skill-author time."
+        ),
     )
     args: dict[str, Any] = Field(
         default_factory=dict,
@@ -514,28 +522,72 @@ def _ensure_engine_producer(project: Project) -> str:
     return producer.id
 
 
-def _load_fsm_spec(project: Project, registered_spec_id: str) -> FsmSpec | None:
-    """Reconstruct an :class:`FsmSpec` from the row identified by id.
+def _load_fsm_spec(
+    project: Project, spec_id_or_slug: str
+) -> tuple[FsmSpec, str] | None:
+    """Reconstruct an :class:`FsmSpec` from the row identified by id-or-slug.
 
     The W2 substrate stores the spec as a canonical JSON ``definition``
     column; we reload it via Pydantic so the engine sees the same
     object shape it would see if the caller had constructed the spec
-    in-process. Returns ``None`` when the spec row is missing. The
-    :func:`ctxr.fsm.core.spec.attach_methods` shim is imported here so
-    ``spec.hash()`` is always callable on the returned object (the spec
-    module installs the method on first import; the import below is the
-    safe entry point even when this module is loaded before any other
-    caller has touched ``ctxr.fsm.core.spec``).
+    in-process.
+
+    Resolution order:
+
+    1. Try ``spec_id_or_slug`` as a UUID primary-key lookup
+       (``project.specs.get``). If the input parses as a valid UUID
+       and the row exists, we return it. This is the historical path.
+    2. Otherwise (non-UUID input OR UUID input that does not match a
+       row), try ``project.specs.get_latest_by_slug`` — accepts the
+       human-readable slug an FsmSpec was registered with and returns
+       the highest-version row for that slug. This is what SKILL.md
+       authors actually pass (``"code-reviewer"`` etc.) because the
+       UUID is unknown at skill-author time.
+
+    Returns ``(spec, registered_spec_pk_id)`` so callers that need the
+    canonical PK for downstream operations (``Project.start_run`` still
+    keys on the PK) can use it. Returns ``None`` when no row matches
+    either resolution path.
+
+    The :func:`ctxr.fsm.core.spec.attach_methods` shim is imported here
+    so ``spec.hash()`` is always callable on the returned object (the
+    spec module installs the method on first import; the import below
+    is the safe entry point even when this module is loaded before any
+    other caller has touched ``ctxr.fsm.core.spec``).
     """
     # Side-effect import: binds ``FsmSpec.hash()`` / ``FsmSpec.validate()``.
     # Idempotent and cheap once the module is on the path.
     from ctxr.fsm.core import spec as _spec_module  # noqa: F401
 
     with project.session_factory() as session:
-        registered = project.specs.get(session, registered_spec_id)
+        # Step 1 — UUID branch. We use ``uuid.UUID`` parsing as the
+        # gate so we never do a PK lookup with a slug-shaped string
+        # (the table's id column is a TEXT-stored UUID; passing a
+        # slug would round-trip as a missing row, which is fine, but
+        # the parse-first path makes the intent explicit and avoids
+        # one wasted query in the common slug case).
+        registered: RegisteredSpec | None = None
+        try:
+            uuid.UUID(spec_id_or_slug)
+        except ValueError:
+            pass
+        else:
+            registered = project.specs.get(session, spec_id_or_slug)
+
+        # Step 2 — slug fallback. Triggered when the input is not
+        # UUID-shaped OR the UUID lookup missed (a stale UUID passed
+        # by a caller that captured it from a prior run shouldn't
+        # silently 404 if the same spec is now registered under a
+        # newer row id).
+        if registered is None:
+            registered = project.specs.get_latest_by_slug(
+                session, spec_id_or_slug
+            )
+
     if registered is None:
         return None
-    return FsmSpec.model_validate(registered.definition)
+    spec_obj = FsmSpec.model_validate(registered.definition)
+    return spec_obj, registered.id
 
 
 def _spec_hash_lock_error(
@@ -860,17 +912,25 @@ def fsm_start_run(input: StartRunInput) -> RunStartedPayload | McpToolError:
     """
     try:
         project = get_project()
-        spec_id_str = str(input.spec_id)
+        # ``input.spec_id`` is now a plain ``str`` (W14k BLOCKER-4): it
+        # may be a UUID primary key OR a registered slug. The loader
+        # resolves either shape + returns the canonical PK so
+        # ``Project.start_run`` (which keys on the PK) can run unchanged.
+        spec_id_input = input.spec_id
 
-        spec = _load_fsm_spec(project, spec_id_str)
-        if spec is None:
+        resolved = _load_fsm_spec(project, spec_id_input)
+        if resolved is None:
             return as_error(
                 "spec_not_found",
-                detail=f"no registered spec with id {spec_id_str!r}",
-                spec_id=spec_id_str,
+                detail=(
+                    f"no registered spec with id or slug {spec_id_input!r}. "
+                    "Try `ctxr-fsm spec list` to see what's registered."
+                ),
+                spec_id=spec_id_input,
             )
+        spec, spec_pk = resolved
 
-        run = project.start_run(spec_id=spec_id_str, args=dict(input.args))
+        run = project.start_run(spec_id=spec_pk, args=dict(input.args))
         producer_id = _ensure_engine_producer(project)
 
         # Materialise the entry state's inputs from args + emit
