@@ -1,12 +1,16 @@
 ---
 name: ctxr-fsm-principles
-version: 0.1.0
+version: 0.2.0
 audience: ai-agents
 ---
 
 # ctxr-fsm: how an agent must use the FSM
 
 You have access to an MCP server named "ctxr-fsm" exposing fsm.* tools (healthcheck, list_specs, register_spec, start_run, get_brief, commit_outputs, confirm_commit, resume_run, abort_run, list_runs, get_run, subscribe_events, inspect_journal, recover_journal, observe_tool_call, list_consumers, list_producers).
+
+## Principle 0: Bootstrap before work
+
+Before any FSM-using skill or agent does ANYTHING else, follow the bootstrap procedure at @.ctxr-fsm/memory/bootstrap.md to ensure `ctxr-fsm` is installed, the project is initialised, the MCP server is registered with the active client, and the supervisor is running. The bootstrap is idempotent and fast (<500ms) when everything is already up, so calling it once per session has negligible cost. Do NOT skip it on the assumption that "it was up yesterday" — sessions, clients, and project state drift. Principles 1 through 10 below describe how to behave once a run is active; Principle 0 is the gate that makes any of them reachable.
 
 ## Principle 1: pre-check before you act
 

@@ -27,8 +27,20 @@ import pytest
 from typer.testing import CliRunner
 
 from ctxr.fsm.cli import app
+from ctxr.fsm.memory import get_principles_path
 
 runner = CliRunner()
+
+
+def _current_principles_version() -> str:
+    """Read the principles version actually shipped in the package."""
+
+    canonical = get_principles_path("canonical").read_text(encoding="utf-8")
+    for line in canonical.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("version:"):
+            return stripped.split(":", 1)[1].strip().strip('"').strip("'")
+    raise AssertionError("principles.md missing version: frontmatter line")
 
 
 @pytest.fixture
@@ -70,9 +82,12 @@ def test_auto_patches_both_claude_and_codex_when_both_present(
     # Cursor should NOT be in the result set (no .cursor/rules dir).
     assert "cursor" not in clients_touched
 
-    # Both host files now carry a marker block at version 0.1.0.
-    assert "<!-- ctxr-fsm:begin v=0.1.0 -->" in claude.read_text(encoding="utf-8")
-    assert "<!-- ctxr-fsm:begin v=0.1.0 -->" in agents.read_text(encoding="utf-8")
+    # Both host files now carry a marker block at the package's
+    # current principles version (read from the source of truth so
+    # this assertion survives future bumps without an edit).
+    current = _current_principles_version()
+    assert f"<!-- ctxr-fsm:begin v={current} -->" in claude.read_text(encoding="utf-8")
+    assert f"<!-- ctxr-fsm:begin v={current} -->" in agents.read_text(encoding="utf-8")
 
     # And Claude's @ import points at the materialised in-project file.
     assert "@.ctxr-fsm/memory/principles.claude.md" in claude.read_text(

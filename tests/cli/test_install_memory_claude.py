@@ -57,6 +57,24 @@ def tmp_target() -> Iterator[Path]:
         yield Path(tmp).resolve()
 
 
+def _current_principles_version() -> str:
+    """Read the principles version actually shipped in the package.
+
+    Tests previously hard-coded ``"0.1.0"`` here, which made every
+    package version bump (Principle 0 ships in 0.2.0, etc.) require a
+    matching test-file edit. Reading the version from the same source
+    of truth the CLI reads from keeps the tests insensitive to future
+    bumps that don't change the marker contract.
+    """
+
+    canonical = get_principles_path("canonical").read_text(encoding="utf-8")
+    for line in canonical.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("version:"):
+            return stripped.split(":", 1)[1].strip().strip('"').strip("'")
+    raise AssertionError("principles.md missing version: frontmatter line")
+
+
 def _install_bumped_principles(
     monkeypatch: pytest.MonkeyPatch, scratch: Path, new_version: str
 ) -> None:
@@ -68,9 +86,12 @@ def _install_bumped_principles(
     ``--check`` run sees the bumped version as the "package" version.
     """
     scratch.mkdir(parents=True, exist_ok=True)
+    current_version = _current_principles_version()
     for client, filename in _FILENAME_BY_CLIENT.items():
         original = get_principles_path(client).read_text(encoding="utf-8")
-        bumped = original.replace("version: 0.1.0", f"version: {new_version}")
+        bumped = original.replace(
+            f"version: {current_version}", f"version: {new_version}"
+        )
         (scratch / filename).write_text(bumped, encoding="utf-8")
 
     def fake_get(client: str = "claude") -> Path:
@@ -103,7 +124,8 @@ def test_install_patches_empty_claude_md_with_import_line(tmp_target: Path) -> N
 
     assert result.exit_code == 0, result.output
     body = host.read_text(encoding="utf-8")
-    assert "<!-- ctxr-fsm:begin v=0.1.0 -->" in body
+    current = _current_principles_version()
+    assert f"<!-- ctxr-fsm:begin v={current} -->" in body
     assert "<!-- ctxr-fsm:end -->" in body
     assert "@.ctxr-fsm/memory/principles.claude.md" in body
     # The materialised in-project principles file (symlink or copy)
@@ -193,7 +215,7 @@ def test_check_reports_out_of_date_after_version_bump(
     assert payload["package_version"] == "9.9.9"
     row = payload["results"][0]
     assert row["client"] == "claude"
-    assert row["installed_version"] == "0.1.0"
+    assert row["installed_version"] == _current_principles_version()
     assert row["status"] == "out-of-date"
 
 

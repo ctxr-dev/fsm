@@ -1,0 +1,58 @@
+<!-- generated from ctxr/fsm/memory/bootstrap.md by scripts/sync_bootstrap_doc.py — do not edit directly -->
+# ctxr-fsm bootstrap: how a skill or agent ensures fsm is ready
+
+**Before any work in a skill that depends on `ctxr-fsm`, run this once per session.** It is idempotent and fast (<500ms) when the project is already initialised and the supervisor is running.
+
+## Step 1 — confirm the package is installed
+
+```bash
+uv run ctxr-fsm --version  # or: pipx run ctxr-fsm --version
+```
+
+If this prints a version, skip to Step 2. If it errors with "command not found":
+
+```bash
+uv add ctxr-fsm                              # in a uv project
+pipx install ctxr-fsm                        # globally, isolated
+pip install --user ctxr-fsm                  # last resort
+```
+
+Then retry the version check. If it still fails, return `MissingRequirement` and STOP — do NOT improvise.
+
+## Step 2 — bootstrap the project (`ctxr-fsm ensure`)
+
+```bash
+uv run ctxr-fsm ensure --json
+```
+
+This is idempotent. On a cold project it: creates `.ctxr-fsm/fsm.db`, runs migrations, installs principles into CLAUDE.md/AGENTS.md/.cursor/rules, registers `ctxr-fsm` as an MCP server in the active client config(s), boots the supervisor (MCP + FastAPI + UI). On a warm project it returns in <500ms confirming everything is up.
+
+Parse the JSON output. Capture `mcp_http_url` (the HTTP-SSE MCP endpoint for current-session use) and `api_url`.
+
+## Step 3 — try stdio MCP first, fall back to HTTP-SSE
+
+Call `fsm.healthcheck()` via the MCP tool surface. If it returns ok, proceed to your skill's actual work — the stdio MCP server is registered with this client and reachable.
+
+If `fsm.healthcheck()` is unavailable (the stdio config was JUST registered and won't be effective until next session) call the HTTP-SSE fallback via Bash:
+
+```bash
+curl -s "$MCP_HTTP_HEALTHZ"  # MCP_HTTP_HEALTHZ comes from ensure --json output
+```
+
+and continue calling fsm primitives via `curl http://127.0.0.1:<port>/...` for THIS session. The next session will pick up the stdio config automatically.
+
+## Step 4 — register your skill's spec (one-time per project)
+
+Skills that ship an FsmSpec must register it before `start_run`:
+
+```bash
+uv run ctxr-fsm spec register <your.module.path:fsm>
+```
+
+Idempotent — re-registering the same spec at the same version is a no-op. If the spec's body changed, fsm bumps `fsm_specs.version` automatically.
+
+## Step 5 — drive the run (LLM-as-orchestrator)
+
+Use the `fsm.*` MCP tool family: `fsm.start_run(spec_id, args)` → loop `fsm.get_brief(run_id)` → for worker states, dispatch a sub-agent with the brief's prompt + inputs → `fsm.commit_outputs(run_id, outputs, signature)` → repeat until brief is terminal. Inline states are advanced server-side; you don't see them as briefs.
+
+See [`principles.md`](./principles.md) for the rules every FSM-driving agent must follow once a run is active.

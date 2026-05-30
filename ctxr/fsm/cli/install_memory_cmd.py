@@ -18,6 +18,14 @@ wires it into the consumer project's standard AI-client memory:
   standalone, so we write the principles file directly with no marker
   block. The rule filename itself is the namespace.
 
+For EVERY client we additionally stage ``bootstrap.md`` under
+``./.ctxr-fsm/memory/bootstrap.md`` so Principle 0's
+``@.ctxr-fsm/memory/bootstrap.md`` reference inside principles.md
+resolves to a real file on disk. (Claude's transitive ``@`` follow
+needs the file; Codex/Cursor inline the principles body and the
+reference is just text, but the file still has to exist for an
+operator to open when following the pointer.)
+
 Idempotence
 -----------
 
@@ -67,6 +75,7 @@ that has no AI-client memory yet is a no-op, not an error).
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 from dataclasses import dataclass
@@ -76,7 +85,7 @@ from typing import Any
 import typer
 
 from ctxr.fsm.cli._common import json_or_pretty
-from ctxr.fsm.memory import get_principles_path
+from ctxr.fsm.memory import BOOTSTRAP_FILENAME, get_bootstrap_path, get_principles_path
 
 __all__ = ["install_memory", "run_install_memory"]
 
@@ -111,6 +120,18 @@ _MARKER_BLOCK_RE: re.Pattern[str] = re.compile(
 # Kept under ``.ctxr-fsm/`` so a ``rm -rf .ctxr-fsm`` is the project's
 # reset (same rationale as the SQLite DB lives there).
 _CLAUDE_LINKED_PATH: Path = Path(".ctxr-fsm") / "memory" / "principles.claude.md"
+
+# Relative path inside the target project where we materialise the
+# bootstrap doc. Principle 0 inside principles.md references this path
+# via ``@.ctxr-fsm/memory/bootstrap.md``, so EVERY client install must
+# put the file here (not just the Claude path that natively resolves
+# the ``@<path>`` syntax). For Codex/Cursor the principles body is
+# inlined and the reference is just text, but the file still needs to
+# exist for the principles' instruction to be actionable when an
+# operator follows the @ pointer manually.
+_BOOTSTRAP_LINKED_PATH: Path = (
+    Path(".ctxr-fsm") / "memory" / BOOTSTRAP_FILENAME
+)
 
 # The relative path Cursor uses for project-scoped rule files. We pick a
 # stable filename (``ctxr-fsm.mdc``) so the rule is greppable and so
@@ -365,13 +386,14 @@ def _apply_patch(host_text: str, new_block: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _materialise_claude_link(
+def _materialise_package_file(
     target: Path,
     package_file: Path,
+    relative_dest: Path,
     *,
     no_symlink: bool,
 ) -> tuple[Path, str]:
-    """Place the Claude principles file under ``target/.ctxr-fsm/memory/``.
+    """Stage a package file under ``target/<relative_dest>`` (symlink or copy).
 
     Returns ``(absolute_destination, mode)`` where ``mode`` is one of
     ``"symlink"`` (we managed to symlink) or ``"copy"`` (we fell back to
@@ -379,9 +401,15 @@ def _materialise_claude_link(
 
     The destination directory is created if missing. If a stale file
     already exists at the destination we replace it — the source of
-    truth is always the package's principles file.
+    truth is always the package's source file.
+
+    Generic over which file is being staged: the principles adapter
+    AND the bootstrap doc both go through this helper so the
+    symlink/copy semantics (including the Windows / FUSE fallback) stay
+    in one place.
     """
-    dest = target / _CLAUDE_LINKED_PATH
+
+    dest = target / relative_dest
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     # Remove any pre-existing entry (file, symlink, or broken symlink)
@@ -395,15 +423,13 @@ def _materialise_claude_link(
         return dest, "copy"
 
     try:
-        # We use a RELATIVE symlink so a tarball / git move of the
-        # project directory still resolves correctly. The relative
-        # target is computed from the destination's parent.
-        rel_target = Path(package_file).resolve()
-        # ``os.path.relpath`` would be the obvious helper but it
-        # produces strings; we want a Path. The principles file lives
+        # We use an ABSOLUTE symlink because the package file lives
         # outside the project dir (it's inside the installed package),
-        # so an absolute symlink is fine and unambiguous — relpath
-        # across that boundary would be cosmetically ugly.
+        # so a relative path across that boundary would be cosmetically
+        # ugly. Resolving here also makes the symlink stable across a
+        # ``git mv`` of the project — the link always points back at
+        # the installed package.
+        rel_target = Path(package_file).resolve()
         dest.symlink_to(rel_target)
         return dest, "symlink"
     except (OSError, NotImplementedError):
@@ -411,6 +437,49 @@ def _materialise_claude_link(
         # without dev mode, some FUSE mounts) — fall back to copy.
         shutil.copy2(package_file, dest)
         return dest, "copy"
+
+
+def _materialise_claude_link(
+    target: Path,
+    package_file: Path,
+    *,
+    no_symlink: bool,
+) -> tuple[Path, str]:
+    """Place the Claude principles file under ``target/.ctxr-fsm/memory/``.
+
+    Thin wrapper over :func:`_materialise_package_file` that pins the
+    relative destination to the Claude principles path. Kept as a named
+    helper so call sites read declaratively rather than threading the
+    relative-destination constant through.
+    """
+
+    return _materialise_package_file(
+        target,
+        package_file,
+        _CLAUDE_LINKED_PATH,
+        no_symlink=no_symlink,
+    )
+
+
+def _materialise_bootstrap_doc(
+    target: Path,
+    *,
+    no_symlink: bool,
+) -> tuple[Path, str]:
+    """Stage the canonical bootstrap doc under ``target/.ctxr-fsm/memory/``.
+
+    Wraps :func:`_materialise_package_file` against the package's
+    bootstrap source so every client install path stages the file
+    consistently. The bootstrap doc has no per-client variant, so
+    there's exactly one ``package_file`` to materialise.
+    """
+
+    return _materialise_package_file(
+        target,
+        get_bootstrap_path(),
+        _BOOTSTRAP_LINKED_PATH,
+        no_symlink=no_symlink,
+    )
 
 
 def _build_claude_payload() -> str:
@@ -453,6 +522,13 @@ class _InstallResult:
     package_version: str | None
     installed_version: str | None
     link_mode: str | None  # "symlink" | "copy" | None
+    # ``bootstrap_link_mode`` records how ``.ctxr-fsm/memory/bootstrap.md``
+    # was staged for this client (symlink / copy / None when dry-run
+    # skipped the materialisation). The bootstrap doc is staged for
+    # EVERY client so Principle 0's ``@.ctxr-fsm/memory/bootstrap.md``
+    # reference resolves regardless of which client hosts the
+    # principles body — see _materialise_bootstrap_doc.
+    bootstrap_link_mode: str | None = None
     note: str = ""
 
 
@@ -465,9 +541,19 @@ def _install_claude(
     dry_run: bool,
     no_symlink: bool,
 ) -> _InstallResult:
-    """Idempotent install for Claude: symlink + marker block in CLAUDE.md."""
+    """Idempotent install for Claude: symlink + marker block in CLAUDE.md.
+
+    The marker block injected into ``CLAUDE.md`` only imports
+    ``principles.<client>.md`` via Claude's ``@<path>`` syntax. Principle
+    0 inside principles.md references ``@.ctxr-fsm/memory/bootstrap.md``
+    in turn, so a separate ``@`` import for the bootstrap doc in the
+    marker block would be redundant — Claude's transitive import
+    resolves it through the principles file. We still stage
+    bootstrap.md alongside the principles file so that import has
+    something to resolve to.
+    """
     if dry_run:
-        # In dry-run mode we don't materialise the symlink — just show
+        # In dry-run mode we don't materialise either symlink — just show
         # what the patch would look like. The link mode is reported as
         # whatever ``no_symlink`` implies so the dry-run output matches
         # what would actually happen.
@@ -487,10 +573,12 @@ def _install_claude(
             package_version=package_version,
             installed_version=installed_version,
             link_mode=link_mode,
+            bootstrap_link_mode=link_mode,
             note=_diff_preview(existing_text, new_text),
         )
 
     _, link_mode = _materialise_claude_link(target, package_file, no_symlink=no_symlink)
+    _, bootstrap_link_mode = _materialise_bootstrap_doc(target, no_symlink=no_symlink)
 
     existing_text = host_file.read_text(encoding="utf-8") if host_file.is_file() else ""
     new_block = _build_marker_block(
@@ -506,6 +594,7 @@ def _install_claude(
             package_version=package_version,
             installed_version=package_version,
             link_mode=link_mode,
+            bootstrap_link_mode=bootstrap_link_mode,
         )
 
     host_file.parent.mkdir(parents=True, exist_ok=True)
@@ -517,17 +606,27 @@ def _install_claude(
         package_version=package_version,
         installed_version=package_version,
         link_mode=link_mode,
+        bootstrap_link_mode=bootstrap_link_mode,
     )
 
 
 def _install_codex(
     *,
+    target: Path,
     host_file: Path,
     package_file: Path,
     package_version: str | None,
     dry_run: bool,
+    no_symlink: bool,
 ) -> _InstallResult:
-    """Idempotent install for Codex: inline the principles into AGENTS.md."""
+    """Idempotent install for Codex: inline the principles into AGENTS.md.
+
+    Codex doesn't natively follow Claude's ``@<path>`` import syntax,
+    so the principles body is inlined directly. We still stage
+    bootstrap.md under ``.ctxr-fsm/memory/`` so an operator (or
+    follow-up tooling) who reads Principle 0's ``@`` reference can
+    open the file at the expected project-relative path.
+    """
     package_text = package_file.read_text(encoding="utf-8")
     existing_text = host_file.read_text(encoding="utf-8") if host_file.is_file() else ""
 
@@ -546,8 +645,11 @@ def _install_codex(
             if existing_text
             else None,
             link_mode=None,
+            bootstrap_link_mode="copy" if no_symlink else "symlink",
             note=_diff_preview(existing_text, new_text),
         )
+
+    _, bootstrap_link_mode = _materialise_bootstrap_doc(target, no_symlink=no_symlink)
 
     if new_text == existing_text and host_file.is_file():
         return _InstallResult(
@@ -557,6 +659,7 @@ def _install_codex(
             package_version=package_version,
             installed_version=package_version,
             link_mode=None,
+            bootstrap_link_mode=bootstrap_link_mode,
         )
 
     host_file.parent.mkdir(parents=True, exist_ok=True)
@@ -568,17 +671,28 @@ def _install_codex(
         package_version=package_version,
         installed_version=package_version,
         link_mode=None,
+        bootstrap_link_mode=bootstrap_link_mode,
     )
 
 
 def _install_cursor(
     *,
+    target: Path,
     host_file: Path,
     package_file: Path,
     package_version: str | None,
     dry_run: bool,
+    no_symlink: bool,
 ) -> _InstallResult:
-    """Idempotent install for Cursor: write the standalone .mdc rule file."""
+    """Idempotent install for Cursor: write the standalone .mdc rule file.
+
+    Cursor rule files live under ``.cursor/rules/`` and are evaluated
+    standalone (no marker / no inlined-import contract). We still stage
+    bootstrap.md alongside the in-project ``.ctxr-fsm/memory/`` copy
+    so Principle 0's ``@.ctxr-fsm/memory/bootstrap.md`` reference is
+    actionable for any human or tool that follows it from the rule
+    body.
+    """
     package_bytes = package_file.read_bytes()
     existing_bytes = host_file.read_bytes() if host_file.is_file() else b""
 
@@ -595,8 +709,11 @@ def _install_cursor(
             package_version=package_version,
             installed_version=installed_version,
             link_mode=None,
+            bootstrap_link_mode="copy" if no_symlink else "symlink",
             note=f"would write {len(package_bytes)} bytes to {host_file}",
         )
+
+    _, bootstrap_link_mode = _materialise_bootstrap_doc(target, no_symlink=no_symlink)
 
     if existing_bytes == package_bytes:
         return _InstallResult(
@@ -606,6 +723,7 @@ def _install_cursor(
             package_version=package_version,
             installed_version=package_version,
             link_mode=None,
+            bootstrap_link_mode=bootstrap_link_mode,
         )
 
     host_file.parent.mkdir(parents=True, exist_ok=True)
@@ -617,6 +735,7 @@ def _install_cursor(
         package_version=package_version,
         installed_version=package_version,
         link_mode=None,
+        bootstrap_link_mode=bootstrap_link_mode,
     )
 
 
@@ -642,20 +761,75 @@ def _read_installed_version_from_text(text: str) -> str | None:
 
 @dataclass(frozen=True)
 class _CheckRow:
-    """One row in the per-client ``--check`` status table."""
+    """One row in the per-client ``--check`` status table.
+
+    ``status`` and ``installed_version`` describe the principles file's
+    drift status (parsed from the marker block's ``v=`` attribute or
+    the cursor rule frontmatter). ``bootstrap_status`` describes the
+    drift status of the staged ``.ctxr-fsm/memory/bootstrap.md`` copy
+    against the package source — bootstrap.md has no frontmatter
+    version, so we compare content hashes instead. A client is
+    considered out-of-date overall when EITHER axis is out of date or
+    missing.
+    """
 
     client: str
     host_file: Path | None
     package_version: str | None
     installed_version: str | None
     status: str  # "ok" | "out-of-date" | "missing" | "not-installed"
+    bootstrap_status: str = "not-installed"  # "ok" | "out-of-date" | "missing" | "not-installed"
+
+
+def _sha256_file(path: Path) -> str:
+    """Return the lowercase hex sha256 of ``path``'s bytes."""
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _check_bootstrap_status(
+    target: Path, package_bootstrap_hash: str
+) -> str:
+    """Compare the staged bootstrap copy under ``target`` against the package.
+
+    Bootstrap.md ships without a frontmatter version (it's a procedural
+    doc, not a versioned policy), so principles-style version-marker
+    comparison doesn't apply. We hash the staged file's bytes and
+    compare against the package source's hash, which is exactly what
+    drift detection needs: any change to either file shows up as a
+    hash mismatch.
+
+    Returns:
+        ``"ok"`` — staged file exists and content matches the package.
+        ``"out-of-date"`` — staged file exists but content differs.
+        ``"not-installed"`` — staged file is absent.
+    """
+
+    staged = target / _BOOTSTRAP_LINKED_PATH
+    if not staged.is_file():
+        return "not-installed"
+
+    if _sha256_file(staged) == package_bootstrap_hash:
+        return "ok"
+    return "out-of-date"
 
 
 def _check_one(
-    detection: _ClientDetection, package_version: str | None
+    target: Path,
+    detection: _ClientDetection,
+    package_version: str | None,
+    package_bootstrap_hash: str,
 ) -> _CheckRow:
-    """Compute the status for one detected client."""
+    """Compute the status for one detected client.
+
+    The bootstrap-axis status is computed once per client even though
+    the bootstrap file is shared across clients — this matches the
+    existing per-client row shape and keeps the JSON contract uniform
+    (every row carries every status it needs to make a verdict).
+    """
     host = detection.host_file
+    bootstrap_status = _check_bootstrap_status(target, package_bootstrap_hash)
+
     if host is None or not host.is_file():
         return _CheckRow(
             client=detection.name,
@@ -663,6 +837,7 @@ def _check_one(
             package_version=package_version,
             installed_version=None,
             status="not-installed",
+            bootstrap_status=bootstrap_status,
         )
 
     installed = _read_installed_version_from_text(
@@ -676,6 +851,7 @@ def _check_one(
             package_version=package_version,
             installed_version=None,
             status="missing",
+            bootstrap_status=bootstrap_status,
         )
     if installed == package_version:
         return _CheckRow(
@@ -684,6 +860,7 @@ def _check_one(
             package_version=package_version,
             installed_version=installed,
             status="ok",
+            bootstrap_status=bootstrap_status,
         )
     return _CheckRow(
         client=detection.name,
@@ -691,6 +868,7 @@ def _check_one(
         package_version=package_version,
         installed_version=installed,
         status="out-of-date",
+        bootstrap_status=bootstrap_status,
     )
 
 
@@ -779,19 +957,23 @@ def run_install_memory(
         elif detection.name == "codex":
             results.append(
                 _install_codex(
+                    target=target,
                     host_file=detection.host_file,
                     package_file=package_file,
                     package_version=package_version,
                     dry_run=dry_run,
+                    no_symlink=no_symlink,
                 )
             )
         elif detection.name == "cursor":
             results.append(
                 _install_cursor(
+                    target=target,
                     host_file=detection.host_file,
                     package_file=package_file,
                     package_version=package_version,
                     dry_run=dry_run,
+                    no_symlink=no_symlink,
                 )
             )
         else:  # pragma: no cover — guarded by _detect_clients
@@ -809,6 +991,7 @@ def run_install_memory(
                 "package_version": r.package_version,
                 "installed_version": r.installed_version,
                 "link_mode": r.link_mode,
+                "bootstrap_link_mode": r.bootstrap_link_mode,
                 "note": r.note,
             }
             for r in results
@@ -861,9 +1044,10 @@ def install_memory(
         False,
         "--no-symlink",
         help=(
-            "For Claude, always copy the principles file under "
-            "TARGET/.ctxr-fsm/memory/ instead of trying to symlink first. "
-            "Default tries symlink and falls back to copy on failure."
+            "Always copy staged files (the Claude principles adapter and "
+            "the bootstrap doc) under TARGET/.ctxr-fsm/memory/ instead of "
+            "trying to symlink first. Default tries symlink and falls back "
+            "to copy on failure (Windows without dev-mode, some FUSE mounts)."
         ),
     ),
     json_mode: bool = typer.Option(
@@ -912,8 +1096,23 @@ def install_memory(
         package_version = _parse_version(
             canonical_package_file.read_text(encoding="utf-8")
         )
-        rows = [_check_one(d, package_version) for d in detections]
-        out_of_date = [r for r in rows if r.status in ("out-of-date", "missing")]
+        package_bootstrap_hash = _sha256_file(get_bootstrap_path())
+        rows = [
+            _check_one(
+                resolved_target, d, package_version, package_bootstrap_hash
+            )
+            for d in detections
+        ]
+        # Drift on EITHER axis (principles version or bootstrap content)
+        # triggers a non-zero exit so CI can fail fast. We treat the
+        # bootstrap doc the same as the principles file: missing or
+        # out-of-date is a problem the human needs to know about.
+        out_of_date = [
+            r
+            for r in rows
+            if r.status in ("out-of-date", "missing")
+            or r.bootstrap_status in ("out-of-date", "not-installed")
+        ]
         json_or_pretty(
             {
                 "target": str(resolved_target),
@@ -925,6 +1124,7 @@ def install_memory(
                         "package_version": r.package_version,
                         "installed_version": r.installed_version,
                         "status": r.status,
+                        "bootstrap_status": r.bootstrap_status,
                     }
                     for r in rows
                 ],

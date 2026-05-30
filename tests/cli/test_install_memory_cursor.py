@@ -44,14 +44,28 @@ def tmp_target() -> Iterator[Path]:
         yield Path(tmp).resolve()
 
 
+def _current_principles_version() -> str:
+    """Read the principles version actually shipped in the package."""
+
+    canonical = get_principles_path("canonical").read_text(encoding="utf-8")
+    for line in canonical.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("version:"):
+            return stripped.split(":", 1)[1].strip().strip('"').strip("'")
+    raise AssertionError("principles.md missing version: frontmatter line")
+
+
 def _install_bumped_principles(
     monkeypatch: pytest.MonkeyPatch, scratch: Path, new_version: str
 ) -> None:
     """Patch ``get_principles_path`` to point at a bumped copy of every file."""
     scratch.mkdir(parents=True, exist_ok=True)
+    current_version = _current_principles_version()
     for client, filename in _FILENAME_BY_CLIENT.items():
         original = get_principles_path(client).read_text(encoding="utf-8")
-        bumped = original.replace("version: 0.1.0", f"version: {new_version}")
+        bumped = original.replace(
+            f"version: {current_version}", f"version: {new_version}"
+        )
         (scratch / filename).write_text(bumped, encoding="utf-8")
 
     def fake_get(client: str = "claude") -> Path:
@@ -93,7 +107,7 @@ def test_install_creates_cursor_rule_with_frontmatter(tmp_target: Path) -> None:
     assert "globs:" in body
     assert "alwaysApply:" in body
     # And the canonical principles version block is also inside.
-    assert "version: 0.1.0" in body
+    assert f"version: {_current_principles_version()}" in body
     assert "# ctxr-fsm: how an agent must use the FSM" in body
 
 
@@ -174,5 +188,5 @@ def test_check_detects_out_of_date_after_version_bump(
     assert payload["package_version"] == "3.1.4"
     row = payload["results"][0]
     assert row["client"] == "cursor"
-    assert row["installed_version"] == "0.1.0"
+    assert row["installed_version"] == _current_principles_version()
     assert row["status"] == "out-of-date"

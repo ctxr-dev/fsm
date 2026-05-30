@@ -47,14 +47,28 @@ def tmp_target() -> Iterator[Path]:
         yield Path(tmp).resolve()
 
 
+def _current_principles_version() -> str:
+    """Read the principles version actually shipped in the package."""
+
+    canonical = get_principles_path("canonical").read_text(encoding="utf-8")
+    for line in canonical.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("version:"):
+            return stripped.split(":", 1)[1].strip().strip('"').strip("'")
+    raise AssertionError("principles.md missing version: frontmatter line")
+
+
 def _install_bumped_principles(
     monkeypatch: pytest.MonkeyPatch, scratch: Path, new_version: str
 ) -> None:
     """Patch ``get_principles_path`` to point at a bumped copy of every file."""
     scratch.mkdir(parents=True, exist_ok=True)
+    current_version = _current_principles_version()
     for client, filename in _FILENAME_BY_CLIENT.items():
         original = get_principles_path(client).read_text(encoding="utf-8")
-        bumped = original.replace("version: 0.1.0", f"version: {new_version}")
+        bumped = original.replace(
+            f"version: {current_version}", f"version: {new_version}"
+        )
         (scratch / filename).write_text(bumped, encoding="utf-8")
 
     def fake_get(client: str = "claude") -> Path:
@@ -90,9 +104,14 @@ def test_check_reports_drift_across_all_clients_after_version_bump(
     )
     assert install.exit_code == 0, install.output
 
-    # Now simulate a package version bump (e.g. release 0.2.0 ships).
+    # Now simulate a package version bump (e.g. a release after the
+    # currently-shipped version ships). We pick a sentinel that is
+    # guaranteed to differ from whatever ``principles.md`` actually
+    # ships as today, so the drift test stays meaningful across
+    # future version bumps.
+    bumped_version = "9.99.99"
     bumped_dir = tmp_target / "_bumped_principles"
-    _install_bumped_principles(monkeypatch, bumped_dir, "0.2.0")
+    _install_bumped_principles(monkeypatch, bumped_dir, bumped_version)
 
     check = runner.invoke(
         app,
@@ -108,14 +127,15 @@ def test_check_reports_drift_across_all_clients_after_version_bump(
     )
     assert check.exit_code == 1, check.output
     payload = json.loads(check.stdout)
-    assert payload["package_version"] == "0.2.0"
+    assert payload["package_version"] == bumped_version
 
     by_client = {row["client"]: row for row in payload["results"]}
     assert set(by_client) == {"claude", "codex", "cursor"}
+    current = _current_principles_version()
     for client in ("claude", "codex", "cursor"):
         row = by_client[client]
-        assert row["installed_version"] == "0.1.0", row
-        assert row["package_version"] == "0.2.0", row
+        assert row["installed_version"] == current, row
+        assert row["package_version"] == bumped_version, row
         assert row["status"] == "out-of-date", row
 
 
