@@ -70,7 +70,9 @@ from ctxr.fsm.core.inline_registry import (
     InlineContext,
     InlineHandler,
     InlineHandlerRegistry,
+    discover_handlers_via_entry_points,
     get_default_registry,
+    lookup_with_discovery,
 )
 
 # ---------------------------------------------------------------------------
@@ -225,11 +227,13 @@ __all__ = [
     "aggregate_loop_outputs",
     "attach_methods",
     "build_brief",
+    "discover_handlers_via_entry_points",
     "evaluate_expression",
     "execute_inline",
     "fsm_spec_hash",
     "get_default_registry",
     "get_verifier_handler",
+    "lookup_with_discovery",
     "loop_decide",
     "outputs_path_for",
     "resolve_transition",

@@ -45,6 +45,7 @@ __all__ = [
     "InlineContext",
     "InlineHandler",
     "InlineHandlerRegistry",
+    "discover_handlers_via_entry_points",
     "get_default_registry",
 ]
 
@@ -227,3 +228,135 @@ def get_default_registry() -> InlineHandlerRegistry:
     time so importing this module is enough to make it available.
     """
     return _default_registry
+
+
+# ---------------------------------------------------------------------------
+# Cross-process entry-points-based handler discovery
+# ---------------------------------------------------------------------------
+#
+# Skills register inline handlers in their OWN Python process (typically
+# via ``python -m <skill>.install`` or some equivalent bootstrap). The
+# MCP server / FastAPI server / supervisor run in DIFFERENT processes.
+# Those server processes' default registries start empty — they have no
+# way to know what handlers a skill installed in some other process.
+#
+# Resolution: skills declare an entry point in their pyproject.toml:
+#
+#     [project.entry-points."ctxr_fsm.skills"]
+#     skill-code-review = "ctxr_skill_code_review.install:register"
+#
+# Server processes (or anyone needing a handler that's not present in
+# their local registry) call :func:`discover_handlers_via_entry_points`
+# to walk every registered entry-point and invoke its ``register()``
+# function. Each skill's ``register()`` is idempotent and re-registers
+# its INLINE_HANDLERS into whatever registry it can reach (typically
+# the default singleton via :func:`get_default_registry`), so the
+# server's registry gets populated in-place.
+
+_EP_GROUP: str = "ctxr_fsm.skills"
+"""Entry-points group every ctxr-fsm-driven skill declares in its
+pyproject.toml. Pinned here as the single source of truth so adding a
+new server-side caller is a one-line ``from inline_registry import
+_EP_GROUP`` away from speaking the same convention."""
+
+
+_discovery_cache: set[str] = set()
+"""Names of entry points whose ``register()`` has already been called in
+THIS process. Lazy discovery is the dominant pattern: the first time
+the MCP server's `commit_outputs` advances to an inline state and finds
+the registry empty, it calls ``discover_handlers_via_entry_points()``,
+which short-circuits subsequent calls so the bootstrap cost is paid
+once per process lifetime."""
+
+
+def discover_handlers_via_entry_points(
+    *,
+    force: bool = False,
+) -> dict[str, str | None]:
+    """Walk ``ctxr_fsm.skills`` entry points and invoke each ``register()``.
+
+    Eager bulk discovery: every entry point registered against the
+    ``ctxr_fsm.skills`` group is loaded and its callable invoked,
+    which is expected to populate the default
+    :class:`InlineHandlerRegistry` with that skill's handlers + the
+    spec row in the local project DB.
+
+    Used by server processes (MCP / FastAPI) when their local registry
+    misses a handler lookup: the missing handler is almost always a
+    cross-process situation (the skill registered in process A, the
+    server runs in process B), and entry-points are the standard
+    cross-process discovery mechanism.
+
+    Parameters
+    ----------
+    force:
+        When ``False`` (default), entry points already invoked in this
+        process are skipped. When ``True``, every entry point is
+        re-loaded + re-invoked (useful for tests that monkeypatch the
+        entry-points and want a fresh walk).
+
+    Returns
+    -------
+    dict[str, str | None]
+        Map of ``entry_point_name -> error_message``. ``error_message``
+        is ``None`` on success. Any exception raised by an entry-point's
+        ``register()`` is captured into the value so a single broken
+        skill does not poison discovery for the rest of the workspace.
+    """
+
+    # Lazy import: ``importlib.metadata`` is stdlib (>= 3.10) so the
+    # import is cheap, but we keep it local so the registry module's
+    # top-level remains zero-dependency for unit tests that monkeypatch.
+    from importlib.metadata import entry_points
+
+    outcomes: dict[str, str | None] = {}
+    # ``entry_points(group=...)`` in 3.12 returns an EntryPoints
+    # collection that supports iteration. Older Python releases (pre-3.10)
+    # would need the fallback shim; this package's pyproject pins
+    # ``requires-python >= 3.12`` so we use the modern surface directly.
+    eps = entry_points(group=_EP_GROUP)
+    for ep in eps:
+        if not force and ep.name in _discovery_cache:
+            outcomes[ep.name] = None  # already loaded successfully
+            continue
+        try:
+            register_fn = ep.load()
+            register_fn()
+        except Exception as exc:  # one bad skill must not poison discovery for the rest
+            outcomes[ep.name] = f"{type(exc).__name__}: {exc}"
+        else:
+            outcomes[ep.name] = None
+            _discovery_cache.add(ep.name)
+    return outcomes
+
+
+def lookup_with_discovery(
+    spec_id: str,
+    handler_id: str,
+    *,
+    registry: InlineHandlerRegistry | None = None,
+) -> InlineHandler | None:
+    """Look up a handler with one round of cross-process discovery on miss.
+
+    Convenience for server processes that drive inline-state advancement
+    without knowing whether the handlers were registered locally or in
+    a different process. The flow is:
+
+    1. Look up in the supplied (or default) registry.
+    2. If found, return.
+    3. Otherwise call :func:`discover_handlers_via_entry_points` once
+       (subsequent calls are short-circuited by the discovery cache).
+    4. Look up again.
+    5. Return whatever we have — possibly still ``None`` if no
+       registered skill owns the requested handler.
+
+    Tests that want to assert "lookup never goes through discovery"
+    should use :meth:`InlineHandlerRegistry.lookup` directly.
+    """
+
+    registry = registry or _default_registry
+    handler = registry.lookup(spec_id, handler_id)
+    if handler is not None:
+        return handler
+    discover_handlers_via_entry_points()
+    return registry.lookup(spec_id, handler_id)
