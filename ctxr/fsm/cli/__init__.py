@@ -146,6 +146,7 @@ app.command(
     name="api",
     help="Run the FastAPI HTTP / SSE server (binds --host/--port).",
 )(api_cmd.api)
-app.command(name="ui", help="(Stub) local UI launcher — ships in W6/W7.")(
-    ui_cmd.ui
-)
+app.command(
+    name="ui",
+    help="Run the Vite dev server for the UI subproject (binds --port).",
+)(ui_cmd.ui)

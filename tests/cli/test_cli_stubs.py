@@ -246,35 +246,71 @@ def test_api_rejects_out_of_range_port() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ``ui`` — Vite UI launcher stub (W6)
+# ``ui`` — Vite UI launcher (W6, now implemented)
 # ---------------------------------------------------------------------------
+#
+# These tests used to assert on the W3 stub's deferral message. W6
+# replaced the stub with a real boot path that shells out to ``npm
+# install`` and ``npm run dev``, both of which would actually spawn
+# the Vite dev server and block the test runner. We therefore exercise
+# the surface via ``--help`` (which Typer can render without entering
+# the command body) and assert that every documented flag
+# (``--port``, ``--api-port``, ``--no-install``) is listed. Real
+# end-to-end coverage of the boot sequence is a manual smoke
+# (``ctxr-fsm ui`` against a live API) plus the W6 UI tests that
+# drive Vite directly; both live outside this stub-shaped file.
 
 
-def test_ui_stub_exits_nonzero_with_deferral_message() -> None:
-    """``ctxr-fsm ui`` must defer to W6 and exit non-zero."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        _project_db(tmpdir)
-        result = runner.invoke(app, ["ui"])
+def test_ui_help_lists_port_api_port_and_no_install_options() -> None:
+    """``ctxr-fsm ui --help`` documents the W6 flag surface."""
+    result = runner.invoke(app, ["ui", "--help"])
 
-    assert result.exit_code != 0
-    assert "Vite UI dev server lands in W6" in result.stderr
+    # ``--help`` always exits 0 — anything else means a registration
+    # regression (e.g. the import in cli/__init__.py was dropped).
+    assert result.exit_code == 0, (
+        f"`ui --help` must exit 0 (got {result.exit_code}); "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    # Each flag must be visible by name so operator scripts and the
+    # docs site can reliably parse the help text. We assert on the
+    # long-form name with the leading double-dash because Typer's
+    # rich help renderer can wrap descriptions but always prints the
+    # flag token verbatim on its own line.
+    assert "--port" in result.stdout
+    assert "--api-port" in result.stdout
+    assert "--no-install" in result.stdout
 
 
-def test_ui_stub_accepts_valid_port_flag() -> None:
-    """A custom in-range ``--port`` reaches the stub body."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        _project_db(tmpdir)
-        result = runner.invoke(app, ["ui", "--port", "5174"])
+def test_ui_rejects_out_of_range_port() -> None:
+    """``--port`` outside 1-65535 fails Typer's bound check.
 
-    assert result.exit_code == 1
-    assert "lands in W6" in result.stderr
-
-
-def test_ui_stub_rejects_out_of_range_port() -> None:
-    """``--port`` outside 1-65535 fails Typer's bound check."""
+    The bound check runs before the command body, so this test can
+    safely invoke the command without ever spawning ``npm`` — the
+    invalid value trips Typer's range validation first.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         _project_db(tmpdir)
         result = runner.invoke(app, ["ui", "--port", "70000"])
+
+    # ``typer.BadParameter`` renders through Click's usage-error path,
+    # which exits with code 2. We assert "non-zero, not 1" so the
+    # distinction between validation failure (2) and any future stub-
+    # style deferral (1) stays explicit.
+    assert result.exit_code != 0
+    assert result.exit_code != 1
+
+
+def test_ui_rejects_out_of_range_api_port() -> None:
+    """``--api-port`` outside 1-65535 fails Typer's bound check.
+
+    Mirrors :func:`test_ui_rejects_out_of_range_port` for the
+    sibling flag — same rationale (validation runs before the body,
+    so no Vite spawn).
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _project_db(tmpdir)
+        result = runner.invoke(app, ["ui", "--api-port", "70000"])
 
     assert result.exit_code != 0
     assert result.exit_code != 1
@@ -289,12 +325,11 @@ def test_ui_stub_rejects_out_of_range_port() -> None:
     ("subcommand", "marker"),
     [
         # Stub commands carry an explicit "ships in W{N}" marker in
-        # their registered help line. ``mcp`` (W4) and ``api`` (W5)
-        # are now real implementations, so their top-level help
-        # strings no longer advertise a workstream — see the
+        # their registered help line. ``mcp`` (W4), ``api`` (W5) and
+        # ``ui`` (W6) are now real implementations, so their top-level
+        # help strings no longer advertise a workstream — see the
         # dedicated cases below.
         ("serve", "W7"),
-        ("ui", "W6"),
     ],
 )
 def test_all_stubs_registered_and_visible_in_help(
@@ -351,3 +386,22 @@ def test_api_registered_and_visible_in_help() -> None:
     # help line — unlikely to false-match against any other command's
     # description.
     assert "FastAPI" in result.stdout
+
+
+def test_ui_registered_and_visible_in_help() -> None:
+    """The real ``ui`` command must appear on the top-level help screen.
+
+    Mirrors :func:`test_api_registered_and_visible_in_help` for the
+    now-implemented W6 command — the parametrised case above can't
+    cover it because ``ui``'s help line no longer carries a
+    workstream marker. Asserting on the subcommand name plus a stable
+    token from the registered help text pins both the registration
+    and the documented purpose.
+    """
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "ui" in result.stdout
+    # "Vite" is the stable, distinctive token in the registered help
+    # line — unlikely to false-match against any other command's
+    # description.
+    assert "Vite" in result.stdout
