@@ -360,7 +360,24 @@ def _detect_clients(target: Path, client: str) -> list[_ClientDetection]:
             _detect_codex(target),
             _detect_cursor(target),
         ]
-        return [d for d in detections if d.detected]
+        detected = [d for d in detections if d.detected]
+        if detected:
+            return detected
+        # BLOCKER-3 (W14k): in a COLD project (no CLAUDE.md, no
+        # AGENTS.md, no .cursor/rules) every detector returns False
+        # and ``auto`` would historically be a no-op — leaving the
+        # SKILL.md ``@.ctxr-fsm/memory/bootstrap.md`` reference dead
+        # because nothing ever stages bootstrap.md alongside
+        # principles.claude.md. Fall back to claude (the dominant
+        # client for `ctxr-fsm ensure` callers) + bootstrap a fresh
+        # CLAUDE.md at the canonical location. The patcher creates
+        # the file if it doesn't exist; the user can rename / move it
+        # afterward and re-running ``install-memory`` is idempotent.
+        return [
+            _ClientDetection(
+                name="claude", detected=True, host_file=target / "CLAUDE.md"
+            )
+        ]
 
     if client == "claude":
         detected = _detect_claude(target)
