@@ -59,6 +59,7 @@ from ctxr.fsm.cli import (
     serve_cmd,
     spec_cmd,
     ui_cmd,
+    urls_cmd,
 )
 
 __all__ = ["app"]
@@ -93,6 +94,19 @@ app.command(name="migrate", help="Run alembic upgrade head against the project D
 app.command(name="doctor", help="Print a diagnostic report for the project DB.")(
     doctor_cmd.doctor
 )
+# ``urls`` (W16) is the one-keystroke "where do I go?" shortcut. Prints
+# ONLY the Rich subsystem table — no DB diagnostic panel, no alembic
+# chatter. ``show`` is registered as an alias for muscle-memory parity
+# (different operators reach for different verbs).
+app.command(
+    name="urls",
+    help="Print the subsystem URL table (UI / Swagger / MCP / API). One-keystroke 'where do I go?' shortcut.",
+)(urls_cmd.urls)
+app.command(
+    name="show",
+    help="Alias for `urls` — prints the subsystem URL table.",
+    hidden=True,
+)(urls_cmd.urls)
 # ``install-memory`` (W11) writes the FSM-usage principles into the
 # consumer project's AI-client memory files (CLAUDE.md, AGENTS.md,
 # .cursor/rules/). Idempotent via marker-fenced blocks.

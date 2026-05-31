@@ -818,6 +818,14 @@ def ensure(
                 print_subsystem_table(
                     {"subsystems": subsystems_block}, project_root=root
                 )
+                # Discoverability tip (W16): operators reach for
+                # ``urls``-style shortcuts to "show me where everything
+                # is" without remembering ``doctor`` or scrolling
+                # through ensure's full output every time.
+                typer.echo(
+                    "\nTip: run `ctxr-fsm urls` any time to reprint this table.",
+                    err=False,
+                )
 
     # Exit non-zero on a failed / degraded run, or on --check that
     # surfaced any ``missing_*`` status, so wrapping scripts can react.
