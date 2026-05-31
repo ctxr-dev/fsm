@@ -10,7 +10,7 @@ import type { JSX, VNode } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 
 import {
-  Card, Dialog, EmptyState, Pill, Spinner, Table, type TableColumn,
+  Card, Dialog, EmptyState, JsonViewer, Pill, Spinner, Table, type TableColumn,
 } from '../components';
 import { api, ApiError, type SpecDetail, type SpecSummary } from '../lib/api';
 
@@ -108,9 +108,14 @@ export function SpecsRoute(): JSX.Element {
         ) : !detail ? (
           <div class="flex items-center justify-center py-8"><Spinner label="Loading spec" /></div>
         ) : (
-          <pre class="font-mono text-xs leading-relaxed whitespace-pre-wrap break-words text-slate-800 dark:text-slate-200">
-            {JSON.stringify(detail.definition, null, 2)}
-          </pre>
+          <JsonViewer
+            value={detail.definition}
+            rootLabel="definition"
+            mode="expanded"
+            defaultExpandDepth={3}
+            downloadFilename={`spec-${detail.slug}-v${detail.version}.json`}
+            ariaLabel={`Definition of ${detail.slug} v${detail.version}`}
+          />
         )}
       </Dialog>
     </div>
