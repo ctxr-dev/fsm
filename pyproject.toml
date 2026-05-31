@@ -42,7 +42,20 @@ build-backend = "hatchling.build"
 packages = ["ctxr"]
 
 [tool.hatch.build]
-include = ["ctxr/**/*.py", "ctxr/**/*.md", "README.md", "LICENSE"]
+include = [
+  "ctxr/**/*.py",
+  "ctxr/**/*.md",
+  # Testing fixture-project template (W17b) ships INSIDE the wheel so
+  # ctxr.fsm.testing.materialise_fixture_project() can resolve its
+  # bundled resources at runtime. Covers the seed source files,
+  # tsconfig/package metadata, and the gitignore template (renamed
+  # from .gitignore so the build backend does not drop it).
+  "ctxr/fsm/testing/fixture_project/**/*.ts",
+  "ctxr/fsm/testing/fixture_project/**/*.json",
+  "ctxr/fsm/testing/fixture_project/**/*.template",
+  "README.md",
+  "LICENSE",
+]
 
 [dependency-groups]
 dev = [

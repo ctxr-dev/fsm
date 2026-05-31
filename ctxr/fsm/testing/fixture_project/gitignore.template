@@ -1,0 +1,10 @@
+.ctxr-fsm/
+.claude/
+.cursor/
+.mcp.json
+CLAUDE.md
+AGENTS.md
+node_modules/
+.runs/
+.skill-code-review/
+*.tmp

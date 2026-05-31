@@ -889,6 +889,50 @@ class Project:
                 "chain_length": inline_result["chain_length"],
             }
 
+        # Worker-direct-to-terminal: the engine reports the transition
+        # INTO a terminal-shaped state as ``advance`` (not ``terminal``)
+        # because ``EngineAdvanceKind.terminal`` is computed from the
+        # CURRENT state's body. When we have just landed at a state
+        # with no body and no transitions, finalise the run here.
+        # Mirrors the same fallback the inline-chain driver applies at
+        # the end of a chain. Skips when an inline chain already ran
+        # (it does its own terminal detection).
+        from ctxr.fsm.core.models import StateKind as _StateKind
+        from ctxr.fsm.sqlite.models_core import RunTable
+        from ctxr.fsm.sqlite.repos_core import _iso_now_ms
+
+        landed_state = spec.get_state(next_state_id)
+        landed_is_terminal = landed_state.kind is _StateKind.terminal or (
+            not landed_state.transitions
+            and landed_state.worker is None
+            and landed_state.loop is None
+            and landed_state.inline is None
+        )
+        if landed_is_terminal:
+            verdict_val = env_for_chain.get("verdict")
+            with self.session_factory() as session, session.begin():
+                run_row = session.get(RunTable, run_id)
+                if run_row is not None:
+                    run_row.status = "completed"
+                    run_row.ended_at = _iso_now_ms()
+                    run_row.last_update_at = run_row.ended_at
+                    if verdict_val is not None:
+                        run_row.verdict = str(verdict_val)
+                    session.add(run_row)
+                self.events.emit(
+                    session,
+                    producer_id=producer_id,
+                    kind=EventKind.run_completed.value,
+                    payload={"run_id": run_id, "verdict": verdict_val},
+                    run_id=run_id,
+                )
+            return {
+                "result_kind": EngineAdvanceKind.terminal.value,
+                "next_state_id": next_state_id,
+                "next_brief": None,
+                "chain_length": 0,
+            }
+
         return {
             "result_kind": result_kind,
             "next_state_id": next_state_id,
