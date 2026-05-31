@@ -1,131 +1,196 @@
-# `@ctxr/fsm`
+# ctxr-fsm — SQLite-backed FSM substrate for deterministic LLM-orchestrated workflows
 
-Generic finite-state-machine substrate for deterministic LLM-orchestrated workflows.
+A Python 3.12+ runtime that turns an `FsmSpec` into a crash-safe, auditable agent workflow on top of a single SQLite database. Workers (LLMs, scripts, humans) advance the run through `fsm.*` tools served over MCP, REST, or stdio; the substrate enforces what each state may do, cosigns every commit, runs an adversarial verifier panel, and quarantines runs that drift. One DB, one process tree, one observable timeline — no Redis, no queue broker, no Kubernetes.
 
-Consumers (skills, agents, CI workflows) declare a YAML state machine + worker prompt templates and call this package's CLIs to drive a run. The CLIs handle:
+## Architecture at a glance
 
-- Atomic state writes (POSIX `O_EXCL` lock files with TTL; write-tmp+fsync+rename).
-- Date-sharded filesystem layout for any volume of runs (256 shards under each day).
-- JSON-Schema-validated worker outputs at every state boundary.
-- Safe deterministic-predicate DSL (no `eval`, no string interpolation).
-- Trace files capturing every transition with inputs / outputs / predicate evaluations.
-
-The package is consumer-agnostic — no project-specific paths, no hardcoded state names. Configure via `--storage-root` / `--fsm-path` flags or a `.fsmrc.json` config file at the consumer's project root.
-
-## Status
-
-**v0.1 — foundations.** Stable interface for the four core CLIs. v0.2 adds lifecycle CLIs (resume, pause, abandon, pivot, stale-cleanup, validate-trace). See [`docs/orchestration-design.md`](docs/orchestration-design.md) for the full roadmap.
-
-## Install
-
-While the package is in early development, consumers reference it via a `file://` path to the sibling repo:
-
-```json
-{
-  "dependencies": {
-    "@ctxr/fsm": "file:../fsm"
-  }
-}
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                      UI (fsm-ui · Vite + Preact)                     │
+│              SSE consumer over the FastAPI event stream              │
+└──────────────────────────────────────────────────────────────────────┘
+                              ▲
+┌─────────────────┬────────────┴───────────┬──────────────────────────┐
+│  ctxr.fsm.mcp   │      ctxr.fsm.api      │      ctxr.fsm.cli        │
+│  (MCP server)   │ (FastAPI · REST + SSE) │   (typer · operator)     │
+│   17 fsm.*      │   /runs /specs /events │   init · serve · doctor  │
+│   tools         │   /admin               │   runs · spec · migrate  │
+└─────────────────┴────────────┬───────────┴──────────────────────────┘
+                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                          ctxr.fsm.sqlite                             │
+│   STRICT schema · alembic migrations · 18 tables · repositories      │
+│   Project facade · transactions · journal · locks · drift detector   │
+└──────────────────────────────────────────────────────────────────────┘
+                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                            ctxr.fsm.core                             │
+│  Pydantic models · engine (advance) · predicate DSL · loop · agg     │
+│  spec validate/hash · verifier panel · Protocols for persistence     │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-After publication to npm, consumers will use the standard semver form.
+Arrows point in the dependency direction. The core never imports SQLite; SQLite never imports MCP/API/CLI; the UI talks HTTP only. Full reference: [docs/architecture.md](docs/architecture.md).
 
 ## Quick start
 
-1. **Author an FSM YAML** at e.g. `fsm/my-orchestrator.fsm.yaml`. See [`docs/state-yaml-reference.md`](docs/state-yaml-reference.md) for the schema.
+```bash
+uv add ctxr-fsm                                       # or: pip install 'ctxr-fsm[all]'
+ctxr-fsm init                                         # .ctxr-fsm/fsm.db + migrations + AI-memory patch
+ctxr-fsm spec register examples.plan_implement_qa_fix:spec
+ctxr-fsm serve --mode dev                             # boots MCP + FastAPI + Vite UI
+open http://localhost:5173                            # browse the run dashboard
+```
 
-2. **Author worker prompt templates** for each state with a `worker:` block. See [`docs/worker-contract.md`](docs/worker-contract.md).
+`ctxr-fsm init` is idempotent — re-run it any time to top up migrations or refresh the principles installed into `CLAUDE.md` / `AGENTS.md`. `serve --mode dev` is a single supervisor process; `ctxr-fsm doctor` prints DB facts plus per-subsystem health.
 
-3. **Add a `.fsmrc.json`** at your project root. The `fsms[]` array supports any number of named FSMs (one per agent / logical pipeline):
+## What's included
 
-   ```json
-   {
-     "fsms": [
-       {
-         "name": "code-review",
-         "fsm_path": "fsm/code-review.fsm.yaml",
-         "storage_root": ".my-app/runs/code-review"
-       },
-       {
-         "name": "report-builder",
-         "fsm_path": "fsm/report-builder.fsm.yaml",
-         "storage_root": ".my-app/runs/reports"
-       }
-     ]
-   }
-   ```
+| Subsystem | What it does | Doc |
+|---|---|---|
+| `ctxr.fsm.core` | Pydantic spec models, pure engine (`advance`, `build_brief`), predicate DSL, loop + aggregator, spec hashing, verifier panel, Protocol surface | [docs/api.md](docs/api.md) |
+| `ctxr.fsm.sqlite` | STRICT-mode schema across 18 tables, alembic migrations, repositories, `Project` facade, single-writer lock, atomic-tx journal, drift detector | [docs/data-model.md](docs/data-model.md) |
+| `ctxr.fsm.mcp` | MCP server (stdio + HTTP/SSE) exposing 17 `fsm.*` tools — start runs, get briefs, commit + confirm outputs, subscribe to events, inspect the journal | [docs/mcp-tools.md](docs/mcp-tools.md) |
+| `ctxr.fsm.api` | FastAPI app with REST + SSE under `/api/v1/`, OpenAPI at `/docs`, auth surface, mirrors the MCP tool set for browser / HTTP clients | [docs/http-api.md](docs/http-api.md) |
+| `ctxr.fsm.cli` | `typer` console script: `init`, `migrate`, `serve`, `mcp`, `api`, `ui`, `doctor`, `runs ls`, `run show/resume/abort`, `spec validate/register/list`, `export`, `import`, `install-memory` | [docs/operating.md](docs/operating.md) |
+| `fsm-ui` | Vite + Preact + Tailwind v4 SPA in `ui/`. SSE-driven run dashboard | [docs/architecture.md](docs/architecture.md) |
+| Service lifecycle | Supervisor with one child per subsystem, reserved ports, PID singleton, graceful drain reload, `doctor` integrity sweep | [docs/operating.md](docs/operating.md) |
+| Enforcement | Spec-hash lock, commit cosignature, two-phase commit, adversarial verifier panel, drift detector, Claude Code pre-tool-use hook | [docs/enforcement.md](docs/enforcement.md) |
+| Examples | Three runnable simulated-worker workflows: plan/implement/qa/fix, code-review pipeline, research-with-retries | [docs/examples-tour.md](docs/examples-tour.md) |
+| Recovery | Operator playbook for crashes, stalled journal txns, drift quarantine, replay | [docs/recovery.md](docs/recovery.md) |
 
-   The config file is static — only project-level setup. Runtime concerns like `session_id` are passed via CLI flags (`--session-id`) or auto-generated, never persisted in the config.
+## Why an FSM substrate?
 
-4. **Validate the FSM**:
+A bare LLM loop is a probability cloud over tool calls; an FSM is a contract. Each state declares what tools the worker may call, what shape its output must take, what predicate decides the next state, and whether an adversarial verifier panel has to second the result. The substrate then enforces that contract with a two-phase commit, a cosignature over the brief + inputs + outputs, a spec-hash lock that pins a running workflow to its declared shape, and a background drift detector that quarantines runs whose accumulated misbehaviour crosses a configurable threshold. The result is a workflow you can replay, audit, and resume — not just one you can rerun and hope. Full layer-by-layer reference: [docs/enforcement.md](docs/enforcement.md).
 
-   ```bash
-   npx fsm-validate-static fsm/my-orchestrator.fsm.yaml
-   ```
+## Development
 
-5. **Drive a run** from your orchestrator. With one FSM in the config you can omit `--fsm`; with multiple FSMs you pass `--fsm <name>` to pick:
+### One-time setup
 
-   ```bash
-   # Start a new run (single-FSM config)
-   npx fsm-next --new-run --repo my-app --base-sha aaa --head-sha bbb --args '{"some":"input"}'
+```bash
+git clone https://github.com/ctxr-dev/fsm.git
+cd fsm
 
-   # Start a new run against a named FSM in a multi-FSM config
-   npx fsm-next --fsm code-review --new-run --repo my-app --base-sha aaa --head-sha bbb --args '{"some":"input"}'
+# Python side
+uv sync --all-extras --dev
 
-   # ...orchestrator dispatches workers, collects JSON outputs...
+# UI side
+cd ui && npm ci && cd ..
+```
 
-   # Commit each state's output and advance
-   npx fsm-commit --fsm code-review --run-id <run-id> --outputs '{"x":42}'
+Requires Python 3.12+, Node 22+, and uv (`curl -LsSf https://astral.sh/uv/install.sh | sh`).
 
-   # Inspect at any time
-   npx fsm-inspect --fsm code-review --run-id <run-id>
-   ```
+### Run the test suites
 
-   You can always bypass the config by passing `--fsm-path` + `--storage-root` directly.
+```bash
+# Python: unit + integration + CLI + MCP + API + lifecycle + enforcement + examples
+uv run pytest tests/
 
-The CLIs all return JSON to stdout. Exit codes: `0` success, `1` runtime error (lock conflict, schema violation, etc.), `2` argument error.
+# Python static analysis
+uv run ruff check ctxr/ tests/ examples/
+uv run mypy ctxr/fsm/
+
+# Frontend
+cd ui && npm test && npm run build && cd ..
+```
+
+Expected: `456 passed` (Python) + `17 passed` (UI) on a clean checkout.
+
+### Run an example
+
+```bash
+uv run python examples/plan_implement_qa_fix.py
+uv run python examples/code_review_pipeline.py
+uv run python examples/research_with_retries.py
+```
+
+Each example uses a tmpdir for the run database, drives the FSM through simulated worker outputs, and prints the resulting state tree + event log. See docs/examples-tour.md for what each one teaches.
+
+### Boot the dev supervisor
+
+```bash
+# In one terminal:
+uv run ctxr-fsm init                  # creates .ctxr-fsm/fsm.db + applies migrations + patches CLAUDE.md/AGENTS.md
+uv run ctxr-fsm serve --mode dev      # supervisor boots MCP (HTTP-SSE) + FastAPI + Vite UI
+
+# In another terminal:
+uv run ctxr-fsm doctor                # diagnostic report
+uv run ctxr-fsm runs ls               # empty until you start a run
+uv run ctxr-fsm spec register examples.plan_implement_qa_fix:spec
+```
+
+The supervisor:
+- assigns ports automatically (and remembers them in `.ctxr-fsm/ports.json`)
+- writes PID files under `.ctxr-fsm/pids/`
+- watches `ctxr/fsm/` for file changes and gracefully drains + respawns MCP + API
+- never spawns a second copy if you re-invoke from the same project root
+
+Browse the UI at `http://localhost:5173`, the FastAPI docs at `http://localhost:<api_port>/docs` (port from `ctxr-fsm doctor`), and connect an MCP client to `http://localhost:<mcp_port>/sse`.
+
+### Bootstrap from a skill or agent (universal entry point)
+
+Skills and agents that depend on `ctxr-fsm` should follow the bootstrap discipline in [BOOTSTRAP.md](BOOTSTRAP.md) (mirror of [`ctxr/fsm/memory/bootstrap.md`](ctxr/fsm/memory/bootstrap.md)). The TL;DR is one command:
+
+```bash
+uv run ctxr-fsm ensure --json
+```
+
+`ensure` is idempotent and fast (<500ms when everything is already up). On a cold project it: creates `.ctxr-fsm/fsm.db`, runs migrations, installs principles into CLAUDE.md/AGENTS.md/.cursor/rules, registers `ctxr-fsm` as an MCP server in the active client's config, boots the supervisor (MCP + FastAPI + UI). Parse the JSON output to get `mcp_http_url` for the HTTP-SSE fallback path. Per-client reload semantics (Claude Code vs Codex vs Cursor) are documented in [BOOTSTRAP.md](BOOTSTRAP.md). A `--check` flag does the same probe read-only.
+
+### Run the MCP server standalone (for Claude Code stdio integration)
+
+When you want JUST the MCP child (no FastAPI, no UI), `ctxr-fsm ensure --mode mcp_only --json` is the supervisor-managed path (the legacy hyphenated form `mcp-only` is still accepted with a deprecation warning). For a raw standalone process (debugging, one-off connection):
+
+```bash
+uv run ctxr-fsm mcp --db ./.ctxr-fsm/fsm.db
+```
+
+This blocks on stdio; pair it with a Claude Code (or other MCP client) session configured to launch the binary on demand. The `.mcp.json` entry that `ctxr-fsm install-mcp` writes calls this same binary in stdio mode and lets it discover the DB by walking up from the inherited cwd to find `.ctxr-fsm/`. See docs/mcp-tools.md.
+
+### Contribution loop
+
+1. Branch off the latest unmerged tip (workstream chain). Use a `<scope>/<short-name>` style branch name.
+2. Make changes inside one of `ctxr/fsm/{core,sqlite,cli,mcp,api,memory}`, `ui/`, `examples/`, or `docs/`. Don't cross layer boundaries (see docs/architecture.md for the dependency rule).
+3. Run the full verify gauntlet locally (pytest + ruff + mypy + ui).
+4. Commit + push + open a PR against the previous workstream branch (or main if it's a follow-on).
+5. CI runs `python-ci.yml` on the PR (lint + test matrix on Python 3.12 + 3.13 + UI build).
+6. After review + green CI, the human gate is: merge.
+7. Publishes to PyPI are MANUAL via `python-publish.yml` workflow_dispatch (see docs/operating.md).
+
+### Useful one-liners
+
+| What | How |
+|---|---|
+| Watch tests rerun on file change | `uv run pytest tests/ -q --looponfail` (needs pytest-xdist) |
+| UI dev mode (HMR) | `cd ui && npm run dev` |
+| Show all CLI commands | `uv run ctxr-fsm --help` |
+| Inspect a run | `uv run ctxr-fsm run show <run-id>` |
+| Find drift signals | `uv run ctxr-fsm doctor` then `curl http://localhost:<api>/api/v1/admin/drift_signals` |
+| Clean local state | `rm -rf .ctxr-fsm/ .venv/ ui/node_modules/ ui/dist/` |
 
 ## Documentation
 
-- [`docs/orchestration-design.md`](docs/orchestration-design.md) — design substrate; failure-mode analysis; architecture; on-disk schemas; roadmap.
-- [`docs/cli-reference.md`](docs/cli-reference.md) — exhaustive CLI reference for `fsm-next`, `fsm-commit`, `fsm-inspect`, `fsm-validate-static`.
-- [`docs/state-yaml-reference.md`](docs/state-yaml-reference.md) — FSM YAML schema with examples.
-- [`docs/worker-contract.md`](docs/worker-contract.md) — worker prompt template conventions and JSON Schema response contract.
-- [`docs/storage-layout.md`](docs/storage-layout.md) — disk layout, lock semantics, manifest schema.
+- [docs/architecture.md](docs/architecture.md) — layered design, dependency rule, service topology
+- [docs/api.md](docs/api.md) — Python API reference (`ctxr.fsm.core` + `ctxr.fsm.sqlite`)
+- [docs/data-model.md](docs/data-model.md) — every SQLite table, enum vocabulary, ER diagram, journal contract
+- [docs/mcp-tools.md](docs/mcp-tools.md) — the 17 `fsm.*` MCP tools, error envelope, examples
+- [docs/http-api.md](docs/http-api.md) — REST + SSE surface, auth, OpenAPI
+- [docs/operating.md](docs/operating.md) — CLI reference, env vars, port + PID layout
+- [docs/enforcement.md](docs/enforcement.md) — spec-hash lock, cosignature, two-phase commit, verifier, drift detector, CC hook
+- [docs/examples-tour.md](docs/examples-tour.md) — walkthrough of the three runnable examples
+- [docs/recovery.md](docs/recovery.md) — crash + drift + replay operator playbook
 
-## Programmatic API
+## Quick links
 
-The package's [`scripts/lib/index.mjs`](scripts/lib/index.mjs) re-exports the engine and helpers for consumers who want to embed the engine directly. The CLIs are the recommended interface — they handle the structured-emit protocol, atomic writes, and lock management for free.
-
-```js
-import { evaluatePredicate, loadFsm, runEnv, resolveTransition } from "@ctxr/fsm";
-
-const fsm = loadFsm({ fsmPath: "fsm/my-orchestrator.fsm.yaml" });
-const env = runEnv("20260426-001512-a3f7c9b", { storageRoot: ".my-app/runs" });
-const { transition } = resolveTransition(stateById(fsm.doc, "my_state"), env);
-```
-
-## Tests
-
-```bash
-npm install
-npm test
-```
-
-The test suite covers the storage layer, predicate DSL, schema validators, static FSM validation, and the CLI runtime end-to-end.
-
-## Releasing
-
-Publishing to npm is **always manual** ([Principle 2: manual publish, sibling linking during dev](https://github.com/ctxr-dev/common-dev-principles)). CI runs `npm run lint`, `npm test`, and an FSM-static-validation pass over any example YAMLs under `examples/` on every PR and main push; `tag-on-main.yml` auto-creates the matching `v<version>` tag when `package.json` `version` changes on `main`; but nothing publishes to npm without an explicit operator dispatch. To cut a release, dispatch `publish.yml` from the Actions UI on `main` with the desired `version_bump` (`patch` / `minor` / `major`) and `dry_run` toggle. The workflow runs `npm version <bump>` first (so the inspected tarball reflects the bumped version), then either `npm publish --dry-run` (when `dry_run=true`; the version bump is NOT committed/pushed in this case) or the real `npm publish` followed by an atomic branch + tag push (when `dry_run=false`):
-
-```bash
-gh workflow run publish.yml --ref main -f version_bump=patch -f dry_run=true
-```
-
-After `dry_run=false` succeeds, optionally dispatch `release.yml` to draft or publish GitHub release notes for the new tag.
-
-> **Operator setup.** `publish.yml` (both the `dry_run` step and the real publish) reads `NODE_AUTH_TOKEN` from the `NPM_TOKEN` repo secret. Configure the secret once under **Settings -> Secrets and variables -> Actions -> Repository secrets** before the first dispatch, otherwise the workflow will fail at `npm publish`.
+- PyPI: [`ctxr-fsm`](https://pypi.org/project/ctxr-fsm/) (publishes from this repo — manual `workflow_dispatch` only)
+- GitHub: [ctxr-dev/fsm](https://github.com/ctxr-dev/fsm) — issues, PRs, CI
 
 ## License
 
-MIT.
+MIT. See [`LICENSE`](LICENSE).
+
+## Contributors
+
+Maintained by [ctxr-dev](https://github.com/ctxr-dev). Work lands under `ctxr/fsm/` on per-workstream branches. PRs welcome — read [docs/architecture.md](docs/architecture.md) first so the layer boundaries stay clean.
+
+The pre-rewrite Node.js sources (`@ctxr/fsm`) were retired in W15 and live at the git tag [`legacy-js-archive`](https://github.com/ctxr-dev/fsm/releases/tag/legacy-js-archive); existing npm pins continue to resolve from the published npmjs.com releases, but no new JS releases are planned.

@@ -1,4 +1,40 @@
-node_modules/
+# macOS
 .DS_Store
-*.tgz
+
+# Python (the new ctxr.fsm package; W1+)
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+.python-version
+.uv-cache/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Project DB + runtime artefacts (.ctxr-fsm/ is the per-consumer-project
+# convention; this matches what `ctxr-fsm init` writes into a consumer's
+# .gitignore, and ignores any local test runs)
+.ctxr-fsm/
+
+# Frontend (fsm-ui under fsm/ui/; W6)
+ui/node_modules/
+ui/dist/
+ui/.vite/
+ui/coverage/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
 *.log

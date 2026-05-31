@@ -1,0 +1,140 @@
+# Python CI for the @ctxr/fsm package (Python side).
+#
+# Per Principle 2 (Manual publish + sibling linking), this workflow ONLY
+# lints, type-checks, runs migrations, runs tests, and builds the UI.
+# It DOES NOT publish to PyPI or npm. Publishing is always manual
+# (workflow_dispatch-only) and lives in separate workflows.
+#
+# Jobs:
+#   * lint     — ruff + mypy across the Python tree (matrix 3.12 / 3.13)
+#   * test     — alembic upgrade/downgrade smoke + pytest (matrix 3.12 / 3.13)
+#   * ui-build — Node 22: npm ci, vite build, vitest run
+#
+# NEVER touch fsm/legacy-js/ from here — that subtree owns its own JS CI.
+
+name: Python — CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff + mypy) — py${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12', '3.13']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: '0.5.11'
+          enable-cache: true
+          cache-dependency-glob: 'uv.lock'
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies
+        run: uv sync --all-extras --dev
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
+
+      - name: Ruff (lint)
+        run: uv run ruff check ctxr/ tests/ examples/
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
+
+      - name: Mypy (type-check)
+        run: uv run mypy ctxr/fsm/
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
+
+  test:
+    name: Test (alembic + pytest) — py${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12', '3.13']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: '0.5.11'
+          enable-cache: true
+          cache-dependency-glob: 'uv.lock'
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies
+        run: uv sync --all-extras --dev
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
+
+      # Alembic migrations smoke test against a throwaway SQLite DB.
+      # CTXR_FSM_DB_URL is honoured by migrations/env.py so we never
+      # touch the repo's default DB path.
+      - name: Alembic upgrade head (SQLite smoke)
+        run: |
+          mkdir -p "$RUNNER_TEMP/fsm-ci"
+          export CTXR_FSM_DB_URL="sqlite:///$RUNNER_TEMP/fsm-ci/ci.db"
+          echo "CTXR_FSM_DB_URL=$CTXR_FSM_DB_URL" >> "$GITHUB_ENV"
+          uv run alembic upgrade head
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
+
+      - name: Alembic downgrade base (reversibility check)
+        run: uv run alembic downgrade base
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
+
+      - name: Pytest
+        run: uv run pytest tests/ -v --tb=short
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
+
+  ui-build:
+    name: UI build (Node 22)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install dependencies (npm ci)
+        run: npm ci
+
+      - name: Build (vite)
+        run: npm run build
+
+      - name: Test (vitest)
+        run: npm test

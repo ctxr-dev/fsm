@@ -1,0 +1,6 @@
+{
+  "name": "ctxr-fsm-fixture-project",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Fixture project materialised from ctxr/fsm/testing/fixture_project/. Used by the fsm package's E2E + cycle tests to drive a real skill-code-review pipeline against deterministic bad-code inputs."
+}

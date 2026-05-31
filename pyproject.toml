@@ -1,0 +1,210 @@
+[project]
+name = "ctxr-fsm"
+version = "0.1.0a1"
+description = "SQLite-backed Python FSM substrate for deterministic LLM-orchestrated workflows."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.12"
+keywords = ["fsm", "state-machine", "orchestration", "agentic", "workflow", "llm", "claude", "mcp", "sqlite"]
+authors = [{ name = "ctxr-dev" }]
+dependencies = [
+  "pydantic>=2.7",
+  "uuid-utils>=0.9",
+  "typer>=0.12",
+  "rich>=13.7",
+  "anyio>=4.4",
+  "watchfiles>=0.22",
+  "jsonschema>=4.23",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+api = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "sse-starlette>=2.1", "httpx>=0.27"]
+sqlite = [
+    "sqlalchemy>=2.0",
+    "sqlmodel>=0.0.21",
+    "alembic>=1.13",
+]
+all  = ["ctxr-fsm[mcp,api,sqlite]"]
+
+[project.scripts]
+ctxr-fsm = "ctxr.fsm.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/ctxr-dev/fsm"
+Issues = "https://github.com/ctxr-dev/fsm/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ctxr"]
+
+[tool.hatch.build]
+include = [
+  "ctxr/**/*.py",
+  "ctxr/**/*.md",
+  # Testing fixture-project template (W17b) ships INSIDE the wheel so
+  # ctxr.fsm.testing.materialise_fixture_project() can resolve its
+  # bundled resources at runtime. Covers the seed source files,
+  # tsconfig/package metadata, and the gitignore template (renamed
+  # from .gitignore so the build backend does not drop it).
+  "ctxr/fsm/testing/fixture_project/**/*.ts",
+  "ctxr/fsm/testing/fixture_project/**/*.json",
+  "ctxr/fsm/testing/fixture_project/**/*.template",
+  "README.md",
+  "LICENSE",
+]
+
+[dependency-groups]
+dev = [
+  # Pin pytest + pytest-asyncio to their 8.x / 0.x lines: pytest 9 +
+  # pytest-asyncio 1.x changed the default event-loop fixture scope,
+  # which breaks the existing tests that call ``anyio.run(...)``
+  # inside test bodies (they hit "Already running asyncio in this
+  # thread"). Holding back here avoids a parallel suite-wide refactor.
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.24,<1",
+  "ruff>=0.6",
+  "mypy>=1.11",
+  "hypothesis>=6.112",
+  "types-jsonschema>=4.23",
+]
+e2e = [
+  "playwright>=1.50",
+  # pytest-playwright 0.7 supports pytest 8.x, which matches our
+  # pinned pytest version above.
+  "pytest-playwright>=0.7,<0.8",
+]
+
+[tool.uv]
+managed = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# The FastAPI app intentionally imports its feature routers at the
+# bottom of ``ctxr/fsm/api/__init__.py`` so each router attaches to a
+# fully-constructed ``app`` (with CORS, lifespan, and always-on
+# endpoints already in place). The trailing import block is the
+# documented FastAPI pattern for avoiding circular imports between
+# the app module and its routes.
+"ctxr/fsm/api/__init__.py" = ["E402"]
+# FastAPI's idiomatic ``Query(...)`` / ``Depends(...)`` defaults trip
+# ``B008`` ("do not perform function call in argument defaults"). The
+# defaults are sentinel marker objects, not values — replacing them
+# with module-level singletons would lose the parameter metadata
+# (descriptions, validation bounds) that FastAPI reads to build the
+# OpenAPI schema.
+"ctxr/fsm/api/routes_*.py" = ["B008"]
+# Test cleanup paths intentionally use ``try / except: pass`` so the
+# comment block documenting *why* the swallow is safe stays attached
+# to the suppressed call. Rewriting to ``contextlib.suppress`` would
+# either drop the comment or split it across the ``with`` line.
+"tests/integration/api/test_api_auth.py" = ["SIM105"]
+"tests/integration/api/test_api_events_sse.py" = ["SIM105"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+packages = ["ctxr.fsm"]
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+# SQLModel + mypy: ORM column descriptors (e.g. `SomeTable.id`) are typed
+# as their Python value type (str/int/bool) rather than InstrumentedAttribute[T]
+# / Mapped[T], so every `column == "literal"` expression looks like a bare
+# `bool` to mypy and gets flagged across query call-sites. Migrating every
+# table to SQLAlchemy 2.0 Mapped[T] annotations would fix this but is a
+# separate model rewrite. Until then, suppress ONLY the codes caused by this
+# friction in the four repository modules where it appears.
+module = [
+    "ctxr.fsm.sqlite.repos_core",
+    "ctxr.fsm.sqlite.repos_states",
+    "ctxr.fsm.sqlite.repos_events",
+    "ctxr.fsm.sqlite.repos_locks_journal",
+    "ctxr.fsm.sqlite.repos_enforcement",
+]
+disable_error_code = ["arg-type", "attr-defined", "union-attr", "operator", "call-overload"]
+
+[[tool.mypy.overrides]]
+# CLI modules that hand-roll SQLAlchemy queries against the W2 SQLModel
+# tables hit the same descriptor-as-value friction described above — the
+# export/import round-trip needs ``select(Table).where(Table.col == x)``
+# clauses outside the repository layer, and ``spec.validate()`` is a
+# monkey-patched method whose return type mypy cannot reconcile against
+# the BaseModel.validate classmethod it shadows. Suppress ONLY the codes
+# those two issues produce; everything else in the CLI is strictly typed.
+module = [
+    "ctxr.fsm.cli.export_cmd",
+    "ctxr.fsm.cli.import_cmd",
+    "ctxr.fsm.cli.spec_cmd",
+]
+disable_error_code = ["arg-type", "attr-defined", "union-attr", "call-overload", "call-arg"]
+
+[[tool.mypy.overrides]]
+# MCP tool modules occasionally drop below the repository layer to issue
+# ad-hoc SQLAlchemy ``select(...).where(Table.col == ...)`` queries — the
+# ``_current_state_pk`` helper in tools_runs.py and the joined spec-summary
+# listing in tools_meta.py both need them. They run into the same
+# descriptor-as-value typing friction described in the repository override
+# block above (column attributes typed as their Python value rather than
+# ``InstrumentedAttribute[T]``). Suppress ONLY the codes that friction
+# produces — every other surface in these files stays strictly typed.
+module = [
+    "ctxr.fsm.mcp.tools_runs",
+    "ctxr.fsm.mcp.tools_meta",
+]
+disable_error_code = ["arg-type", "attr-defined", "call-overload"]
+
+[[tool.mypy.overrides]]
+# HTTP route handlers under ``ctxr.fsm.api.*`` hit two flavours of
+# typing friction that have nothing to do with the routes themselves:
+#
+# 1. They occasionally fall through to ad-hoc SQLAlchemy queries
+#    (``select(...).where(Table.col == x)``, ``.order_by(Table.col.desc())``)
+#    against the W2 SQLModel tables, which run into the same column-
+#    descriptor-as-value friction documented on the repository override
+#    block above. That produces ``arg-type`` / ``attr-defined``.
+# 2. The ``EventsRepo`` / ``EventDeliveriesRepo`` bus exposes a value
+#    object named ``Event`` that overlaps the lifecycle ``Event`` we
+#    re-export from ``ctxr.fsm.sqlite`` (see the docstring in that
+#    package's ``__init__``). The route handlers list the lifecycle
+#    type as their response model and feed bus rows back through, so
+#    mypy sees a ``misc`` / ``arg-type`` mismatch on every handoff.
+# 3. ``Project.runs`` returns repository payloads whose interior
+#    fields are typed ``Any`` in a few places (engine-level state
+#    tree, event-journal iterator), so handlers that return the value
+#    unchanged trip ``no-any-return`` even though the runtime shape
+#    matches the declared response model.
+#
+# Suppress ONLY the codes those three issues produce — every other
+# surface in the route modules stays strictly typed (request /
+# response models, dependency wiring, control flow).
+module = [
+    "ctxr.fsm.api.routes_admin",
+    "ctxr.fsm.api.routes_events",
+    "ctxr.fsm.api.routes_runs",
+    "ctxr.fsm.api.routes_specs",
+]
+disable_error_code = [
+    "arg-type",
+    "attr-defined",
+    "call-overload",
+    "misc",
+    "no-any-return",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra -q --strict-markers"
+testpaths = ["tests"]
+markers = [
+  "e2e: end-to-end UI tests (Playwright). Require the 'e2e' dependency group and 'playwright install chromium'. Skipped automatically when those are not present.",
+]
