@@ -34,3 +34,25 @@ export type { Toast, ToastVariant, ShowToastOptions } from './Toast';
 
 export { Dialog } from './Dialog';
 export type { DialogProps } from './Dialog';
+
+// W18b primitives
+export { Sheet } from './Sheet';
+export type { SheetProps, SheetWidth, SheetSide } from './Sheet';
+
+export { JsonViewer } from './JsonViewer';
+export type { JsonViewerProps, JsonViewerMode } from './JsonViewer';
+
+export { CodeBlock } from './CodeBlock';
+export type { CodeBlockProps } from './CodeBlock';
+
+export { KeyValueTable } from './KeyValueTable';
+export type { KeyValueTableProps, KvRow } from './KeyValueTable';
+
+export { FilterChips } from './FilterChips';
+export type { FilterChipsProps, FilterChip } from './FilterChips';
+
+export { Tabs } from './Tabs';
+export type { TabsProps, TabSpec } from './Tabs';
+
+export { FlowGraph } from './FlowGraph';
+export type { FlowGraphProps, FlowNodeData, FlowNodeKind } from './FlowGraph';
