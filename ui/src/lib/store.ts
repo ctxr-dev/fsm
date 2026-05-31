@@ -26,7 +26,7 @@
  * ``GET /runs/{id}/events`` from :class:`ApiClient` directly.
  */
 
-import { signal, type Signal } from '@preact/signals';
+import { signal, type Signal, effect } from '@preact/signals';
 
 import type { ConnectionState } from './sse';
 import type { Event as FsmEvent, RunSummary } from './api';
@@ -42,6 +42,72 @@ import type { Event as FsmEvent, RunSummary } from './api';
  * the magic number in two places.
  */
 export const EVENT_LOG_CAP = 200;
+
+/** Maximum entries kept in ``recentRuns`` / ``recentSpecs`` / ``recentQueries``. */
+export const RECENT_CAP = 30;
+
+/** Maximum entries kept in the ``notifications`` queue. */
+export const NOTIFICATIONS_CAP = 50;
+
+/** localStorage key for persisted preferences (W18a). */
+const PREFS_STORAGE_KEY = 'fsm-ui:prefs';
+
+// ---------------------------------------------------------------------------
+// W18a types (chrome + persistence)
+// ---------------------------------------------------------------------------
+
+export type DensityMode = 'compact' | 'comfortable' | 'spacious';
+export type ThemeMode = 'auto' | 'light' | 'dark';
+
+export interface SheetEntry {
+  /** Stable id; used as the keyed-render key and the URL fragment marker. */
+  id: string;
+  /** Visible title in the sheet's header. */
+  title: string;
+  /** Width preset; the sheet header renders a cycle button. */
+  width?: 'right-third' | 'right-half' | 'fullscreen';
+  /** Sheet body. Arbitrary VNode-shaped value; typed `unknown` here to keep
+   *  store.ts free of preact runtime imports for tree-shaking. */
+  content: unknown;
+  /** Optional onClose hook. Sheet host calls this BEFORE popping the stack. */
+  onClose?: () => void;
+  /** When set, the top sheet's identity mirrors to ``?sheet=<id>``. */
+  urlFragment?: string;
+  /** Pin: when true, Esc does NOT close this sheet (Brief rail uses it). */
+  pinned?: boolean;
+}
+
+export interface RunRecency {
+  id: string;
+  status: string;
+  spec?: string;
+  lastSeenAt: string; // ISO 8601 UTC
+}
+
+export interface SpecRecency {
+  slug: string;
+  version: number;
+  lastSeenAt: string; // ISO 8601 UTC
+}
+
+export interface NotificationEntry {
+  id: string;
+  kind: string;
+  title: string;
+  body?: string;
+  runId?: string;
+  timestamp: string; // ISO 8601 UTC
+  read: boolean;
+}
+
+export interface SseSubInfo {
+  consumerName: string;
+  url: string;
+  state: ConnectionState;
+  lastFrameAt: string | null;
+  frameCount: number;
+  reconnectCount: number;
+}
 
 // ---------------------------------------------------------------------------
 // Signals — the canonical app state
@@ -160,4 +226,222 @@ export function setConnectionState(state: ConnectionState): void {
  */
 export function clearEventLog(): void {
   eventLog.value = [];
+}
+
+// ---------------------------------------------------------------------------
+// W18a: persisted preference signals
+// ---------------------------------------------------------------------------
+
+export const densityMode: Signal<DensityMode> = signal<DensityMode>('comfortable');
+export const theme: Signal<ThemeMode> = signal<ThemeMode>('auto');
+export const urlStateEnabled: Signal<boolean> = signal<boolean>(true);
+
+export const recentRuns: Signal<RunRecency[]> = signal<RunRecency[]>([]);
+export const recentSpecs: Signal<SpecRecency[]> = signal<SpecRecency[]>([]);
+export const recentQueries: Signal<string[]> = signal<string[]>([]);
+
+// ---------------------------------------------------------------------------
+// W18a: chrome / transient (NOT persisted)
+// ---------------------------------------------------------------------------
+
+export const commandPaletteOpen: Signal<boolean> = signal<boolean>(false);
+export const commandPaletteSeed: Signal<string> = signal<string>('');
+export const keyboardHelpOpen: Signal<boolean> = signal<boolean>(false);
+export const notificationCentreOpen: Signal<boolean> = signal<boolean>(false);
+
+/** Stack of open sheets. Top of the stack is the rightmost / topmost rendered. */
+export const sheetStack: Signal<SheetEntry[]> = signal<SheetEntry[]>([]);
+
+export const notifications: Signal<NotificationEntry[]> = signal<NotificationEntry[]>([]);
+
+/** Map of active SSE subscriptions for the Settings / Topology diagnostics view. */
+export const sseSubscriptions: Signal<Map<string, SseSubInfo>> = signal<
+  Map<string, SseSubInfo>
+>(new Map());
+
+/** Compare-context: cmd palette + run-detail header surface a Compare action when set. */
+export const runComparisonContext: Signal<{ a: string; b: string | null } | null> = signal<{
+  a: string;
+  b: string | null;
+} | null>(null);
+
+// ---------------------------------------------------------------------------
+// W18a mutators
+// ---------------------------------------------------------------------------
+
+export function openSheet(entry: SheetEntry): void {
+  sheetStack.value = [...sheetStack.value, entry];
+}
+
+export function closeTopSheet(): void {
+  const stack = sheetStack.value;
+  if (stack.length === 0) return;
+  const top = stack[stack.length - 1];
+  top.onClose?.();
+  sheetStack.value = stack.slice(0, -1);
+}
+
+export function closeSheet(id: string): void {
+  const stack = sheetStack.value;
+  const idx = stack.findIndex((e) => e.id === id);
+  if (idx === -1) return;
+  stack[idx].onClose?.();
+  sheetStack.value = stack.filter((_, i) => i !== idx);
+}
+
+export function clearSheets(): void {
+  for (const entry of sheetStack.value) entry.onClose?.();
+  sheetStack.value = [];
+}
+
+export function rememberRun(entry: RunRecency): void {
+  const existing = recentRuns.value.filter((r) => r.id !== entry.id);
+  const next = [entry, ...existing].slice(0, RECENT_CAP);
+  recentRuns.value = next;
+}
+
+export function rememberSpec(entry: SpecRecency): void {
+  const existing = recentSpecs.value.filter(
+    (s) => !(s.slug === entry.slug && s.version === entry.version),
+  );
+  const next = [entry, ...existing].slice(0, RECENT_CAP);
+  recentSpecs.value = next;
+}
+
+export function rememberQuery(q: string): void {
+  if (!q.trim()) return;
+  const existing = recentQueries.value.filter((existing) => existing !== q);
+  const next = [q, ...existing].slice(0, RECENT_CAP);
+  recentQueries.value = next;
+}
+
+export function pushNotification(entry: NotificationEntry): void {
+  const next = [entry, ...notifications.value].slice(0, NOTIFICATIONS_CAP);
+  notifications.value = next;
+}
+
+export function markAllNotificationsRead(): void {
+  if (notifications.value.every((n) => n.read)) return;
+  notifications.value = notifications.value.map((n) => ({ ...n, read: true }));
+}
+
+// ---------------------------------------------------------------------------
+// W18a: persistence
+// ---------------------------------------------------------------------------
+
+interface PersistedPrefs {
+  densityMode: DensityMode;
+  theme: ThemeMode;
+  urlStateEnabled: boolean;
+  recentRuns: RunRecency[];
+  recentSpecs: SpecRecency[];
+  recentQueries: string[];
+}
+
+const VALID_DENSITIES: ReadonlySet<DensityMode> = new Set(['compact', 'comfortable', 'spacious']);
+const VALID_THEMES: ReadonlySet<ThemeMode> = new Set(['auto', 'light', 'dark']);
+
+/**
+ * Read persisted prefs from localStorage. Defended per-field so a
+ * corrupted entry doesn't blow up the app on boot. Idempotent.
+ * SSR-safe: returns early if `window` is undefined.
+ */
+export function loadStoredPrefs(): void {
+  if (typeof window === 'undefined') return;
+  let raw: string | null = null;
+  try {
+    raw = window.localStorage.getItem(PREFS_STORAGE_KEY);
+  } catch {
+    return;
+  }
+  if (!raw) return;
+  let parsed: Partial<PersistedPrefs>;
+  try {
+    parsed = JSON.parse(raw) as Partial<PersistedPrefs>;
+  } catch {
+    return;
+  }
+  if (parsed.densityMode && VALID_DENSITIES.has(parsed.densityMode)) {
+    densityMode.value = parsed.densityMode;
+  }
+  if (parsed.theme && VALID_THEMES.has(parsed.theme)) {
+    theme.value = parsed.theme;
+  }
+  if (typeof parsed.urlStateEnabled === 'boolean') {
+    urlStateEnabled.value = parsed.urlStateEnabled;
+  }
+  if (Array.isArray(parsed.recentRuns)) {
+    recentRuns.value = parsed.recentRuns
+      .filter(
+        (r): r is RunRecency =>
+          !!r &&
+          typeof r.id === 'string' &&
+          typeof r.status === 'string' &&
+          typeof r.lastSeenAt === 'string',
+      )
+      .slice(0, RECENT_CAP);
+  }
+  if (Array.isArray(parsed.recentSpecs)) {
+    recentSpecs.value = parsed.recentSpecs
+      .filter(
+        (s): s is SpecRecency =>
+          !!s &&
+          typeof s.slug === 'string' &&
+          typeof s.version === 'number' &&
+          typeof s.lastSeenAt === 'string',
+      )
+      .slice(0, RECENT_CAP);
+  }
+  if (Array.isArray(parsed.recentQueries)) {
+    recentQueries.value = parsed.recentQueries
+      .filter((q): q is string => typeof q === 'string')
+      .slice(0, RECENT_CAP);
+  }
+}
+
+let _persistenceWired = false;
+
+/**
+ * Wire up the debounced persistence effect. Called once from
+ * main.tsx. Idempotent — a second call is a no-op so tests can
+ * exercise the boot path repeatedly.
+ */
+export function wirePrefsPersistence(): void {
+  if (_persistenceWired) return;
+  _persistenceWired = true;
+  if (typeof window === 'undefined') return;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  effect(() => {
+    const snapshot: PersistedPrefs = {
+      densityMode: densityMode.value,
+      theme: theme.value,
+      urlStateEnabled: urlStateEnabled.value,
+      recentRuns: recentRuns.value,
+      recentSpecs: recentSpecs.value,
+      recentQueries: recentQueries.value,
+    };
+    if (timer != null) clearTimeout(timer);
+    timer = setTimeout(() => {
+      try {
+        window.localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify(snapshot));
+      } catch {
+        // Quota exceeded / disabled storage — silently drop.
+      }
+    }, 200);
+  });
+}
+
+/** Test-only hook: reset the persistence wiring flag between tests. */
+export function _resetPersistenceWiring(): void {
+  _persistenceWired = false;
+}
+
+/** Test-only hook: clear persisted prefs from storage. */
+export function _clearStoredPrefs(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.removeItem(PREFS_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
 }

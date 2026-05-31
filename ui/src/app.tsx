@@ -56,11 +56,8 @@ import {
   connectionState,
   setConnectionState,
 } from './lib/store';
-import { Runs as RunsRoute } from './routes/runs';
-import { RunDetailRoute } from './routes/runDetail';
-import { SpecsRoute } from './routes/specs';
-import { ConsumersRoute } from './routes/consumers';
-import { SettingsRoute } from './routes/settings';
+import { ROUTES } from './routes';
+import { SheetHost } from './chrome/SheetHost';
 
 // ---------------------------------------------------------------------------
 // SSE wiring
@@ -345,17 +342,15 @@ function Shell(): JSX.Element {
         <TopBar />
         <main id="main" class="min-h-0 flex-1 overflow-auto" tabIndex={-1}>
           <Router>
-            <Route path="/" component={RunsRoute} />
-            <Route path="/runs" component={RunsRoute} />
-            <Route path="/runs/:id" component={RunDetailRoute} />
-            <Route path="/specs" component={SpecsRoute} />
-            <Route path="/consumers" component={ConsumersRoute} />
-            <Route path="/settings" component={SettingsRoute} />
+            {ROUTES.map((r) => (
+              <Route key={r.path} path={r.path} component={r.component} />
+            ))}
             <Route default component={NotFoundRoute} />
           </Router>
         </main>
       </div>
       <ToastContainer />
+      <SheetHost />
     </div>
   );
 }
