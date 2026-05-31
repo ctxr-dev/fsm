@@ -49,20 +49,23 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 
 from ctxr.fsm.cli.lifecycle.primitives import write_active_run_marker
 from ctxr.fsm.core.engine import advance as engine_advance
-from ctxr.fsm.core.engine import build_brief
+from ctxr.fsm.core.engine import build_brief, execute_inline
+from ctxr.fsm.core.inline_registry import lookup_with_discovery
 from ctxr.fsm.core.models import (
     Brief,
     CommitSignature,
     EngineAdvanceKind,
     EventKind,
     FsmSpec,
+    InlineFaultReason,
     PostValidationResultEntry,
     RunCtx,
+    StateKind,
     TransitionEvaluation,
     TransitionKind,
     VerifierVerdict,
@@ -223,6 +226,24 @@ class StartRunInput(BaseModel):
             "the slug because the UUID is unknown at skill-author time."
         ),
     )
+
+    @field_validator("spec_id", mode="before")
+    @classmethod
+    def _normalise_spec_id(cls, value: Any) -> str:
+        """Coerce ``uuid.UUID`` inputs to their canonical string form.
+
+        BLOCKER-4 changed the field type from ``uuid.UUID`` to ``str``
+        so SKILL.md authors can pass a slug. Existing test fixtures +
+        any Python-side caller that builds the input with a real
+        ``uuid.UUID`` should keep working — this validator normalises
+        the UUID to its string representation before strict validation
+        rejects it as a non-string. JSON-over-the-wire callers already
+        send a string so this branch is a no-op for them.
+        """
+        if isinstance(value, uuid.UUID):
+            return str(value)
+        # Strict-string check handles non-str inputs; we cast for mypy.
+        return value  # type: ignore[no-any-return]
     args: dict[str, Any] = Field(
         default_factory=dict,
         description="Free-form arguments threaded into the run env at start.",
@@ -742,6 +763,467 @@ def _record_state_exit(
             payload={"run_id": run_id, "state_pk": state_pk},
             run_id=run_id,
         )
+
+
+# ---------------------------------------------------------------------------
+# Inline-state chain driver (W14a/W14k BLOCKER-2)
+# ---------------------------------------------------------------------------
+#
+# After a worker commits and the engine advances to the NEXT state, that
+# next state may be ``kind=inline`` — a deterministic Python callable
+# registered against ``(spec.id, handler_id)`` in the InlineHandlerRegistry
+# (W14a). Inline states must advance SERVER-SIDE without an LLM
+# round-trip: that is the entire point of the LLM-as-orchestrator
+# template (a skill ships its 9 deterministic inline handlers + the
+# 5 worker prompts; the LLM only sees worker briefs, never inline ones).
+#
+# Walks the inline chain forward: on each step, look up the handler
+# (with cross-process discovery), run ``execute_inline``, persist the
+# state-entry-and-exit pair + engine transition + events, then call
+# ``engine.advance`` again. Loops until the new state is non-inline
+# or terminal, or a fault surfaces.
+#
+# Cap at 64 inline steps per chain — far above any realistic FSM design
+# (skill-code-review tops out at 9 inline states; future skills are
+# unlikely to chain more than 20). Hitting the cap fault-pauses the run
+# with a clear ``inline_chain_runaway`` reason rather than spinning
+# indefinitely.
+
+_INLINE_CHAIN_HARD_CAP: int = 64
+
+
+def _drive_inline_chain(
+    project: Project,
+    *,
+    spec: FsmSpec,
+    run_id: str,
+    producer_id: str,
+    start_state_id: str | None,
+    env_at_entry: dict[str, Any],
+) -> dict[str, Any]:
+    """Drive forward through any inline-state chain starting at ``start_state_id``.
+
+    Called from ``fsm_confirm_commit`` (and the single-phase ``fsm_commit_outputs``
+    path when no two-phase token is in use) AFTER a worker commit has
+    advanced the run to a new state. If that new state is non-inline or
+    the run already reached terminal, this is a no-op fast-path.
+
+    Returns a dict carrying the post-chain ``result_kind``,
+    ``next_state_id``, ``next_brief``, ``chain_length`` (how many inline
+    states were executed; 0 when no chain ran), and optionally
+    ``fault`` (when an inline step couldn't be handled cleanly).
+
+    Persistence model: each inline step runs in its OWN atomic
+    transaction (state_entered → inline_executed → state_exited →
+    transition_taken → next state_entered), so a crash mid-chain leaves
+    a well-formed prefix on disk. The replay path can resume from the
+    last finalised state on the next ``ensure``.
+
+    Faults:
+
+    * ``handler_missing`` — no handler registered for
+      ``(spec.id, inline.handler_id)`` even after entry-points
+      discovery. The run is paused in the inline state for an
+      operator to inspect.
+    * ``handler_raised`` / ``bad_return_type`` /
+      ``validation_failed`` / ``post_validation_failed`` — surfaced
+      from the underlying ``InlineExecutionResult.fault_reason`` enum.
+    * ``inline_chain_runaway`` — the chain exceeded
+      ``_INLINE_CHAIN_HARD_CAP``. A FSM design issue (state graph
+      loops endlessly through inline states with no terminal); pause
+      the run + alert the operator.
+    """
+
+    current_state_id = start_state_id
+    current_env = dict(env_at_entry)
+    last_brief: Brief | None = None
+    last_result_kind = EngineAdvanceKind.advance.value
+    chain_length = 0
+
+    # Skill-registered handlers may live in the consumer's Python
+    # process rather than ours; ``lookup_with_discovery`` triggers
+    # entry-points walk on first miss + populates our default registry.
+    while True:
+        if current_state_id is None:
+            break
+
+        state = spec.get_state(current_state_id)
+        if state.kind is not StateKind.inline:
+            break
+
+        if state.inline is None:
+            # Shape invariant: kind=inline ⇔ inline is non-None.
+            # If we got here something is structurally wrong with the
+            # spec; surface it as a fault rather than crash.
+            return _inline_fault_result(
+                project,
+                run_id=run_id,
+                producer_id=producer_id,
+                state_id=current_state_id,
+                spec_id=spec.id,
+                handler_id=None,
+                reason=InlineFaultReason.unregistered,
+                detail="state.kind=inline but state.inline is None (spec invariant violation)",
+                last_brief=last_brief,
+                chain_length=chain_length,
+            )
+
+        if chain_length >= _INLINE_CHAIN_HARD_CAP:
+            return _inline_fault_result(
+                project,
+                run_id=run_id,
+                producer_id=producer_id,
+                state_id=current_state_id,
+                spec_id=spec.id,
+                handler_id=state.inline.handler_id,
+                reason=InlineFaultReason.raised,  # closest existing slug
+                detail=(
+                    f"inline chain exceeded hard cap of "
+                    f"{_INLINE_CHAIN_HARD_CAP} steps without reaching a "
+                    "non-inline state; likely an FSM design issue"
+                ),
+                last_brief=last_brief,
+                chain_length=chain_length,
+            )
+
+        handler_id = state.inline.handler_id
+        handler = lookup_with_discovery(spec.id, handler_id)
+        if handler is None:
+            return _inline_fault_result(
+                project,
+                run_id=run_id,
+                producer_id=producer_id,
+                state_id=current_state_id,
+                spec_id=spec.id,
+                handler_id=handler_id,
+                reason=InlineFaultReason.unregistered,
+                detail=(
+                    f"no handler registered for "
+                    f"({spec.id!r}, {handler_id!r}) even after "
+                    f"entry-points discovery. Skill bootstrap (e.g. "
+                    f"`python -m <skill>.install`) may not have run, "
+                    f"or the skill's pyproject is missing the "
+                    f"`[project.entry-points.\"ctxr_fsm.skills\"]` "
+                    f"declaration."
+                ),
+                last_brief=last_brief,
+                chain_length=chain_length,
+            )
+
+        # Find the open state-entry PK for this inline state — replay
+        # already created the entry row for us during the worker commit
+        # that advanced TO this inline state. We need the PK to mark
+        # it exited after the handler runs.
+        with project.session_factory() as session:
+            entries = project.states.list_by_run(session, run_id)
+        # Newest matching entry that's still ``entered`` is the one
+        # replay just created; we walk in reverse so we naturally pick
+        # the latest matching row.
+        state_pk: str | None = None
+        for entry in reversed(entries):
+            if entry.state_id == current_state_id and entry.status == "entered":
+                state_pk = entry.id
+                break
+        if state_pk is None:
+            return _inline_fault_result(
+                project,
+                run_id=run_id,
+                producer_id=producer_id,
+                state_id=current_state_id,
+                spec_id=spec.id,
+                handler_id=handler_id,
+                reason=InlineFaultReason.unregistered,
+                detail=(
+                    f"no open state-entry row found for {current_state_id!r}; "
+                    "replay may have skipped persistence — surface as fault"
+                ),
+                last_brief=last_brief,
+                chain_length=chain_length,
+            )
+
+        # Build the InlineContext the handler receives. Inputs come
+        # from the env-at-entry shape the engine would have built for
+        # any worker on this state (resolve State.outputs declarations
+        # against the rolling env). For inline states this just means
+        # threading through the env so handlers can read prior outputs.
+        run_ctx = RunCtx(
+            run_id=uuid.UUID(run_id),
+            fsm_id=spec.id,
+            current_state=current_state_id,
+            env=current_env,
+        )
+        run_args = current_env.get("args") if isinstance(current_env.get("args"), dict) else {}
+
+        inline_result = execute_inline(
+            state, run_ctx, args=run_args or {}, inputs=current_env
+        )
+
+        if not inline_result.ok:
+            return _inline_fault_result(
+                project,
+                run_id=run_id,
+                producer_id=producer_id,
+                state_id=current_state_id,
+                spec_id=spec.id,
+                handler_id=handler_id,
+                reason=(
+                    inline_result.fault_reason
+                    if isinstance(inline_result.fault_reason, InlineFaultReason)
+                    else InlineFaultReason.raised
+                ),
+                detail=inline_result.fault_detail or "inline handler reported failure",
+                last_brief=last_brief,
+                chain_length=chain_length,
+            )
+
+        # Successful inline execution. Persist the outputs + emit the
+        # inline_executed event, advance the engine, persist the next
+        # state entry. All in one tx so a crash leaves a consistent
+        # prefix.
+        outputs = dict(inline_result.outputs)
+        advance_result = engine_advance(spec, run_ctx, outputs)
+
+        with project.session_factory() as session, session.begin():
+            project.states.mark_exited(session, state_pk, outputs)
+            project.events.emit(
+                session,
+                producer_id=producer_id,
+                kind=EventKind.inline_executed.value,
+                payload={
+                    "run_id": run_id,
+                    "state_id": current_state_id,
+                    "handler_id": handler_id,
+                    "state_pk": state_pk,
+                },
+                run_id=run_id,
+            )
+            project.events.emit(
+                session,
+                producer_id=producer_id,
+                kind=EventKind.state_exited.value,
+                payload={"run_id": run_id, "state_pk": state_pk},
+                run_id=run_id,
+            )
+
+        # Decide what comes next based on the engine result.
+        chain_length += 1
+        last_result_kind = advance_result.kind.value
+        current_env = {**current_env, **outputs}
+
+        if advance_result.kind is EngineAdvanceKind.terminal:
+            # Run reached terminal. Mark the run completed.
+            with project.session_factory() as session, session.begin():
+                run_row = session.get(RunTable, run_id)
+                if run_row is not None:
+                    run_row.status = "completed"
+                    run_row.ended_at = _iso_now_ms()
+                    run_row.last_update_at = run_row.ended_at
+                    verdict_val = advance_result.verdict
+                    if verdict_val is not None:
+                        run_row.verdict = str(verdict_val)
+                    session.add(run_row)
+                project.events.emit(
+                    session,
+                    producer_id=producer_id,
+                    kind=EventKind.run_completed.value,
+                    payload={"run_id": run_id, "verdict": advance_result.verdict},
+                    run_id=run_id,
+                )
+            last_brief = advance_result.brief
+            current_state_id = None
+            break
+
+        if advance_result.kind is EngineAdvanceKind.fault:
+            # The engine itself faulted (e.g., no_transition_matched).
+            # Surface as a generic inline fault so the operator sees
+            # the chain context.
+            return _inline_fault_result(
+                project,
+                run_id=run_id,
+                producer_id=producer_id,
+                state_id=current_state_id,
+                spec_id=spec.id,
+                handler_id=handler_id,
+                reason=InlineFaultReason.post_validation_failed
+                if advance_result.reason == "post_validation_failed"
+                else InlineFaultReason.raised,
+                detail=(
+                    f"engine fault after inline execution: "
+                    f"{advance_result.reason}"
+                ),
+                last_brief=last_brief,
+                chain_length=chain_length,
+            )
+
+        # advance_result.kind is EngineAdvanceKind.advance — record
+        # transition + persist new state entry. Builds the brief for
+        # the new state which becomes ``last_brief``.
+        next_state_id = advance_result.next_state
+        if next_state_id is None:
+            break  # defensive; advance always populates next_state
+
+        # Resolve the new state's inputs per its outputs-declaration.
+        next_state = spec.get_state(next_state_id)
+        next_inputs: dict[str, Any] = {}
+        worker = next_state.worker or (
+            next_state.loop.worker if next_state.loop is not None else None
+        )
+        if worker is not None:
+            next_inputs = {name: current_env.get(name) for name in worker.inputs}
+
+        # Record the transition + persist new state entry. Done in one
+        # transaction so subscribers see them together.
+        with project.session_factory() as session, session.begin():
+            # Transition row.
+            transition = next(
+                iter(advance_result.evaluations or []), None
+            )
+            tkind = (
+                transition.kind
+                if transition is not None and transition.kind is not None
+                else TransitionKind.always.value
+            )
+            project.transitions.create(
+                session,
+                run_id=run_id,
+                from_state_pk=state_pk,
+                to_state_id=next_state_id,
+                kind=tkind,
+                predicate=transition.expression if transition is not None else None,
+                predicate_result=transition.result if transition is not None else None,
+            )
+            project.events.emit(
+                session,
+                producer_id=producer_id,
+                kind=EventKind.transition_taken.value,
+                payload={
+                    "run_id": run_id,
+                    "from_state_pk": state_pk,
+                    "to_state_id": next_state_id,
+                    "kind": tkind,
+                },
+                run_id=run_id,
+            )
+
+        # Persist the new state entry (its own atomic block per the
+        # existing _persist_state_entry contract).
+        _persist_state_entry(
+            project,
+            run_id=run_id,
+            state_id=next_state_id,
+            inputs=next_inputs,
+            producer_id=producer_id,
+        )
+
+        last_brief = advance_result.brief
+        current_state_id = next_state_id
+
+    # If the chain landed on a terminal-shaped state (no body, no
+    # transitions), mark the run completed. The engine reports the
+    # transition INTO such a state as ``advance`` (not ``terminal``)
+    # because ``EngineAdvanceKind.terminal`` is computed from the
+    # CURRENT state's body — so when we LANDED at a no-body state
+    # after walking through the inline chain, we have to detect the
+    # terminal shape ourselves here. Mirrors what the replay layer's
+    # ``complete_run`` op does for worker-direct-to-terminal commits.
+    if (
+        current_state_id is not None
+        and chain_length > 0
+        and last_result_kind != EngineAdvanceKind.terminal.value
+    ):
+        final_state = spec.get_state(current_state_id)
+        if (
+            final_state.kind is StateKind.terminal
+            or (
+                not final_state.transitions
+                and final_state.worker is None
+                and final_state.loop is None
+                and final_state.inline is None
+            )
+        ):
+            verdict_val = current_env.get("verdict")
+            with project.session_factory() as session, session.begin():
+                run_row = session.get(RunTable, run_id)
+                if run_row is not None:
+                    run_row.status = "completed"
+                    run_row.ended_at = _iso_now_ms()
+                    run_row.last_update_at = run_row.ended_at
+                    if verdict_val is not None:
+                        run_row.verdict = str(verdict_val)
+                    session.add(run_row)
+                project.events.emit(
+                    session,
+                    producer_id=producer_id,
+                    kind=EventKind.run_completed.value,
+                    payload={"run_id": run_id, "verdict": verdict_val},
+                    run_id=run_id,
+                )
+            last_result_kind = EngineAdvanceKind.terminal.value
+
+    return {
+        "result_kind": last_result_kind,
+        "next_state_id": current_state_id,
+        "next_brief": last_brief,
+        "chain_length": chain_length,
+    }
+
+
+def _inline_fault_result(
+    project: Project,
+    *,
+    run_id: str,
+    producer_id: str,
+    state_id: str,
+    spec_id: str,
+    handler_id: str | None,
+    reason: InlineFaultReason,
+    detail: str,
+    last_brief: Brief | None,
+    chain_length: int,
+) -> dict[str, Any]:
+    """Persist an inline fault + return the fault-shaped result dict.
+
+    Pauses the run (status=faulted) so an operator can inspect the
+    state and decide whether to resume / abort. Emits
+    ``inline_failed`` with full diagnostic payload so the audit
+    timeline shows exactly which handler, which spec, and which
+    failure mode triggered the pause.
+    """
+
+    with project.session_factory() as session, session.begin():
+        run_row = session.get(RunTable, run_id)
+        if run_row is not None:
+            run_row.status = "faulted"
+            run_row.last_update_at = _iso_now_ms()
+            session.add(run_row)
+        project.events.emit(
+            session,
+            producer_id=producer_id,
+            kind=EventKind.inline_failed.value,
+            payload={
+                "run_id": run_id,
+                "state_id": state_id,
+                "spec_id": spec_id,
+                "handler_id": handler_id,
+                "reason": reason.value,
+                "detail": detail,
+                "chain_length": chain_length,
+            },
+            run_id=run_id,
+        )
+
+    return {
+        "result_kind": EngineAdvanceKind.fault.value,
+        "next_state_id": state_id,
+        "next_brief": last_brief,
+        "chain_length": chain_length,
+        "fault": {
+            "reason": reason.value,
+            "detail": detail,
+            "state_id": state_id,
+            "handler_id": handler_id,
+        },
+    }
 
 
 def _record_verified_signature(
@@ -1295,6 +1777,12 @@ def _replay_journal_txn(
         "next_state_id": next_state_id,
         "next_brief": next_brief,
         "next_state_entry_pk": next_state_entry_pk,
+        # ``env`` exposes the post-commit env (worker inputs merged with
+        # committed outputs) so the inline-chain driver (W14k BLOCKER-2)
+        # can seed its first inline handler's InlineContext without
+        # re-running engine.advance. The dict is JSON-friendly (every
+        # value is already a Python primitive) and safe to pass around.
+        "env": env_after,
     }
 
 
@@ -1940,6 +2428,39 @@ def fsm_confirm_commit(input: ConfirmCommitInput) -> ConfirmResult | McpToolErro
             producer_id=producer_id,
             staged_writes=list(txn.staged_writes),
         )
+
+        # 3b. BLOCKER-2 wiring: after the worker commit advances to a new
+        #     state, drive forward through any inline-state chain that
+        #     follows. The skill ships its deterministic inline handlers
+        #     (W14a InlineHandler engine extension) but the engine extension
+        #     is only useful if someone INVOKES it after a state advance.
+        #     This is the canonical invocation site: between replay
+        #     (which committed the worker's outputs + advanced to the
+        #     next state) and the brief return (which would otherwise
+        #     hand the LLM an inline-brief it can't act on).
+        replay_result_kind = replay.get("result_kind")
+        if replay_result_kind == EngineAdvanceKind.advance.value:
+            next_state_id = replay.get("next_state_id")
+            if next_state_id is not None:
+                inline_chain = _drive_inline_chain(
+                    project,
+                    spec=spec,
+                    run_id=run_id,
+                    producer_id=producer_id,
+                    start_state_id=next_state_id,
+                    env_at_entry=replay.get("env") or {},
+                )
+                # When the chain produced any inline step, overwrite the
+                # replay's next_state / next_brief / result_kind with the
+                # post-chain values so the caller sees the final state
+                # the run ended up in rather than the inline brief that
+                # the LLM cannot act on.
+                if inline_chain.get("chain_length", 0) > 0:
+                    replay["result_kind"] = inline_chain["result_kind"]
+                    replay["next_state_id"] = inline_chain["next_state_id"]
+                    replay["next_brief"] = inline_chain["next_brief"]
+                    if "fault" in inline_chain:
+                        replay["fault"] = inline_chain["fault"]
 
         # 4. Mark the journal finalised + emit consumed/finalised events.
         with project.session_factory() as session, session.begin():
