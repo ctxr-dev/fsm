@@ -601,6 +601,301 @@ class Project:
         """
         return TransactionContext(self._engine, run_id=run_id)
 
+    def commit_and_advance(
+        self,
+        *,
+        run_id: str,
+        outputs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persistence-complete worker-output commit + engine advance.
+
+        The Python-direct equivalent of MCP's ``fsm.commit_outputs`` +
+        ``fsm.confirm_commit`` pair (W14k). Drives the engine through
+        the current state's worker output, persists every state /
+        transition / event row the MCP path persists, walks any
+        following inline-state chain server-side via the W14a
+        ``execute_inline`` helper, and updates ``runs.status`` /
+        ``runs.current_state`` so the UI + REST API see a coherent
+        view of the run.
+
+        Why this exists: drivers that talk to the engine via the
+        Python facade (test harnesses, in-process consumers, the W14h
+        cycle battery) need the same DB hygiene MCP gives over the
+        wire. Previously they had to either reimplement the
+        persistence calls (error-prone) or accept that the runs/states/
+        transitions/events tables stayed empty (UI showed no data).
+        This method closes that gap.
+
+        Parameters
+        ----------
+        run_id:
+            The run's primary key (UUIDv7 string) returned by
+            :meth:`start_run`.
+        outputs:
+            The worker's structured output dict for the current state.
+            Validated against the state's ``response_schema`` if one
+            is declared.
+
+        Returns
+        -------
+        dict[str, Any]
+            ``{"result_kind": "advance"|"terminal"|"fault",
+               "next_state_id": str|None,
+               "next_brief": dict|None,
+               "chain_length": int}`` — the same shape the MCP path's
+            replay produces. ``chain_length`` reports how many inline
+            states the engine walked after the worker commit.
+
+        See also
+        --------
+        :func:`ctxr.fsm.mcp.tools_runs._drive_inline_chain` — the
+        canonical inline-chain walker this method shares.
+        """
+
+        # Lazy import: tools_runs imports the engine + repos heavily;
+        # importing it at module top would couple ``Project`` to the
+        # MCP layer, which violates the layer-dependency rule. The
+        # MCP layer can import the Project facade, never the other
+        # way around. Localising the import here keeps the dependency
+        # graph one-way while still letting us share the well-tested
+        # inline-driver implementation.
+        import uuid as _uuid
+
+        from ctxr.fsm.core import RunCtx
+        from ctxr.fsm.core.engine import advance as engine_advance
+        from ctxr.fsm.core.models import (
+            EngineAdvanceKind,
+            EventKind,
+            FsmSpec,
+            TransitionKind,
+        )
+        from ctxr.fsm.mcp.tools_runs import (
+            _drive_inline_chain,
+            _ensure_engine_producer,
+            _persist_state_entry,
+        )
+
+        run = self.get_run(run_id)
+        if run is None:
+            raise ValueError(f"unknown run_id: {run_id!r}")
+
+        with self.session_factory() as session:
+            registered = self.specs.get(session, run.fsm_spec_id)
+        if registered is None:
+            raise ValueError(
+                f"spec {run.fsm_spec_id!r} not registered for run {run_id!r}"
+            )
+        spec: FsmSpec = FsmSpec.model_validate(registered.definition)
+
+        producer_id = _ensure_engine_producer(self)
+
+        # Lazy entry-state persistence: ``Project.start_run`` leaves
+        # ``runs.current_state`` as None for backward compatibility
+        # with the MCP layer (which does its own ``_persist_state_entry``
+        # right after start_run). When ``commit_and_advance`` is the
+        # first thing that touches the run after ``start_run``, we
+        # persist the entry-state row here so the rest of the method
+        # has a valid ``current_state`` + an open state-entry PK to
+        # work with. Idempotent for runs whose current_state is
+        # already set (i.e., MCP-driven runs that already persisted).
+        current_state_id = run.current_state
+        if current_state_id is None:
+            entry_state_id = registered.definition.get("entry")
+            if not entry_state_id:
+                raise ValueError(
+                    f"spec {registered.id!r} has no entry state declared"
+                )
+            entry_state_obj = spec.get_state(entry_state_id)
+            entry_inputs: dict[str, Any] = {}
+            entry_worker = entry_state_obj.worker or (
+                entry_state_obj.loop.worker
+                if entry_state_obj.loop is not None
+                else None
+            )
+            if entry_worker is not None:
+                entry_inputs = {
+                    name: (run.args or {}).get(name) for name in entry_worker.inputs
+                }
+            _persist_state_entry(
+                self,
+                run_id=run_id,
+                state_id=entry_state_id,
+                inputs=entry_inputs,
+                producer_id=producer_id,
+            )
+            # Re-fetch so the rest of the method sees current_state set.
+            run = self.get_run(run_id)
+            assert run is not None and run.current_state == entry_state_id
+            current_state_id = entry_state_id
+
+        # Find the open state-entry PK for the current state (the row
+        # start_run / a prior commit_and_advance created).
+        with self.session_factory() as session:
+            entries = self.states.list_by_run(session, run_id)
+        from_state_pk: str | None = None
+        for entry in reversed(entries):
+            if entry.state_id == current_state_id and entry.status == "entered":
+                from_state_pk = entry.id
+                break
+
+        # Build the RunCtx the engine expects, threading the run's args
+        # through so transition predicates can read them.
+        run_ctx = RunCtx(
+            run_id=_uuid.UUID(run_id),
+            fsm_id=spec.id,
+            current_state=current_state_id,
+            env=dict(run.args or {}),
+        )
+
+        advance_result = engine_advance(spec, run_ctx, outputs)
+        result_kind = advance_result.kind.value
+
+        if advance_result.kind is EngineAdvanceKind.fault:
+            # Fault path: surface to caller without further persistence
+            # state mutations. The engine's contract guarantees no
+            # partial advance on fault.
+            return {
+                "result_kind": result_kind,
+                "next_state_id": current_state_id,
+                "next_brief": None,
+                "chain_length": 0,
+                "fault_reason": advance_result.reason,
+            }
+
+        # Mark the worker state's row as exited + emit state_exited
+        # + (if advancing) record the transition + persist the next
+        # state's entry row + emit transition_taken + state_entered.
+        # The transaction shape mirrors what MCP confirm_commit does.
+        if from_state_pk is not None:
+            with self.session_factory() as session, session.begin():
+                self.states.mark_exited(session, from_state_pk, outputs)
+                self.events.emit(
+                    session,
+                    producer_id=producer_id,
+                    kind=EventKind.state_exited.value,
+                    payload={"run_id": run_id, "state_pk": from_state_pk},
+                    run_id=run_id,
+                )
+
+        if advance_result.kind is EngineAdvanceKind.terminal:
+            from ctxr.fsm.sqlite.models_core import RunTable
+            from ctxr.fsm.sqlite.repos_core import _iso_now_ms
+
+            verdict_val = (
+                {**(run.args or {}), **outputs}.get("verdict")
+            )
+            with self.session_factory() as session, session.begin():
+                run_row = session.get(RunTable, run_id)
+                if run_row is not None:
+                    run_row.status = "completed"
+                    run_row.ended_at = _iso_now_ms()
+                    run_row.last_update_at = run_row.ended_at
+                    if verdict_val is not None:
+                        run_row.verdict = str(verdict_val)
+                    session.add(run_row)
+                self.events.emit(
+                    session,
+                    producer_id=producer_id,
+                    kind=EventKind.run_completed.value,
+                    payload={"run_id": run_id, "verdict": verdict_val},
+                    run_id=run_id,
+                )
+            return {
+                "result_kind": result_kind,
+                "next_state_id": None,
+                "next_brief": None,
+                "chain_length": 0,
+            }
+
+        # EngineAdvanceKind.advance: record transition + persist new entry.
+        next_state_id = advance_result.next_state
+        assert next_state_id is not None, "advance result must carry next_state"
+        # ``from_state_pk`` was set unless the run is in a malformed
+        # state — e.g. a state row went missing between start_run and
+        # the first commit_and_advance. We require it for the
+        # transition row's FK, so surface the malformed-state case
+        # rather than letting the type checker carry an Optional all
+        # the way into the repo.
+        assert from_state_pk is not None, (
+            f"no open state-entry row found for {current_state_id!r}"
+        )
+        next_state = spec.get_state(next_state_id)
+        next_inputs: dict[str, Any] = {}
+        worker = next_state.worker or (
+            next_state.loop.worker if next_state.loop is not None else None
+        )
+        if worker is not None:
+            env_after = {**(run.args or {}), **outputs}
+            next_inputs = {name: env_after.get(name) for name in worker.inputs}
+
+        with self.session_factory() as session, session.begin():
+            transition_eval = next(
+                iter(advance_result.evaluations or []), None
+            )
+            tkind = (
+                transition_eval.kind
+                if transition_eval is not None and transition_eval.kind is not None
+                else TransitionKind.always.value
+            )
+            self.transitions.create(
+                session,
+                run_id=run_id,
+                from_state_pk=from_state_pk,
+                to_state_id=next_state_id,
+                kind=tkind,
+                predicate=transition_eval.expression if transition_eval else None,
+                predicate_result=transition_eval.result if transition_eval else None,
+            )
+            self.events.emit(
+                session,
+                producer_id=producer_id,
+                kind=EventKind.transition_taken.value,
+                payload={
+                    "run_id": run_id,
+                    "from_state_pk": from_state_pk,
+                    "to_state_id": next_state_id,
+                    "kind": tkind,
+                },
+                run_id=run_id,
+            )
+
+        _persist_state_entry(
+            self,
+            run_id=run_id,
+            state_id=next_state_id,
+            inputs=next_inputs,
+            producer_id=producer_id,
+        )
+
+        # Walk any following inline-state chain server-side. The W14k
+        # inline-driver handles persistence + terminal detection for
+        # us, so a chain that ends at terminal correctly flips
+        # runs.status to completed without further work here.
+        env_for_chain = {**(run.args or {}), **outputs}
+        inline_result = _drive_inline_chain(
+            self,
+            spec=spec,
+            run_id=run_id,
+            producer_id=producer_id,
+            start_state_id=next_state_id,
+            env_at_entry=env_for_chain,
+        )
+
+        if inline_result.get("chain_length", 0) > 0:
+            return {
+                "result_kind": inline_result["result_kind"],
+                "next_state_id": inline_result["next_state_id"],
+                "next_brief": inline_result.get("next_brief"),
+                "chain_length": inline_result["chain_length"],
+            }
+
+        return {
+            "result_kind": result_kind,
+            "next_state_id": next_state_id,
+            "next_brief": None,
+            "chain_length": 0,
+        }
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
