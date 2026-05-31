@@ -502,7 +502,14 @@ async def _boot_subsystem(
                 "silence this advisory."
             )
             release_singleton(acq, project_root=project_root)
-            return None, port, None, True
+            # Return port=None so the caller treats UI as "absent" and
+            # OMITS it from active-mcp.json. Returning the picked port
+            # here was a bug: it surfaced an unreachable URL in the
+            # subsystem table that gave operators ECONNREFUSED on
+            # ⌘-click. The whole point of the skip-branch is "this
+            # subsystem doesn't exist for this project" — half-recording
+            # it as a working subsystem defeats the skip.
+            return None, None, None, True
         cmd = _ui_cmd(port=port)
         cwd = ui_cwd
         env = os.environ.copy()
@@ -960,10 +967,23 @@ async def run_supervisor(
             # subsystems we actually booted (UI omitted in prod mode
             # or mcp_only; API omitted in mcp_only).
             if mcp_healthz_ok and ports["mcp"] is not None:
+                # ``include_ui`` MUST reflect what actually got booted,
+                # not just the mode flag: the UI-boot path skips when
+                # ``ui/`` doesn't exist in the project root (W14k
+                # BLOCKER-1) and signals "absent" by leaving
+                # ``ports["ui"]`` as None. Recording UI in the
+                # discovery file in that case surfaces a dead URL in
+                # ``ctxr-fsm urls`` / ``doctor`` — operators ⌘-click +
+                # get ECONNREFUSED. The right key is "did this boot
+                # pass produce a UI port at all?"
                 _publish_active_mcp_file(
                     project_root=project_root,
                     ports=ports,
-                    include_ui=(mode == "dev" and not mcp_only),
+                    include_ui=(
+                        mode == "dev"
+                        and not mcp_only
+                        and ports["ui"] is not None
+                    ),
                 )
 
             # Banner. We render even-when-skipped URLs because the
