@@ -30,6 +30,7 @@ __all__ = [
     "portable_project_repr",
     "print_subsystem_table",
     "render_subsystem_table",
+    "render_subsystem_urls",
 ]
 
 
@@ -169,19 +170,44 @@ def render_subsystem_table(
         show_lines=False,
         title_style="bold",
         header_style="bold cyan",
+        # NOT ``expand=True``: that would split available width across
+        # ratio'd columns and force URL truncation when the terminal
+        # is narrow. Default sizing (auto-fit-to-content) instead
+        # claims exactly the width each URL needs; if the table
+        # overflows the terminal, the terminal handles the horizontal
+        # overflow (or wraps the WHOLE table line — readable OSC 8
+        # links survive a terminal-level reflow because the markup
+        # already encodes the click target before any visual wrap).
     )
-    table.add_column("Subsystem", style="bold")
-    table.add_column("URL", overflow="fold")
-    table.add_column("Swagger", overflow="fold")
-    table.add_column("Health")
-    table.add_column("PID", justify="right")
+    # URL + Swagger cells are wrapped in Rich ``[link=…]`` markup below
+    # so terminals that support OSC 8 hyperlinks (iTerm2, macOS
+    # Terminal.app on Sequoia+, VS Code integrated terminal, Wezterm,
+    # Kitty, Alacritty with the right config, modern GNOME Terminal +
+    # Konsole) render the visible URL as CLICKABLE — Cmd-click /
+    # Ctrl-click opens the browser straight from the table. Setting
+    # ``no_wrap=True`` keeps the visible URL on a single line so the
+    # operator can read AND click it; if the column overflows the
+    # terminal width the column expands rather than folding into a
+    # broken two-line URL that no copy-paste survives.
+    # The table no longer carries the URLs themselves — Rich's
+    # column-fit math will TRUNCATE URLs with ``…`` on any terminal
+    # narrower than the natural table+URL width, which is exactly the
+    # operator pain that motivated W16 in the first place ("the dots
+    # disarm all the point of having this info!!! how can i follow
+    # these links????"). Instead the table is the at-a-glance status
+    # view (which subsystem, healthz status, pid) and the URLs are
+    # printed BELOW the table as plain lines wrapped in OSC 8
+    # hyperlink escapes — one URL per line, ALWAYS full, ALWAYS
+    # clickable on supporting terminals (iTerm2, modern macOS
+    # Terminal.app, VSCode terminal, Wezterm, Kitty).
+    table.add_column("Subsystem", style="bold", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("PID", justify="right", no_wrap=True)
 
     # Leading project row — structural context, not a subsystem.
     table.add_row(
         "Project",
         portable_project_repr(project_root),
-        "",
-        "",
         "",
         style="dim",
     )
@@ -197,17 +223,6 @@ def render_subsystem_table(
         sub = subsystems.get(name)
         if not isinstance(sub, dict):
             continue
-        http_url = sub.get("http_url") or ""
-        # Swagger column: explicit ``docs_url`` wins; otherwise we
-        # derive ``<http_url>/docs`` for the api row only. Other rows
-        # stay blank.
-        docs_url_raw = sub.get("docs_url")
-        if isinstance(docs_url_raw, str) and docs_url_raw:
-            swagger = docs_url_raw
-        elif name == "api" and http_url:
-            swagger = http_url.rstrip("/") + "/docs"
-        else:
-            swagger = ""
         status_value = sub.get("status", "unknown")
         status_text, status_style = _format_status(
             status_value if isinstance(status_value, str) else "unknown"
@@ -217,13 +232,56 @@ def render_subsystem_table(
 
         table.add_row(
             name,
-            http_url,
-            swagger,
             f"[{status_style}]{status_text}[/{status_style}]",
             pid_repr,
         )
 
     return table
+
+
+def render_subsystem_urls(active_mcp: dict[str, Any]) -> list[str]:
+    """Build clickable-URL lines for the post-table "open this" block.
+
+    Each line carries an OSC 8 hyperlink (via Rich ``[link=…]`` markup
+    expanded at render time) wrapping the URL itself, so the visible
+    text and the click target are byte-identical AND the link survives
+    terminals that strip OSC 8 (the user sees the URL anyway). Order
+    matches the table: MCP first (the bootstrap entry point), then API
+    + the Swagger doc URL, then UI.
+
+    Returns a list of Rich markup strings; the caller prints each line.
+    Empty list when no subsystem reported a URL (e.g. ensure failed).
+    """
+    subsystems_raw = active_mcp.get("subsystems") or {}
+    subsystems = subsystems_raw if isinstance(subsystems_raw, dict) else {}
+
+    lines: list[str] = []
+
+    def _link_line(label: str, url: str) -> str:
+        """One ``label  link`` line. Label padded to a constant width
+        so a column of multiple labels visually aligns."""
+        return f"  [bold cyan]{label:<10}[/bold cyan] [link={url}]{url}[/link]"
+
+    for name in ("mcp", "api", "ui"):
+        sub = subsystems.get(name)
+        if not isinstance(sub, dict):
+            continue
+        http_url = sub.get("http_url")
+        if isinstance(http_url, str) and http_url:
+            lines.append(_link_line(name, http_url))
+        # Swagger lands on its own line right after the api row so
+        # operators looking for "the docs URL" find it adjacent in
+        # the visual flow.
+        if name == "api":
+            docs_url_raw = sub.get("docs_url")
+            if isinstance(docs_url_raw, str) and docs_url_raw:
+                lines.append(_link_line("swagger", docs_url_raw))
+            elif isinstance(http_url, str) and http_url:
+                lines.append(
+                    _link_line("swagger", http_url.rstrip("/") + "/docs")
+                )
+
+    return lines
 
 
 def print_subsystem_table(
@@ -244,3 +302,10 @@ def print_subsystem_table(
     console.print(
         render_subsystem_table(active_mcp, project_root=project_root, title=title)
     )
+    url_lines = render_subsystem_urls(active_mcp)
+    if url_lines:
+        # Single-line header + the link block. The header is short
+        # enough to live above the URLs without crowding the table.
+        console.print("\n[bold]Open in your browser:[/bold]")
+        for line in url_lines:
+            console.print(line)

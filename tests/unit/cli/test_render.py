@@ -31,17 +31,41 @@ from rich.console import Console
 
 from ctxr.fsm.cli._render import (
     portable_project_repr,
+    print_subsystem_table,
     render_subsystem_table,
+    render_subsystem_urls,
 )
 
 
 def _render_to_string(table_input: dict, *, project_root: Path, force_terminal: bool = False) -> str:
-    """Build a Console-backed StringIO, render the table, return the captured text."""
+    """Build a Console-backed StringIO, render the FULL surface (table + URL block), return captured text.
+
+    W16 split the renderer: the table carries Subsystem | Status | PID,
+    and the URLs print as a clickable OSC 8 block BELOW the table so
+    Rich's column-fit math can never truncate a URL with an ellipsis.
+    Tests that previously asserted on URL/Swagger column content should
+    look at the captured-text URL block; tests that pin column headers
+    should pin the new headers (Subsystem | Status | PID).
+    """
     buf = io.StringIO()
     console = Console(
         file=buf,
         force_terminal=force_terminal,
         color_system="truecolor" if force_terminal else None,
+        width=160,
+        legacy_windows=False,
+    )
+    print_subsystem_table(table_input, project_root=project_root, console=console)
+    return buf.getvalue()
+
+
+def _render_table_only_to_string(table_input: dict, *, project_root: Path) -> str:
+    """Render JUST the table (no URL block) for tests that pin column headers."""
+    buf = io.StringIO()
+    console = Console(
+        file=buf,
+        force_terminal=False,
+        color_system=None,
         width=160,
         legacy_windows=False,
     )
@@ -90,23 +114,60 @@ def _full_active_mcp() -> dict:
 
 
 def test_render_subsystem_table_columns_in_order(tmp_path: Path) -> None:
-    """Headers appear in the locked order: Subsystem | URL | Swagger | Health | PID.
+    """Headers appear in the locked W16 order: Subsystem | Status | PID.
 
-    The order is part of the operator's mental model — a regression
-    that reshuffled the columns would silently change every screenshot
-    in the docs. We capture the rendered text and assert the columns
-    appear left-to-right in the right order.
+    URLs are no longer in the TABLE — they print as a clickable OSC 8
+    block BELOW the table (see ``test_render_subsystem_urls_block``).
+    The locked column order is preserved as the at-a-glance status row
+    so operators know which subsystem to look at without scrolling.
     """
-    output = _render_to_string(_full_active_mcp(), project_root=tmp_path)
-    # Each header is its own substring; pinning indices makes the
-    # order-property explicit.
+    output = _render_table_only_to_string(_full_active_mcp(), project_root=tmp_path)
     idx_subsystem = output.index("Subsystem")
-    idx_url = output.index("URL")
-    idx_swagger = output.index("Swagger")
-    idx_health = output.index("Health")
+    idx_status = output.index("Status")
     idx_pid = output.index("PID")
-    assert idx_subsystem < idx_url < idx_swagger < idx_health < idx_pid, (
+    assert idx_subsystem < idx_status < idx_pid, (
         f"unexpected column order in:\n{output}"
+    )
+    # URL / Swagger / Health are NOT in the table anymore.
+    assert "URL" not in output[: output.index("Project")], (
+        "URL column header should not appear in the W16 table header"
+    )
+    assert "Swagger" not in output, "Swagger column was removed from the W16 table"
+
+
+def test_render_subsystem_urls_block_lists_every_url_with_link_markup(
+    tmp_path: Path,
+) -> None:
+    """The URL block lists mcp, api (+ swagger), ui in fixed order, each as
+    a Rich ``[link=URL]URL[/link]`` markup line so OSC 8-aware terminals
+    render them as clickable hyperlinks. Operators ⌘+click to open.
+    """
+    lines = render_subsystem_urls(_full_active_mcp())
+    # Order: mcp, api, swagger (right after api), ui.
+    labels = [line.split("[/bold cyan]")[0].split("[bold cyan]")[1].strip() for line in lines]
+    assert labels == ["mcp", "api", "swagger", "ui"], (
+        f"unexpected URL-block label order: {labels}"
+    )
+    # Each line carries [link=URL] markup wrapping the URL text.
+    assert all("[link=" in line for line in lines)
+    assert any("http://127.0.0.1:8770/sse" in line for line in lines)
+    assert any("http://127.0.0.1:8765/docs" in line for line in lines)  # swagger
+    assert any("http://127.0.0.1:5173" in line for line in lines)
+
+
+def test_print_subsystem_table_emits_osc8_hyperlinks(tmp_path: Path) -> None:
+    """When rendered to a TTY, the URL block produces OSC 8 escape bytes
+    (``\\x1b]8;`` start sequence) so the URL text becomes clickable on
+    terminals that support OSC 8 (iTerm2, modern macOS Terminal, VSCode
+    terminal, Wezterm, Kitty)."""
+    output = _render_to_string(
+        _full_active_mcp(), project_root=tmp_path, force_terminal=True
+    )
+    osc8_start = "\x1b]8;"
+    # 4 URL lines × 2 OSC 8 sequences per line (start + close) = 8 occurrences.
+    assert output.count(osc8_start) == 8, (
+        f"expected 8 OSC 8 sequences (4 URLs × open+close), got "
+        f"{output.count(osc8_start)} in:\n{output!r}"
     )
 
 
@@ -133,25 +194,22 @@ def test_render_subsystem_table_includes_project_row(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_render_subsystem_table_swagger_derived_for_api(tmp_path: Path) -> None:
-    """When ``docs_url`` is absent on the api payload, derive ``http_url + /docs``.
-
-    The W14c discovery doc historically carried ``docs_url`` for
-    api; the renderer must still cope when a future payload variant
-    omits it (e.g. a check-mode run that only fills the URL). Other
-    rows (mcp / ui) MUST stay blank — Swagger is api-specific.
+def test_render_subsystem_urls_swagger_derived_for_api(tmp_path: Path) -> None:
+    """When ``docs_url`` is absent on the api payload, the URL block
+    derives ``http_url + /docs`` for the api Swagger line. Other rows
+    (mcp / ui) don't get a Swagger line — Swagger is api-specific.
     """
     payload = _full_active_mcp()
     del payload["subsystems"]["api"]["docs_url"]  # force derivation
 
-    output = _render_to_string(payload, project_root=tmp_path)
+    lines = render_subsystem_urls(payload)
+    flat = "\n".join(lines)
     # The derived swagger URL appears for api.
-    assert "http://127.0.0.1:8765/docs" in output
-    # The mcp row has no swagger column content (we cannot grep for
-    # "empty cell" but the mcp http_url and the api swagger URL are
-    # different strings, so the per-row content stays unambiguous).
-    # We additionally check that no swagger appears for the mcp URL:
-    assert "http://127.0.0.1:8770/sse/docs" not in output
+    assert "http://127.0.0.1:8765/docs" in flat
+    # And it's labelled ``swagger`` on its own line right after api.
+    assert any("swagger" in line and "http://127.0.0.1:8765/docs" in line for line in lines)
+    # The mcp URL does NOT get a /docs derivative attached.
+    assert "http://127.0.0.1:8770/sse/docs" not in flat
 
 
 # ---------------------------------------------------------------------------

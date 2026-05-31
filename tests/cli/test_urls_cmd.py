@@ -47,17 +47,24 @@ def _write_active_mcp(target: Path) -> None:
 
 
 def test_urls_prints_table_with_no_diagnostic_noise(tmp_path: Path) -> None:
-    """urls outputs the Rich table + nothing else: no DB panel, no alembic chatter."""
+    """urls outputs the table + URL block + nothing else (no DB panel, no alembic)."""
     _write_active_mcp(tmp_path)
 
     result = runner.invoke(app, ["urls", "--project-root", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
-    assert "Subsystem" in result.output
-    assert "Swagger" in result.output
+    # Subsystem names appear in the table.
     assert "mcp" in result.output
     assert "api" in result.output
     assert "ui" in result.output
+    # The URL block below the table carries the full URLs +
+    # the "swagger" label for the api row's docs_url.
+    assert "Open in your browser" in result.output
+    assert "swagger" in result.output
+    assert "http://127.0.0.1:50001/sse" in result.output
+    assert "http://127.0.0.1:50002/docs" in result.output
+    assert "http://127.0.0.1:50003" in result.output
+    # No diagnostic noise from `doctor`.
     assert "Revision" not in result.output, "urls should not print the DB panel"
     assert "alembic" not in result.output.lower()
 
@@ -76,5 +83,5 @@ def test_show_is_a_working_alias_for_urls(tmp_path: Path) -> None:
     _write_active_mcp(tmp_path)
     result = runner.invoke(app, ["show", "--project-root", str(tmp_path)])
     assert result.exit_code == 0, result.output
-    assert "Subsystem" in result.output
     assert "mcp" in result.output
+    assert "Open in your browser" in result.output

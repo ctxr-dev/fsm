@@ -124,12 +124,10 @@ def test_doctor_pretty_renders_subsystem_table_header() -> None:
         # Subsystem table header + the leading Project row are always
         # rendered (rows for individual subsystems depend on whether a
         # supervisor has booted in this fixture; we only pin the
-        # invariant skeleton here).
+        # invariant skeleton here). W16 split: URL + Swagger moved to
+        # the OSC-8 link block printed below the table.
         assert "ctxr-fsm subsystems" in result.stdout
-        assert "Subsystem" in result.stdout
-        assert "URL" in result.stdout
-        assert "Swagger" in result.stdout
-        assert "Health" in result.stdout
+        assert "Status" in result.stdout
         assert "PID" in result.stdout
         assert "Project" in result.stdout
 

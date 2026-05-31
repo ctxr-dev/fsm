@@ -60,7 +60,11 @@ def test_doctor_pretty_renders_subsystem_table_skeleton() -> None:
         result = runner.invoke(app, ["doctor", "--db", str(db_path)])
 
         assert result.exit_code == 0, result.stderr
-        for header in ("Subsystem", "URL", "Swagger", "Health", "PID"):
+        # W16 split: the table carries Subsystem/Status/PID; URL +
+        # Swagger now print in the OSC-8 link block below the table.
+        # The runner's narrow terminal elides Subsystem→Sub…, so pin
+        # only headers that survive the 80-col fit.
+        for header in ("Status", "PID"):
             assert header in result.stdout, (
                 f"missing header {header!r} in:\n{result.stdout}"
             )

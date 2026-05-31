@@ -294,7 +294,9 @@ def test_supervisor_boot_table_headers_visible_on_stdout() -> None:
             )
 
             captured = out.snapshot()
-            for header in ("Subsystem", "URL", "Swagger", "Health", "PID"):
+            # W16 split: the table carries Subsystem/Status/PID; URL +
+            # Swagger live in the OSC-8 link block printed below.
+            for header in ("Subsystem", "Status", "PID"):
                 assert header in captured, (
                     f"missing header {header!r} in:\n{captured}"
                 )

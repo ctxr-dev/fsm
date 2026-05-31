@@ -188,12 +188,13 @@ def test_ensure_tty_non_json_prints_subsystem_table(
     )
     assert result.exit_code == 0, result.stdout
 
-    # Table headers are present.
-    for header in ("Subsystem", "URL", "Swagger", "Health", "PID"):
-        assert header in result.stdout, (
-            f"missing header {header!r} in:\n{result.stdout}"
-        )
-    # At least one staged URL appears in the rendered table.
+    # The Rich CliRunner sandbox is fixed at 80 columns so the
+    # table's first column header ("Subsystem") elides to "Sub…" —
+    # don't pin the table header text in this runner. Instead assert
+    # on tokens that genuinely survive: row labels, the URL block
+    # header (one of the W16 deliverables), and the staged URL.
+    assert "mcp" in result.stdout
+    assert "Open in your browser" in result.stdout
     assert "127.0.0.1:65000" in result.stdout
 
 
@@ -229,7 +230,7 @@ def test_ensure_json_mode_does_not_print_table(
     # No Rich table characters in the output. The Subsystem column
     # header is the cleanest single sentinel.
     assert "Subsystem" not in result.stdout
-    assert "Swagger" not in result.stdout
+    assert "Open in your browser" not in result.stdout
     # The captured stdout is parseable JSON.
     payload = json.loads(result.stdout)
     assert payload["status"] == "ready"
@@ -265,7 +266,7 @@ def test_ensure_no_table_flag_suppresses_table_in_tty(
     assert "actions" in result.stdout or "supervisor" in result.stdout
     # The table header is absent.
     assert "Subsystem" not in result.stdout
-    assert "Swagger" not in result.stdout
+    assert "Open in your browser" not in result.stdout
 
 
 def test_ensure_no_tty_defaults_to_json_without_table(
