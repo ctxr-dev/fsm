@@ -105,6 +105,34 @@ from ctxr.fsm.sqlite.drift import (
 __all__ = ["main", "run_supervisor"]
 
 
+def _locate_package_ui_dir() -> Path | None:
+    """Resolve the fsm package's own ``ui/`` source tree.
+
+    The UI (Vite + Preact + Tailwind v4, W6) is part of the ctxr-fsm
+    package, not the consumer project. We need its on-disk path so the
+    supervisor can spawn ``vite`` with the right ``cwd``. Two layouts
+    we have to handle:
+
+    * **Sibling-linked / editable / sdist install** — the package
+      lives at ``<repo>/ctxr/fsm/`` (PEP 420 namespace package) and
+      the UI lives at ``<repo>/ui/``. ``Path(__file__).resolve()``
+      walks ``cli/lifecycle/supervisor.py → cli/ → fsm/ → ctxr/ →
+      <repo>``, so the root is ``parents[4]``.
+    * **Wheel install** — the wheel's data section lands ``ui/`` next
+      to ``ctxr/`` inside the site-packages tree. Same parents[4]
+      resolution lands there.
+
+    Returns the directory if it contains a ``package.json``; otherwise
+    returns ``None`` and the caller logs the diagnostic + skips UI.
+    """
+    # supervisor.py lives at <root>/ctxr/fsm/cli/lifecycle/supervisor.py
+    # → parents: [lifecycle, cli, fsm, ctxr, <root>] = parents[4].
+    candidate = Path(__file__).resolve().parents[4] / "ui"
+    if (candidate / "package.json").is_file():
+        return candidate
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
@@ -482,43 +510,44 @@ async def _boot_subsystem(
         env = None
         inherit = False
     elif name == "ui":
-        # The UI is a Vite dev server that lives in the fsm package's own
-        # ``ui/`` subtree. Consumer projects (any project that pip / uv
-        # installed ctxr-fsm) DON'T have a ``ui/`` subdir, and trying to
-        # spawn there would crash the entire supervisor with
-        # FileNotFoundError, taking mcp + api down with it. We skip the
-        # UI spawn with a one-line stderr advisory when no ui/ tree is
-        # present at the project root; the supervisor continues with
-        # just mcp + api, and the operator gets a clear pointer at the
-        # underlying reason. (Released the singleton lock + freed the
-        # port; callers see the same "subsystem absent" return shape as
-        # the reuse path.)
-        ui_cwd = project_root / "ui"
-        if not ui_cwd.is_dir():
+        # The UI is a Vite dev server that ships INSIDE the ctxr-fsm
+        # package itself (W6 — ``fsm/ui/``), NOT in the consumer
+        # project. Consumer projects never have their own ``ui/`` tree
+        # because the UI is the package's UI: the operator sees the
+        # same dashboard regardless of which project they pointed
+        # ``ctxr-fsm`` at. We locate the package's ui/ via
+        # :func:`_locate_package_ui_dir` (resolves the source tree
+        # whether ctxr-fsm is sibling-linked, editable-installed, or
+        # site-packages-installed) and spawn the Vite dev server from
+        # THERE. The dev server then reads its config + node_modules
+        # from the package and serves SSE/API proxying against the
+        # consumer's API child via ``VITE_API_PORT`` in env.
+        ui_cwd = _locate_package_ui_dir()
+        if ui_cwd is None or not (ui_cwd / "package.json").is_file():
             _log(
-                f"[ctxr-fsm supervisor] ui skipped: no {ui_cwd} found at this "
-                "project root (expected for consumer projects that install "
-                "ctxr-fsm rather than develop it). Use `--mode mcp-only` to "
+                "[ctxr-fsm supervisor] ui skipped: could not locate the "
+                "package-owned ui/ directory (looked relative to "
+                f"ctxr.fsm.__file__={Path(__file__).resolve()}). The UI "
+                "ships inside the ctxr-fsm package; if you installed via "
+                "a wheel that excluded the ui/ subtree, reinstall with "
+                "the source distribution or use --mode mcp-only to "
                 "silence this advisory."
             )
             release_singleton(acq, project_root=project_root)
-            # Return port=None so the caller treats UI as "absent" and
-            # OMITS it from active-mcp.json. Returning the picked port
-            # here was a bug: it surfaced an unreachable URL in the
-            # subsystem table that gave operators ECONNREFUSED on
-            # ⌘-click. The whole point of the skip-branch is "this
-            # subsystem doesn't exist for this project" — half-recording
-            # it as a working subsystem defeats the skip.
             return None, None, None, True
         cmd = _ui_cmd(port=port)
         cwd = ui_cwd
         env = os.environ.copy()
         # The Vite config reads VITE_API_PORT at startup to wire the
-        # /api/v1 proxy target; passing the actual api port keeps the
-        # UI talking to the supervisor's API child.
+        # /api/v1 proxy target at the SUPERVISOR's api port for THIS
+        # consumer project. That's the bridge: code from the package,
+        # data routed at the consumer's API.
         api_port = recall_port("api", project_root=project_root)
         if api_port is not None:
             env["VITE_API_PORT"] = str(api_port)
+        # Pass the consumer's project root through so the UI can label
+        # the dashboard with "you're looking at <consumer project>".
+        env["CTXR_FSM_PROJECT_ROOT"] = str(project_root)
         inherit = True
     else:
         # Defensive: any future subsystem must add an arm here. Crash
