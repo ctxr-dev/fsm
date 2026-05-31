@@ -23,6 +23,26 @@ import os
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _wide_terminal_for_rich_assertions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pin COLUMNS=200 so Rich does not wrap flag names in CI.
+
+    Several CLI tests assert ``'--mode' in result.stdout`` against
+    Typer help output. Typer renders help through Rich, which honours
+    ``COLUMNS``: on a developer laptop terminal that is typically
+    >120 cols and the long flag tokens land on a single line; on
+    GitHub Actions ``COLUMNS`` is unset and Rich falls back to ~80
+    cols, where a long-named flag inside a panel can wrap and the
+    substring check fails. The dashboard's CLI surface is the same
+    in both environments; the test's assertion is what's brittle.
+    Forcing a wide terminal in the test environment removes the
+    environment-dependence without touching the production CLI.
+    """
+    monkeypatch.setenv("COLUMNS", "200")
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     """Register the ``--run-e2e`` opt-in flag for the E2E suite."""
     parser.addoption(
