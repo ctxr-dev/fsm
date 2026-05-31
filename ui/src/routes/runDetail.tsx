@@ -52,15 +52,28 @@ import {
   Card,
   Dialog,
   EmptyState,
+  FilterChips,
+  JsonViewer,
   Pill,
   Spinner,
   Timeline,
   Tree,
   useToast,
+  type FilterChip,
   type PillVariant,
   type TimelineItem,
   type TreeNode,
 } from '../components';
+import {
+  clearAllFilters,
+  clearFilter,
+  eventPassesFilters,
+  filtersToChips,
+  runDetailFilters,
+  signaturePassesFilters,
+  toggleFilter,
+  toolCallPassesFilters,
+} from '../lib/runDetailStore';
 import {
   api,
   ApiError,
@@ -104,14 +117,9 @@ function shortHash(hash: string): string {
   return hash.length > 12 ? hash.slice(0, 12) : hash;
 }
 
-/** Pretty-print a JSON-like value with 2-space indentation. */
-function prettyJson(value: unknown): string {
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-}
+// W18d: prettyJson helper removed — every JSON-render site now uses
+// the JsonViewer primitive (which carries its own copy / download /
+// full-screen / search toolbar instead of producing a raw string).
 
 // ---------------------------------------------------------------------------
 // Variant maps — semantic colours per status / verdict / event kind
@@ -254,11 +262,14 @@ function extractAllowedTools(node: StateNode | null): string[] | null {
 /** Render an FSM event as a :class:`TimelineItem`. */
 function eventToTimelineItem(event: FsmEvent): TimelineItem {
   const variant = variantForEventKind(event.kind);
-  const payloadString = prettyJson(event.payload);
   const payload: VNode = (
-    <pre class="font-mono text-xs leading-snug whitespace-pre-wrap break-words text-slate-600 dark:text-slate-300 bg-slate-50 dark:bg-slate-900/40 rounded-md px-3 py-2 max-h-40 overflow-auto">
-      {payloadString}
-    </pre>
+    <JsonViewer
+      value={event.payload}
+      rootLabel="payload"
+      mode="inline"
+      maxInlineHeight="max-h-40"
+      ariaLabel={`Payload of event ${event.id}`}
+    />
   );
   return {
     id: event.id,
@@ -550,10 +561,36 @@ export function RunDetailRoute(): JSX.Element {
     [selectedNode, currentNode],
   );
 
-  const timelineItems = useMemo(
-    () => events.map(eventToTimelineItem),
-    [events],
+  // W18d: subscribe to the cross-pane filter set so the timeline /
+  // tool calls / signatures rerender when chips change.
+  const activeFilters = runDetailFilters.value;
+  const filterChips: FilterChip[] = useMemo(
+    () => filtersToChips(activeFilters),
+    [activeFilters],
   );
+
+  const filteredEvents = useMemo(
+    () => events.filter((e) => eventPassesFilters(e, activeFilters)),
+    [events, activeFilters],
+  );
+  const filteredToolCalls = useMemo(
+    () => toolCalls.filter((c) => toolCallPassesFilters(c, activeFilters)),
+    [toolCalls, activeFilters],
+  );
+  const filteredSignatures = useMemo(
+    () => signatures.filter((s) => signaturePassesFilters(s, activeFilters)),
+    [signatures, activeFilters],
+  );
+
+  const timelineItems = useMemo(
+    () => filteredEvents.map(eventToTimelineItem),
+    [filteredEvents],
+  );
+
+  // Reset filters whenever the user navigates between runs.
+  useEffect(() => {
+    clearAllFilters();
+  }, [runId]);
 
   // -----------------------------------------------------------------------
   // Action handler — closes dialog, fires the API, toasts, reloads
@@ -641,7 +678,17 @@ export function RunDetailRoute(): JSX.Element {
     journal !== null && journal.status !== 'finalised';
 
   const meta = pendingAction ? ACTION_META[pendingAction.kind] : null;
-  const lastSignatures = signatures.slice(0, 3);
+  const lastSignatures = filteredSignatures.slice(0, 3);
+
+  // FilterChipBar handlers: chip-remove maps back to the right filter key.
+  const onChipRemove = useCallback((chip: FilterChip) => {
+    const [k] = chip.id.split(':');
+    if (k === 'state') clearFilter('stateId');
+    else if (k === 'kind') clearFilter('eventKind');
+    else if (k === 'producer') clearFilter('producerId');
+    else if (k === 'tool') clearFilter('toolName');
+    else if (k === 'signal') clearFilter('signalKind');
+  }, []);
 
   return (
     <div class="p-4 md:p-6 space-y-4">
@@ -750,6 +797,18 @@ export function RunDetailRoute(): JSX.Element {
       </header>
 
       {/* ----------------------------------------------------------------
+          Filter chip bar (W18d): every label click in the panes below
+          writes into the runDetailFilters signal; chips render here so
+          the user can see + remove active filters.
+          ---------------------------------------------------------------- */}
+      <FilterChips
+        chips={filterChips}
+        onRemove={onChipRemove}
+        onClear={clearAllFilters}
+        ariaLabel="Run filters"
+      />
+
+      {/* ----------------------------------------------------------------
           Three-pane grid
           ---------------------------------------------------------------- */}
       <div class="grid grid-cols-1 gap-4 lg:grid-cols-3">
@@ -770,9 +829,14 @@ export function RunDetailRoute(): JSX.Element {
           {selectedNode ? (
             <div class="mt-4 space-y-3 border-t border-slate-200 dark:border-slate-700 pt-3">
               <div class="flex flex-wrap items-baseline gap-2">
-                <h3 class="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                <button
+                  type="button"
+                  onClick={() => toggleFilter('stateId', selectedNode.state_id)}
+                  title={`Filter all panes to state ${selectedNode.state_id}`}
+                  class="text-sm font-semibold text-slate-900 dark:text-slate-100 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded-sm"
+                >
                   {selectedNode.state_id}
-                </h3>
+                </button>
                 <Pill variant={variantForStatus(selectedNode.status)} size="sm">
                   {selectedNode.status}
                 </Pill>
@@ -784,17 +848,27 @@ export function RunDetailRoute(): JSX.Element {
                 <h4 class="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">
                   Inputs
                 </h4>
-                <pre class="font-mono text-xs leading-snug whitespace-pre-wrap break-words text-slate-700 dark:text-slate-200 bg-slate-50 dark:bg-slate-900/40 rounded-md px-3 py-2 max-h-48 overflow-auto">
-                  {prettyJson(selectedNode.inputs)}
-                </pre>
+                <JsonViewer
+                  value={selectedNode.inputs}
+                  rootLabel="inputs"
+                  mode="inline"
+                  maxInlineHeight="max-h-48"
+                  downloadFilename={`run-${runId}-${selectedNode.state_id}-inputs.json`}
+                  ariaLabel={`Inputs for state ${selectedNode.state_id}`}
+                />
               </div>
               <div>
                 <h4 class="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">
                   Outputs
                 </h4>
-                <pre class="font-mono text-xs leading-snug whitespace-pre-wrap break-words text-slate-700 dark:text-slate-200 bg-slate-50 dark:bg-slate-900/40 rounded-md px-3 py-2 max-h-48 overflow-auto">
-                  {prettyJson(selectedNode.outputs)}
-                </pre>
+                <JsonViewer
+                  value={selectedNode.outputs}
+                  rootLabel="outputs"
+                  mode="inline"
+                  maxInlineHeight="max-h-48"
+                  downloadFilename={`run-${runId}-${selectedNode.state_id}-outputs.json`}
+                  ariaLabel={`Outputs for state ${selectedNode.state_id}`}
+                />
               </div>
             </div>
           ) : null}
@@ -971,7 +1045,7 @@ export function RunDetailRoute(): JSX.Element {
           <span>
             Tool calls audit log{' '}
             <span class="ml-1 text-xs font-normal text-slate-500 dark:text-slate-400">
-              ({toolCalls.length} most recent)
+              ({filteredToolCalls.length}{filteredToolCalls.length !== toolCalls.length ? ` of ${toolCalls.length}` : ''} most recent)
             </span>
           </span>
           <span
@@ -998,14 +1072,14 @@ export function RunDetailRoute(): JSX.Element {
             id="tool-call-audit-log"
             class="border-t border-slate-200 dark:border-slate-700 px-4 py-3"
           >
-            {toolCalls.length === 0 ? (
+            {filteredToolCalls.length === 0 ? (
               <EmptyState
                 title="No tool calls recorded"
                 message="The audit log is empty for this run."
               />
             ) : (
               <ul class="divide-y divide-slate-200 dark:divide-slate-700">
-                {toolCalls.map((call) => (
+                {filteredToolCalls.map((call) => (
                   <li key={call.id} class="py-3 space-y-1">
                     <div class="flex flex-wrap items-baseline gap-2">
                       <Pill
@@ -1027,9 +1101,31 @@ export function RunDetailRoute(): JSX.Element {
                         {shortHash(call.producer_id)}
                       </span>
                     </div>
-                    <pre class="font-mono text-xs leading-snug whitespace-pre-wrap break-words text-slate-600 dark:text-slate-300 bg-slate-50 dark:bg-slate-900/40 rounded-md px-3 py-2 max-h-40 overflow-auto">
-                      {prettyJson(call.args_redacted)}
-                    </pre>
+                    <JsonViewer
+                      value={call.args_redacted}
+                      rootLabel="args"
+                      mode="inline"
+                      maxInlineHeight="max-h-40"
+                      ariaLabel={`Tool call args ${call.tool_name}`}
+                    />
+                    <div class="mt-1 flex gap-1">
+                      <button
+                        type="button"
+                        onClick={() => toggleFilter('toolName', call.tool_name)}
+                        title={`Filter tool calls to ${call.tool_name}`}
+                        class="text-[10px] underline text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded-sm"
+                      >
+                        filter by tool
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => toggleFilter('producerId', call.producer_id)}
+                        title={`Filter to producer ${call.producer_id}`}
+                        class="text-[10px] underline text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded-sm"
+                      >
+                        filter by producer
+                      </button>
+                    </div>
                   </li>
                 ))}
               </ul>
