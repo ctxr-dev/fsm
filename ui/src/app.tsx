@@ -56,6 +56,11 @@ import {
   connectionState,
   setConnectionState,
 } from './lib/store';
+import { Runs as RunsRoute } from './routes/runs';
+import { RunDetailRoute } from './routes/runDetail';
+import { SpecsRoute } from './routes/specs';
+import { ConsumersRoute } from './routes/consumers';
+import { SettingsRoute } from './routes/settings';
 
 // ---------------------------------------------------------------------------
 // SSE wiring
@@ -307,51 +312,6 @@ function RouteStub({
         {description}
       </p>
     </section>
-  );
-}
-
-function RunsRoute(): JSX.Element {
-  return (
-    <RouteStub
-      title="Runs"
-      description="Live and historical FSM runs grouped by status. Subsequent waves will render the runs list, filters, and inline actions here."
-    />
-  );
-}
-
-function RunDetailRoute({ id }: { id: string }): JSX.Element {
-  return (
-    <RouteStub
-      title={`Run ${id}`}
-      description="State tree, journal, lock, and live tape for a single run. The detail view will subscribe to per-run SSE filters in a later wave."
-    />
-  );
-}
-
-function SpecsRoute(): JSX.Element {
-  return (
-    <RouteStub
-      title="Specs"
-      description="Registered FSM specs and their version history. Future waves will surface diffs and lineage between versions."
-    />
-  );
-}
-
-function ConsumersRoute(): JSX.Element {
-  return (
-    <RouteStub
-      title="Consumers"
-      description="Event-bus topology — producers, consumers, and their last-seen heartbeats. Future waves will surface ack lag and per-consumer event tails."
-    />
-  );
-}
-
-function SettingsRoute(): JSX.Element {
-  return (
-    <RouteStub
-      title="Settings"
-      description="API base URL, bearer token, and dev-only affordances live here. Persisted to localStorage in a later wave."
-    />
   );
 }
 

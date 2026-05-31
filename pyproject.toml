@@ -59,12 +59,23 @@ include = [
 
 [dependency-groups]
 dev = [
-  "pytest>=8.3",
-  "pytest-asyncio>=0.24",
+  # Pin pytest + pytest-asyncio to their 8.x / 0.x lines: pytest 9 +
+  # pytest-asyncio 1.x changed the default event-loop fixture scope,
+  # which breaks the existing tests that call ``anyio.run(...)``
+  # inside test bodies (they hit "Already running asyncio in this
+  # thread"). Holding back here avoids a parallel suite-wide refactor.
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.24,<1",
   "ruff>=0.6",
   "mypy>=1.11",
   "hypothesis>=6.112",
   "types-jsonschema>=4.23",
+]
+e2e = [
+  "playwright>=1.50",
+  # pytest-playwright 0.7 supports pytest 8.x, which matches our
+  # pinned pytest version above.
+  "pytest-playwright>=0.7,<0.8",
 ]
 
 [tool.uv]
@@ -194,3 +205,6 @@ disable_error_code = [
 [tool.pytest.ini_options]
 addopts = "-ra -q --strict-markers"
 testpaths = ["tests"]
+markers = [
+  "e2e: end-to-end UI tests (Playwright). Require the 'e2e' dependency group and 'playwright install chromium'. Skipped automatically when those are not present.",
+]
