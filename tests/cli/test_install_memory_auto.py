@@ -95,8 +95,16 @@ def test_auto_patches_both_claude_and_codex_when_both_present(
     )
 
 
-def test_auto_in_empty_dir_is_clean_no_op(tmp_target: Path) -> None:
-    """No client signature anywhere -> noop, exit 0, no files written."""
+def test_auto_in_empty_dir_falls_back_to_claude(tmp_target: Path) -> None:
+    """W14k BLOCKER-3: auto in a COLD project bootstraps Claude as the fallback.
+
+    The original "clean no-op" contract was a UX bug: it left
+    SKILL.md's ``@.ctxr-fsm/memory/bootstrap.md`` reference dead in
+    fresh projects because nothing ever staged the bootstrap doc.
+    The fallback creates a minimal CLAUDE.md at the canonical location
+    + stages principles.claude.md + bootstrap.md under
+    ``.ctxr-fsm/memory/`` so the SKILL.md `@` import resolves.
+    """
     result = runner.invoke(
         app,
         [
@@ -111,14 +119,21 @@ def test_auto_in_empty_dir_is_clean_no_op(tmp_target: Path) -> None:
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["detected"] == []
-    assert "no AI-client memory files found" in payload["message"]
+    # Claude is the fallback target so it appears in the results list
+    # with action="wrote" (the first run that bootstraps the file).
+    assert any(
+        row["client"] == "claude" and row["action"] == "wrote"
+        for row in payload["results"]
+    ), f"expected claude 'wrote' action; got: {payload['results']!r}"
 
-    # Verify the command did not create any of the canonical client files.
-    assert not (tmp_target / "CLAUDE.md").exists()
+    # CLAUDE.md was bootstrapped at the canonical top-level location.
+    assert (tmp_target / "CLAUDE.md").is_file()
+    # Principles + bootstrap docs staged under .ctxr-fsm/memory/.
+    assert (tmp_target / ".ctxr-fsm" / "memory" / "principles.claude.md").exists()
+    assert (tmp_target / ".ctxr-fsm" / "memory" / "bootstrap.md").exists()
+    # Codex + Cursor were NOT detected so their files don't appear.
     assert not (tmp_target / "AGENTS.md").exists()
     assert not (tmp_target / ".cursor").exists()
-    assert not (tmp_target / ".ctxr-fsm").exists()
 
 
 def test_auto_with_only_cursor_rules_writes_only_cursor(tmp_target: Path) -> None:
