@@ -5,12 +5,13 @@ that wants to use `ctxr-fsm` as its FSM substrate — either by migrating an
 existing pipeline or by being authored against the FSM from day one.
 
 > **Scope note.** The canonical case study throughout this guide is
-> `skill-code-review` (the lens-specialist pipeline that today ships as a
-> Node CLI under `legacy-js/`). Its **migration to the Python `ctxr-fsm`
-> substrate is explicitly OUT OF SCOPE for the current `fsm/` repo plan**
-> — `legacy-js/` is preserved untouched. Use this guide either as the
-> blueprint for that future migration **or** as the green-field recipe
-> for a brand-new skill that targets `ctxr-fsm` from the start.
+> `skill-code-review` v3, the Python port that targets `ctxr-fsm`
+> natively (ships a Pydantic `FsmSpec` + 9 inline state handlers + 5
+> worker prompts). The pre-rewrite Node v2 sources are retired and
+> archived at the [`legacy-js-archive`](https://github.com/ctxr-dev/fsm/releases/tag/legacy-js-archive)
+> git tag. Use this guide either as the blueprint for porting another
+> JS-based skill **or** as the green-field recipe for a brand-new
+> skill that targets `ctxr-fsm` from the start.
 
 Cross-references:
 - [`docs/mcp-tools.md`](./mcp-tools.md) — the 17 `fsm.*` MCP tool surface
@@ -320,26 +321,29 @@ returns `created=False` and does not bump the version. Edit the spec,
 re-run, and a new version row is minted automatically (see
 [`docs/data-model.md`](./data-model.md)).
 
-### E. Migration checklist for the existing JS-based skill
+### E. Migration checklist (already complete for skill-code-review)
 
-When the time comes (this is the out-of-scope work flagged at the top
-of this guide), the migration from `legacy-js/` to the Python substrate
-is:
+The skill-code-review v2 -> v3 port followed this checklist. Use it as
+the template for any other JS skill that targets `ctxr-fsm`:
 
-- [ ] Port `.fsm.yaml` (or the hand-rolled JS FSM in
+- [x] Port `.fsm.yaml` (or the hand-rolled JS FSM in
       `scripts/run-review.mjs`) into a Pydantic `FsmSpec` exactly as
       shown in section A.
-- [ ] Replace the Node runner's shell loop with the MCP tool dispatch
+- [x] Replace the Node runner's shell loop with the MCP tool dispatch
       loop in section B of "The three integration shapes".
-- [ ] Replace `SKILL.md`'s `requires.fsm.npm` block (if any) with the
+- [x] Replace `SKILL.md`'s `requires.fsm.npm` block (if any) with the
       `requires.fsm.mcp_server` block from section B above.
-- [ ] Add `install_spec.py` (section D) and call it from the package's
-      post-install hook.
-- [ ] Update CI to test the Python-driven flow end-to-end via
+- [x] Add `install_spec.py` (section D) and call it from the package's
+      post-install hook (or expose it as a `python -m <skill>.install`
+      entry point so cross-process MCP servers can lazily hydrate the
+      inline-handler registry via the `ctxr_fsm.skills` entry-points
+      group).
+- [x] Update CI to test the Python-driven flow end-to-end via
       `tests/integration/test_pipeline.py` (mirror
       `tests/integration/examples/test_code_review_pipeline.py`).
-- [ ] **Leave `legacy-js/` in place** until the new flow has shipped at
-      least one production review. The old runner is the rollback path.
+- [x] Archive the JS sources at a recoverable git tag
+      ([`legacy-js-archive`](https://github.com/ctxr-dev/fsm/releases/tag/legacy-js-archive)
+      for the original cohabitation) before deleting them.
 
 ---
 

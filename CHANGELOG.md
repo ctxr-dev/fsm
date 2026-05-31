@@ -4,7 +4,7 @@ All notable changes to `ctxr-fsm` (the Python package at this repository root) a
 
 The format is based on [Keep a Changelog v1.1.0](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-The cohabiting Node.js package `@ctxr/fsm` at [`legacy-js/`](legacy-js/) keeps its own changelog under [`legacy-js/CHANGELOG.md`](legacy-js/CHANGELOG.md); entries here cover the Python rewrite only.
+The pre-rewrite Node.js sources (`@ctxr/fsm`) were retired in W15. The pre-deletion state is preserved at the git tag [`legacy-js-archive`](https://github.com/ctxr-dev/fsm/releases/tag/legacy-js-archive); existing npm pins continue to resolve from the npmjs.com releases unchanged. This changelog covers the Python `ctxr-fsm` only.
 
 ## [Unreleased]
 
@@ -64,9 +64,9 @@ Plus the operator playbooks in [`docs/enforcement.md`](docs/enforcement.md) and 
 **W9 — Documentation.**
 Production-ready top-level [`README.md`](README.md) and this changelog. Full reference set under [`docs/`](docs/): `architecture.md`, `api.md`, `data-model.md`, `mcp-tools.md`, `http-api.md`, `operating.md`, `enforcement.md`, `examples-tour.md`, `recovery.md`.
 
-### Note about the JS cohabitation
+### Note about the JS predecessor (retired in W15)
 
-The pre-rewrite Node.js package `@ctxr/fsm` continues to live at [`legacy-js/`](legacy-js/) and publishes to npm independently via `legacy-js/.github/workflows/publish.yml`. This Python `0.1.0` release does **not** change, deprecate, or replace the JS package — existing npm consumers (notably `skill-code-review`) keep working unchanged. Migrating JS consumers onto `ctxr-fsm` is tracked separately and is not a precondition for adopting either side.
+The pre-rewrite Node.js package `@ctxr/fsm` cohabited this repo under `legacy-js/` for W0–W14 so existing JS consumers (notably `skill-code-review` v2) kept working during the Python rewrite. W15 retires that subtree: the pre-deletion state is preserved at the git tag [`legacy-js-archive`](https://github.com/ctxr-dev/fsm/releases/tag/legacy-js-archive), npm consumers continue to resolve from the existing npmjs.com releases unchanged, and `skill-code-review` v3 (the Python port) replaces v2.
 
 ### Known issues / future
 

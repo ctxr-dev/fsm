@@ -360,9 +360,9 @@ def _detect_clients(target: Path, client: str) -> list[_ClientDetection]:
             _detect_codex(target),
             _detect_cursor(target),
         ]
-        detected = [d for d in detections if d.detected]
-        if detected:
-            return detected
+        live = [d for d in detections if d.detected]
+        if live:
+            return live
         # BLOCKER-3 (W14k): in a COLD project (no CLAUDE.md, no
         # AGENTS.md, no .cursor/rules) every detector returns False
         # and ``auto`` would historically be a no-op — leaving the

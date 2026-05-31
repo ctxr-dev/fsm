@@ -1,8 +1,9 @@
 """Structured error envelopes returned by MCP tools.
 
-The legacy JavaScript MCP server in ``legacy-js/`` returns errors as
+The predecessor JavaScript MCP server (archived at the
+``legacy-js-archive`` git tag) returned errors as
 ``{"error": "<snake_case_code>", ...}`` objects rather than throwing
-JSON-RPC errors so clients can handle them as first-class tool
+JSON-RPC errors so clients could handle them as first-class tool
 results. We keep the same contract for the Python rewrite so any
 existing client that already speaks the legacy shape works unchanged
 against the new server.

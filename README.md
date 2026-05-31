@@ -63,10 +63,6 @@ open http://localhost:5173                            # browse the run dashboard
 
 A bare LLM loop is a probability cloud over tool calls; an FSM is a contract. Each state declares what tools the worker may call, what shape its output must take, what predicate decides the next state, and whether an adversarial verifier panel has to second the result. The substrate then enforces that contract with a two-phase commit, a cosignature over the brief + inputs + outputs, a spec-hash lock that pins a running workflow to its declared shape, and a background drift detector that quarantines runs whose accumulated misbehaviour crosses a configurable threshold. The result is a workflow you can replay, audit, and resume — not just one you can rerun and hope. Full layer-by-layer reference: [docs/enforcement.md](docs/enforcement.md).
 
-## What's at `legacy-js/`
-
-The pre-rewrite Node.js package `@ctxr/fsm` lives at [`legacy-js/`](legacy-js/) and still publishes to npm from there via its own workflow. It cohabits this repository so existing JS consumers (notably `skill-code-review`) keep working unchanged while the Python rewrite stabilises; migrating JS consumers onto `ctxr-fsm` is tracked separately and is not a precondition for using either side.
-
 ## Development
 
 ### One-time setup
@@ -191,8 +187,10 @@ This blocks on stdio; pair it with a Claude Code (or other MCP client) session c
 
 ## License
 
-MIT for both roots. See [`LICENSE`](LICENSE) (Python) and [`legacy-js/LICENSE`](legacy-js/LICENSE) (JS).
+MIT. See [`LICENSE`](LICENSE).
 
 ## Contributors
 
-Maintained by [ctxr-dev](https://github.com/ctxr-dev). Python work lands under `ctxr/fsm/` on per-workstream branches; JS bug fixes land under `legacy-js/`. Cross-cutting changes (the cohabitation itself, the top-level README, this CHANGELOG) live at this root. PRs welcome — read [docs/architecture.md](docs/architecture.md) first so the layer boundaries stay clean.
+Maintained by [ctxr-dev](https://github.com/ctxr-dev). Work lands under `ctxr/fsm/` on per-workstream branches. PRs welcome — read [docs/architecture.md](docs/architecture.md) first so the layer boundaries stay clean.
+
+The pre-rewrite Node.js sources (`@ctxr/fsm`) were retired in W15 and live at the git tag [`legacy-js-archive`](https://github.com/ctxr-dev/fsm/releases/tag/legacy-js-archive); existing npm pins continue to resolve from the published npmjs.com releases, but no new JS releases are planned.

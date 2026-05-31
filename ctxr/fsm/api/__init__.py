@@ -31,9 +31,8 @@ What this layer is NOT
   package; the API is a plain ASGI app sharing the same SQLite
   substrate. Both can run side-by-side against the same database file
   (SQLite's WAL journal handles concurrent readers).
-* It is not the UI. The UI lives in ``fsm/legacy-js/`` (frozen) and
-  the eventual ``fsm/ui/`` (W6+). This package serves the HTTP that
-  the UI consumes.
+* It is not the UI. The UI lives in ``fsm/ui/`` (W6); this package
+  serves the HTTP that the UI consumes.
 
 CORS
 ----

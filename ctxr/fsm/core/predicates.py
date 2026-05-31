@@ -1,7 +1,8 @@
 """Sandboxed predicate DSL for FSM transition guards.
 
 This module ports the deterministic predicate evaluator originally written
-in JavaScript (``fsm/legacy-js/scripts/lib/fsm-predicates.mjs``) to Python.
+in JavaScript (the predecessor ``@ctxr/fsm`` Node package, archived at the
+``legacy-js-archive`` git tag) to Python.
 The DSL is intentionally tiny and side-effect-free; no ``eval``, ``exec`` or
 ``compile`` is used anywhere. Parsing and evaluation are implemented with a
 hand-written tokenizer plus a recursive-descent parser.
