@@ -21,7 +21,11 @@ import type { ComponentType } from 'preact';
 
 import { Runs } from './runs';
 import { RunDetailRoute } from './runDetail';
+import { RunCompareRoute } from './runCompare';
 import { SpecsRoute } from './specs';
+import { TopologyRoute } from './topology';
+import { DriftRoute } from './drift';
+import { JournalRoute } from './journal';
 import { ConsumersRoute } from './consumers';
 import { SettingsRoute } from './settings';
 
@@ -69,6 +73,13 @@ export const ROUTES: readonly RouteDef[] = [
     description: 'State tree, events, journal, drift for one run.',
   },
   {
+    path: '/runs/:id/compare/:otherId',
+    component: RunCompareRoute,
+    label: 'Run comparison',
+    navGroup: null,
+    description: 'Side-by-side comparison of two runs.',
+  },
+  {
     path: '/specs',
     component: SpecsRoute,
     label: 'Specs',
@@ -77,12 +88,38 @@ export const ROUTES: readonly RouteDef[] = [
     description: 'Registered FSM specs and version lineage.',
   },
   {
-    path: '/consumers',
-    component: ConsumersRoute,
+    path: '/topology',
+    component: TopologyRoute,
     label: 'Topology',
     navGroup: 'primary',
     shortcut: 'g t',
     description: 'Event-bus producers, consumers, and SSE health.',
+  },
+  // /consumers is the pre-W18f path; kept registered as a non-nav
+  // entry so any bookmarks still resolve to the same list-view
+  // component until users naturally migrate to /topology.
+  {
+    path: '/consumers',
+    component: ConsumersRoute,
+    label: 'Consumers (legacy)',
+    navGroup: null,
+    description: 'Deprecated; see /topology.',
+  },
+  {
+    path: '/drift',
+    component: DriftRoute,
+    label: 'Drift',
+    navGroup: 'primary',
+    shortcut: 'g d',
+    description: 'Runs ranked by accumulated drift score.',
+  },
+  {
+    path: '/journal',
+    component: JournalRoute,
+    label: 'Journal',
+    navGroup: 'admin',
+    shortcut: 'g j',
+    description: 'Recover pending journal transactions across runs.',
   },
   {
     path: '/settings',
