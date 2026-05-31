@@ -67,6 +67,99 @@ A bare LLM loop is a probability cloud over tool calls; an FSM is a contract. Ea
 
 The pre-rewrite Node.js package `@ctxr/fsm` lives at [`legacy-js/`](legacy-js/) and still publishes to npm from there via its own workflow. It cohabits this repository so existing JS consumers (notably `skill-code-review`) keep working unchanged while the Python rewrite stabilises; migrating JS consumers onto `ctxr-fsm` is tracked separately and is not a precondition for using either side.
 
+## Development
+
+### One-time setup
+
+```bash
+git clone https://github.com/ctxr-dev/fsm.git
+cd fsm
+
+# Python side
+uv sync --all-extras --dev
+
+# UI side
+cd ui && npm ci && cd ..
+```
+
+Requires Python 3.12+, Node 22+, and uv (`curl -LsSf https://astral.sh/uv/install.sh | sh`).
+
+### Run the test suites
+
+```bash
+# Python: unit + integration + CLI + MCP + API + lifecycle + enforcement + examples
+uv run pytest tests/
+
+# Python static analysis
+uv run ruff check ctxr/ tests/ examples/
+uv run mypy ctxr/fsm/
+
+# Frontend
+cd ui && npm test && npm run build && cd ..
+```
+
+Expected: `456 passed` (Python) + `17 passed` (UI) on a clean checkout.
+
+### Run an example
+
+```bash
+uv run python examples/plan_implement_qa_fix.py
+uv run python examples/code_review_pipeline.py
+uv run python examples/research_with_retries.py
+```
+
+Each example uses a tmpdir for the run database, drives the FSM through simulated worker outputs, and prints the resulting state tree + event log. See docs/examples-tour.md for what each one teaches.
+
+### Boot the dev supervisor
+
+```bash
+# In one terminal:
+uv run ctxr-fsm init                  # creates .ctxr-fsm/fsm.db + applies migrations + patches CLAUDE.md/AGENTS.md
+uv run ctxr-fsm serve --mode dev      # supervisor boots MCP (HTTP-SSE) + FastAPI + Vite UI
+
+# In another terminal:
+uv run ctxr-fsm doctor                # diagnostic report
+uv run ctxr-fsm runs ls               # empty until you start a run
+uv run ctxr-fsm spec register examples.plan_implement_qa_fix:spec
+```
+
+The supervisor:
+- assigns ports automatically (and remembers them in `.ctxr-fsm/ports.json`)
+- writes PID files under `.ctxr-fsm/pids/`
+- watches `ctxr/fsm/` for file changes and gracefully drains + respawns MCP + API
+- never spawns a second copy if you re-invoke from the same project root
+
+Browse the UI at `http://localhost:5173`, the FastAPI docs at `http://localhost:<api_port>/docs` (port from `ctxr-fsm doctor`), and connect an MCP client to `http://localhost:<mcp_port>/sse`.
+
+### Run the MCP server standalone (for Claude Code stdio integration)
+
+```bash
+uv run ctxr-fsm mcp --db ./.ctxr-fsm/fsm.db
+```
+
+This blocks on stdio; pair it with a Claude Code (or other MCP client) session configured to launch the binary on demand. See docs/mcp-tools.md.
+
+### Contribution loop
+
+1. Branch off the latest unmerged tip (workstream chain). Use a `<scope>/<short-name>` style branch name.
+2. Make changes inside one of `ctxr/fsm/{core,sqlite,cli,mcp,api,memory}`, `ui/`, `examples/`, or `docs/`. Don't cross layer boundaries (see docs/architecture.md for the dependency rule).
+3. Run the full verify gauntlet locally (pytest + ruff + mypy + ui).
+4. Commit + push + open a PR against the previous workstream branch (or main if it's a follow-on).
+5. CI runs `python-ci.yml` on the PR (lint + test matrix on Python 3.12 + 3.13 + UI build).
+6. After review + green CI, the human gate is: merge.
+7. Publishes to PyPI are MANUAL via `python-publish.yml` workflow_dispatch (see docs/operating.md).
+
+### Useful one-liners
+
+| What | How |
+|---|---|
+| Watch tests rerun on file change | `uv run pytest tests/ -q --looponfail` (needs pytest-xdist) |
+| UI dev mode (HMR) | `cd ui && npm run dev` |
+| Show all CLI commands | `uv run ctxr-fsm --help` |
+| Inspect a run | `uv run ctxr-fsm run show <run-id>` |
+| Find drift signals | `uv run ctxr-fsm doctor` then `curl http://localhost:<api>/api/v1/admin/drift_signals` |
+| Clean local state | `rm -rf .ctxr-fsm/ .venv/ ui/node_modules/ ui/dist/` |
+
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — layered design, dependency rule, service topology
@@ -83,7 +176,6 @@ The pre-rewrite Node.js package `@ctxr/fsm` lives at [`legacy-js/`](legacy-js/) 
 
 - PyPI: [`ctxr-fsm`](https://pypi.org/project/ctxr-fsm/) (publishes from this repo — manual `workflow_dispatch` only)
 - GitHub: [ctxr-dev/fsm](https://github.com/ctxr-dev/fsm) — issues, PRs, CI
-- Plan: `/Users/developer/.claude/plans/how-it-fits-toasty-gray.md` — single source of truth for workstreams (W0–W12), locked decisions, verification gates
 
 ## License
 

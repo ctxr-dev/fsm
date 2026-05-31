@@ -2,8 +2,6 @@
 
 `ctxr-fsm` is a workstation-scale finite-state-machine runtime for agent orchestration. It is a Python 3.12+ library plus a small set of long-running services (MCP server, FastAPI server, UI dev server, supervisor) that share one SQLite database per project. Every higher layer depends only on the layers below it; nothing in the core imports SQLite, HTTP, MCP, or the UI.
 
-The full workstream plan, including locked decisions and verification gates, lives at `/Users/developer/.claude/plans/how-it-fits-toasty-gray.md`.
-
 ## Layered overview
 
 ```
