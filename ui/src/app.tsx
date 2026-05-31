@@ -58,6 +58,11 @@ import {
 } from './lib/store';
 import { ROUTES } from './routes';
 import { SheetHost } from './chrome/SheetHost';
+import { CommandPalette } from './chrome/CommandPalette';
+import { KeyboardHelp } from './chrome/KeyboardHelp';
+import { NotificationCentre } from './chrome/NotificationCentre';
+import { ThemeApplier } from './chrome/ThemeApplier';
+import { TopBarExtras } from './chrome/TopBarExtras';
 
 // ---------------------------------------------------------------------------
 // SSE wiring
@@ -275,6 +280,9 @@ function TopBar(): JSX.Element {
           {label}
         </Pill>
       </div>
+      <div class="ml-3 pl-3 border-l border-slate-200 dark:border-slate-700">
+        <TopBarExtras />
+      </div>
     </header>
   );
 }
@@ -351,6 +359,10 @@ function Shell(): JSX.Element {
       </div>
       <ToastContainer />
       <SheetHost />
+      <CommandPalette />
+      <KeyboardHelp />
+      <NotificationCentre />
+      <ThemeApplier />
     </div>
   );
 }
