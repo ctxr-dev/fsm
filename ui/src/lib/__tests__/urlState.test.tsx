@@ -60,12 +60,13 @@ describe('codecs', () => {
 });
 
 describe('buildSchema', () => {
-  interface S {
+  type S = {
     tab: string;
     offset: number;
     flag: boolean;
     kinds?: string[];
-  }
+    [k: string]: unknown;
+  };
   const initial: S = { tab: 'a', offset: 0, flag: false };
   const schema = buildSchema<S>(initial, {
     tab: codecs.string,
@@ -115,10 +116,11 @@ describe('useUrlState', () => {
     window.history.replaceState(null, '', '/');
   });
 
-  interface S {
+  type S = {
     name: string;
     n: number;
-  }
+    [k: string]: unknown;
+  };
   const initial: S = { name: '', n: 0 };
   const schema = buildSchema<S>(initial, {
     name: codecs.string,
