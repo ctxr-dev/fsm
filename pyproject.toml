@@ -207,4 +207,5 @@ addopts = "-ra -q --strict-markers"
 testpaths = ["tests"]
 markers = [
   "e2e: end-to-end UI tests (Playwright). Require the 'e2e' dependency group and 'playwright install chromium'. Skipped automatically when those are not present.",
+  "keeps_rich_color: opt this test out of the W18a conftest fixture that sets NO_COLOR=1 / COLUMNS=200. Use it when the test deliberately asserts on Rich ANSI SGR output (e.g. the render-table colour tests).",
 ]

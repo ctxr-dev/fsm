@@ -27,6 +27,7 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
+import pytest
 from rich.console import Console
 
 from ctxr.fsm.cli._render import (
@@ -254,6 +255,7 @@ def test_render_subsystem_table_handles_empty_subsystems(tmp_path: Path) -> None
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.keeps_rich_color
 def test_render_subsystem_table_status_colours(tmp_path: Path) -> None:
     """Each closed-vocabulary status maps to its expected Rich colour.
 

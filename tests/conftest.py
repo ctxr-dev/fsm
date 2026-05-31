@@ -24,23 +24,42 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _wide_terminal_for_rich_assertions(
+def _wide_plain_terminal_for_rich_assertions(
+    request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pin COLUMNS=200 so Rich does not wrap flag names in CI.
+    """Pin a wide, colour-less terminal so Rich emits stable plain text.
 
-    Several CLI tests assert ``'--mode' in result.stdout`` against
-    Typer help output. Typer renders help through Rich, which honours
-    ``COLUMNS``: on a developer laptop terminal that is typically
-    >120 cols and the long flag tokens land on a single line; on
-    GitHub Actions ``COLUMNS`` is unset and Rich falls back to ~80
-    cols, where a long-named flag inside a panel can wrap and the
-    substring check fails. The dashboard's CLI surface is the same
-    in both environments; the test's assertion is what's brittle.
-    Forcing a wide terminal in the test environment removes the
-    environment-dependence without touching the production CLI.
+    Several CLI tests assert ``'--mode' in result.stdout`` against Typer
+    help output. Typer renders help through Rich, which on CI:
+
+      1. Defaults to ~80 cols (no ``COLUMNS``), wrapping long flag tokens.
+      2. Emits ANSI escape codes (``\\x1b[1m--\\x1b[0m\\x1b[36mmode\\x1b[0m``)
+         that split flag tokens across colour spans, so a literal
+         ``'--mode'`` substring match against the captured stdout fails
+         even though the rendered text contains the flag.
+
+    Both behaviours are environment-dependent (a developer's iTerm has
+    wide columns + still emits ANSI under CliRunner, so locally the
+    assertions pass by luck). The dashboard's CLI surface is identical
+    in both environments; the tests' substring checks are what's
+    brittle. The env knobs:
+
+      - ``COLUMNS=200`` widens the panel so flag tokens fit on one line.
+      - ``NO_COLOR=1`` (https://no-color.org) tells Rich to skip ANSI
+        styling, so the captured stdout is plain ASCII.
+      - ``TERM=dumb`` belt-and-braces for tools that ignore NO_COLOR.
+
+    Opt-out: tests that DELIBERATELY exercise Rich's colour SGR output
+    (e.g. ``tests/unit/cli/test_render.py``) can opt out with
+    ``@pytest.mark.keeps_rich_color``, after which Rich's own
+    ``force_terminal=True`` arg fully drives the colour decision.
     """
+    if request.node.get_closest_marker("keeps_rich_color") is not None:
+        return
     monkeypatch.setenv("COLUMNS", "200")
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("TERM", "dumb")
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -68,7 +87,7 @@ def pytest_collection_modifyitems(
     importable (it ships in the ``e2e`` dependency group).
     """
     try:
-        import playwright  # noqa: F401 -- presence check only
+        import playwright  # type: ignore[import-not-found,unused-ignore]  # noqa: F401
     except ImportError:
         playwright_available = False
     else:
