@@ -17,6 +17,15 @@ export default defineConfig({
   },
   test: {
     environment: 'jsdom',
+    // jsdom defaults to about:blank, which produces an "opaque origin"
+    // and rejects localStorage / sessionStorage access with SecurityError.
+    // Pin a real URL so the store-persistence tests + urlState tests
+    // exercise the real browser surface.
+    environmentOptions: {
+      jsdom: {
+        url: 'http://localhost/',
+      },
+    },
     setupFiles: ['./src/test/setup.ts'],
     globals: true,
   },

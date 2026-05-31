@@ -25,10 +25,9 @@ import os
 from logging.config import fileConfig
 from pathlib import Path
 
+from alembic import context
 from sqlalchemy import pool
 from sqlmodel import SQLModel
-
-from alembic import context
 
 # Importing these modules has the side effect of registering every table on
 # ``SQLModel.metadata`` (the shared registry SQLModel inherits from

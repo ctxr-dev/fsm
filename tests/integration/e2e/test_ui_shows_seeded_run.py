@@ -26,7 +26,6 @@ from ctxr.fsm.sqlite.project import Project
 from ctxr.fsm.testing import drive_run_to_completion
 from tests.integration.e2e.conftest import LiveProject
 
-
 _SEED_SPEC_ID = "e2e-baseline-fsm"
 
 

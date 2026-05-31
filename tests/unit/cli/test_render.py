@@ -27,6 +27,7 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
+import pytest
 from rich.console import Console
 
 from ctxr.fsm.cli._render import (
@@ -164,9 +165,9 @@ def test_print_subsystem_table_emits_osc8_hyperlinks(tmp_path: Path) -> None:
         _full_active_mcp(), project_root=tmp_path, force_terminal=True
     )
     osc8_start = "\x1b]8;"
-    # 4 URL lines × 2 OSC 8 sequences per line (start + close) = 8 occurrences.
+    # 4 URL lines x 2 OSC 8 sequences per line (start + close) = 8 occurrences.
     assert output.count(osc8_start) == 8, (
-        f"expected 8 OSC 8 sequences (4 URLs × open+close), got "
+        f"expected 8 OSC 8 sequences (4 URLs x open+close), got "
         f"{output.count(osc8_start)} in:\n{output!r}"
     )
 
@@ -254,6 +255,7 @@ def test_render_subsystem_table_handles_empty_subsystems(tmp_path: Path) -> None
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.keeps_rich_color
 def test_render_subsystem_table_status_colours(tmp_path: Path) -> None:
     """Each closed-vocabulary status maps to its expected Rich colour.
 

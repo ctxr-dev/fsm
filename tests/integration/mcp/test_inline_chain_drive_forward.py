@@ -15,20 +15,16 @@ records that it ran into a process-local list so the test can assert
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from ctxr.fsm.core import (
     FsmSpec,
     InlineContext,
-    InlineHandlerRegistry,
     get_default_registry,
 )
 from ctxr.fsm.core.models import (
-    EngineAdvanceKind,
     EventKind,
     InlineFaultReason,
-    StateKind,
 )
 from ctxr.fsm.mcp._state import reset_project, set_project
 from ctxr.fsm.mcp.tools_runs import (
@@ -40,7 +36,6 @@ from ctxr.fsm.mcp.tools_runs import (
     fsm_start_run,
 )
 from ctxr.fsm.sqlite.project import Project
-
 
 _HANDLER_INVOCATIONS: list[InlineContext] = []
 """Module-global recording slot. Each call to the inline handler in this

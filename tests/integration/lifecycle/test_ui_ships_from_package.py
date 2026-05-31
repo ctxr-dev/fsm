@@ -20,6 +20,7 @@ project's.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
@@ -27,9 +28,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-
-import pytest
-
 
 _BOOT_WAIT_SECONDS: float = 35.0
 _POLL_INTERVAL_SECONDS: float = 0.2
@@ -56,10 +54,8 @@ def _kill_pid_quietly(pid: int) -> None:
         except ProcessLookupError:
             return
         time.sleep(_POLL_INTERVAL_SECONDS)
-    try:
+    with contextlib.suppress(ProcessLookupError):
         os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
 
 
 def test_consumer_project_gets_ui_subsystem_from_package_source(
