@@ -89,6 +89,10 @@ const NODE_KIND_CLASSES: Record<FlowNodeKind, string> = {
 
 function FsmNode({ data, selected }: NodeProps<Node<FlowNodeData>>): JSX.Element {
   const kind = data.kind;
+  // The pixel dimensions are constants matched against the dagre
+  // layout numbers; staying inline keeps the two values in literal
+  // sync. Suppress the no-inline-styles lint for this single case.
+  /* eslint-disable-next-line react/forbid-dom-props -- xyflow nodes need fixed pixel dimensions matched to dagre layout */
   return (
     <div
       class={[
@@ -96,7 +100,7 @@ function FsmNode({ data, selected }: NodeProps<Node<FlowNodeData>>): JSX.Element
         NODE_KIND_CLASSES[kind],
         selected ? 'ring-2 ring-emerald-400 ring-offset-1' : '',
       ].join(' ')}
-      style={{ width: NODE_WIDTH, minHeight: NODE_HEIGHT }}
+      style={{ width: `${NODE_WIDTH}px`, minHeight: `${NODE_HEIGHT}px` }}
     >
       <div class="flex items-center justify-between gap-1">
         <span class="font-semibold truncate" title={data.label}>
@@ -186,10 +190,13 @@ export function FlowGraph({
     );
   }
 
+  // min-h-[320px] keeps the graph readable when the parent container
+  // doesn't supply an explicit height. h-full + w-full make sure
+  // xyflow's renderer has a measurable box when the parent DOES set
+  // a height (e.g. the Specs route's h-[60vh] tab panel).
   return (
     <div
-      class={['flow-graph relative', className ?? ''].join(' ')}
-      style={{ minHeight: 320 }}
+      class={['flow-graph relative h-full w-full min-h-[320px]', className ?? ''].join(' ')}
     >
       <ReactFlow
         nodes={decoratedNodes}

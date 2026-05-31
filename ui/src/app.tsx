@@ -139,11 +139,24 @@ interface NavLinkDef {
   matchPrefix: string;
 }
 
+// W18 sidebar nav is derived from the ROUTES registry so adding a
+// new route (W18f Topology / W18g Drift / W18h Journal) automatically
+// surfaces here without sidebar-side edits. Static fallbacks for the
+// label come from each registry entry; the matchPrefix is the route's
+// own path (or its first /-segment for nested routes).
+import { primaryRoutes, adminRoutes } from './routes';
+
 const NAV_LINKS: readonly NavLinkDef[] = [
-  { href: '/runs', label: 'Runs', matchPrefix: '/runs' },
-  { href: '/specs', label: 'Specs', matchPrefix: '/specs' },
-  { href: '/consumers', label: 'Consumers', matchPrefix: '/consumers' },
-  { href: '/settings', label: 'Settings', matchPrefix: '/settings' },
+  ...primaryRoutes().map((r) => ({
+    href: r.path,
+    label: r.label,
+    matchPrefix: r.path === '/' ? '/runs' : r.path,
+  })),
+  ...adminRoutes().map((r) => ({
+    href: r.path,
+    label: r.label,
+    matchPrefix: r.path,
+  })),
 ];
 
 /** Highlight a nav link when the current path lives under its prefix. */
