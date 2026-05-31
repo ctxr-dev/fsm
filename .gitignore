@@ -30,6 +30,9 @@ ui/dist/
 ui/.vite/
 ui/coverage/
 
+# Vite Vue / Vitest spawn-helper occasionally creates a root-level cache
+node_modules/
+
 # Editor / IDE
 .idea/
 .vscode/
