@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
 from ctxr.fsm.core import FsmSpec
 from ctxr.fsm.sqlite.project import Project
 from ctxr.fsm.sqlite.repos_core import SpecsRepo

@@ -14,6 +14,7 @@ playwright install chromium" instead of as a silent green.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -140,10 +141,8 @@ def _kill_supervisor(project_root: Path) -> None:
                 break
         with pid_file.open("a"):
             pass
-        try:
+        with contextlib.suppress(OSError):
             pid_file.unlink()
-        except OSError:
-            pass
 
 
 # ---------------------------------------------------------------------------

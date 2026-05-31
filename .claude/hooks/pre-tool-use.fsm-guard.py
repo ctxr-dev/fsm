@@ -57,7 +57,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 # Name of the marker file written by ``write_active_run_marker``.
 # Duplicated (rather than imported from ctxr) so a consumer project
 # can drop this hook in place without taking a Python dependency on
