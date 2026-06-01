@@ -8,9 +8,10 @@
  * lives in the page-level e2e battery (W18k) where a real browser can
  * exercise it; here we assert our wrappers exist and dispatch.
  *
- * The theme-switch tests (last describe block) mock @uiw/react-json-view
- * so we can capture the `style` prop our wrapper passes in (the W20
- * fix) without depending on the library's own rendering.
+ * Theme-switch coverage for the W20 useIsDark() hook lives in the
+ * sibling __tests__/JsonViewerTheme.test.tsx (separate file because
+ * vi.mock is hoisted, and the rest of this suite needs the real
+ * library — mixing both in one file makes every test mock-affected).
  */
 
 import { afterEach, describe, expect, test, vi } from 'vitest';

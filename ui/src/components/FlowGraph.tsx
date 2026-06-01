@@ -52,7 +52,9 @@ export interface FlowNodeData extends Record<string, unknown> {
 export interface FlowGraphProps {
   nodes: readonly Node<FlowNodeData>[];
   edges: readonly Edge[];
-  /** When true (default), runs a dagre layered layout if nodes lack positions. */
+  /** When true (default), runs a dagre layered layout that OVERWRITES any
+   * per-node position. Pass `false` if the caller has already assigned
+   * positions (e.g. a saved manual layout) and wants them preserved. */
   autoLayout?: boolean;
   /** Layout direction. Default 'TB' (top to bottom) — natural reading for
    * FSMs, and fits a viewport-bounded panel better than LR for long chains. */
