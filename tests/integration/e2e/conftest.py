@@ -199,3 +199,97 @@ def live_project(tmp_path_factory: pytest.TempPathFactory) -> Generator[LiveProj
     finally:
         _kill_supervisor(project_root)
         shutil.rmtree(root_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# W23a: Universal "no console errors" autouse fixture
+# ---------------------------------------------------------------------------
+
+
+# URL prefixes / message patterns that legitimately log to console in dev mode
+# and don't indicate a real bug. Kept TIGHT to avoid masking actual API
+# failures — a broad "Failed to load resource" wildcard would mask the
+# /specs TypeError that prompted W23a.
+_IGNORED_CONSOLE_PREFIXES: tuple[str, ...] = (
+    # Vite HMR client noise when the dev server is reloading or briefly down.
+    "[vite] failed to connect to websocket",
+    # /favicon.ico 404 is browser-default and not the API's concern.
+    "Failed to load resource: the server responded with a status of 404 (Not Found) @ http://",
+)
+
+
+def _is_ignored_console_message(text: str, url: str | None) -> bool:
+    """Return True for known-acceptable console errors in dev mode.
+
+    Any error not matched here fails the autouse audit. The list is
+    intentionally narrow so a real regression cannot hide behind a
+    permissive wildcard.
+    """
+    if any(text.startswith(p) for p in _IGNORED_CONSOLE_PREFIXES):
+        return True
+    # favicon misses in particular surface as ``Failed to load resource``
+    # with the resource URL in a separate field on some Playwright versions.
+    return url is not None and url.endswith("/favicon.ico")
+
+
+@pytest.fixture(autouse=True)
+def _console_audit(request: pytest.FixtureRequest) -> Generator[None]:
+    """Fail any e2e test whose page logged a console.error or threw.
+
+    W23a-deep mandate: the /specs TypeError that prompted this wave was
+    a console error the existing tests didn't catch. From now on every
+    e2e test that requests the ``page`` fixture also asserts that the
+    page produced ZERO uncaught errors during the test body. Opt out
+    per-test with ``@pytest.mark.allow_console_errors`` (reserved for
+    tests deliberately exercising a UI error path).
+
+    The fixture is autouse so collection-time inclusion is implicit;
+    tests that DO NOT request ``page`` (no Playwright surface) are
+    no-ops because the fixture only activates when ``page`` is in the
+    request's resolved fixturenames.
+    """
+    if request.node.get_closest_marker("allow_console_errors") is not None:
+        yield
+        return
+    # The ``page`` fixture is lazy — if a test never requests it we
+    # skip the wiring entirely. Detection: look up the fixture name in
+    # the test's resolved fixture set.
+    if "page" not in request.fixturenames:
+        yield
+        return
+
+    # Pull the Playwright page fixture by name (the Playwright pytest
+    # integration registers it as a normal pytest fixture).
+    page = request.getfixturevalue("page")
+
+    console_errors: list[str] = []
+    page_errors: list[str] = []
+
+    def _on_console(msg) -> None:
+        if msg.type != "error":
+            return
+        url = None
+        try:
+            url = msg.location.get("url") if msg.location else None
+        except Exception:
+            url = None
+        if _is_ignored_console_message(msg.text, url):
+            return
+        console_errors.append(msg.text)
+
+    def _on_pageerror(err) -> None:
+        page_errors.append(repr(err))
+
+    page.on("console", _on_console)
+    page.on("pageerror", _on_pageerror)
+
+    yield
+
+    diag_lines: list[str] = []
+    for e in console_errors:
+        diag_lines.append(f"  console.error: {e}")
+    for e in page_errors:
+        diag_lines.append(f"  pageerror:     {e}")
+    assert not console_errors and not page_errors, (
+        "JS console / uncaught errors during e2e test:\n" + "\n".join(diag_lines)
+    )
