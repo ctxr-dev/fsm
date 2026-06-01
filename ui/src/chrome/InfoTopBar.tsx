@@ -59,10 +59,13 @@ import { useEffect, useMemo, useState } from 'preact/hooks';
 
 import { Pill, type PillVariant } from '../components';
 import { connectionPillProps } from '../lib/connectionPill';
-import { connectionState } from '../lib/store';
+import { projectNameFromRoot } from '../lib/projectName';
 import {
-  api,
-  ApiError,
+  connectionState,
+  projectMetadata,
+  projectMetadataError,
+} from '../lib/store';
+import {
   type ProjectMetadata,
   type SubsystemInfo,
 } from '../lib/api';
@@ -187,36 +190,15 @@ function buildViews(metadata: ProjectMetadata): SubsystemView[] {
 }
 
 export function InfoTopBar(): JSX.Element {
-  const [metadata, setMetadata] = useState<ProjectMetadata | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  // W23c: read from the hoisted store signal that ``wireProjectMetadata()``
+  // populates at boot. Pre-W23c this component owned its own fetch +
+  // focus-refetch state machine; now Settings, PageHeader, and every
+  // future consumer share the same value via the same signal. Local
+  // probe state stays here because health-probe results are presentation,
+  // not application metadata.
+  const metadata = projectMetadata.value;
+  const error = projectMetadataError.value;
   const [probes, setProbes] = useState<Record<string, ProbeStatus>>({});
-
-  // Initial fetch + re-fetch on focus.
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const m = await api.getCurrentProject();
-        if (cancelled) return;
-        setMetadata(m);
-        setError(null);
-      } catch (err) {
-        if (cancelled) return;
-        setError(err instanceof ApiError ? err.message : String(err));
-      }
-    };
-    load();
-    const onFocus = () => { void load(); };
-    if (typeof window !== 'undefined') {
-      window.addEventListener('focus', onFocus);
-    }
-    return () => {
-      cancelled = true;
-      if (typeof window !== 'undefined') {
-        window.removeEventListener('focus', onFocus);
-      }
-    };
-  }, []);
 
   // Health probes whenever the metadata refreshes. Issued SERIALLY
   // (one ``await`` per iteration) — the canonical subsystem count is
@@ -257,6 +239,16 @@ export function InfoTopBar(): JSX.Element {
 
   const connection = connectionPillProps(connectionState.value);
   const projectRoot = condenseHome(metadata?.project_root);
+  // W23c: derive the human-readable project NAME from the last path
+  // segment of project_root (e.g. /Users/dev/work/dummy-fsm-test ->
+  // "dummy-fsm-test"). Fall back to project_slug for in-memory
+  // backends that have no filesystem path. This is the dominant
+  // identifier the user wanted everywhere; ctxr-fsm is the tool
+  // wordmark, the project name tells you WHICH project you're
+  // looking at.
+  const projectName = metadata
+    ? (projectNameFromRoot(metadata.project_root) ?? metadata.project_slug)
+    : null;
 
   return (
     <header
@@ -268,12 +260,12 @@ export function InfoTopBar(): JSX.Element {
         'flex flex-wrap items-center gap-x-6 gap-y-2 px-6 py-2'
       }
     >
-      {/* Band 1: branding. The two-line treatment communicates "what
-          tool is this" at first glance — the wordmark is the slug,
-          the tagline names the substrate in plain English so a
-          newcomer who lands on the dashboard isn't left guessing. */}
+      {/* Band 1: branding. Demoted to secondary weight post-W23c so
+          the project name (Band 2) dominates the header. The tagline
+          stays so a first-time visitor still understands what tool
+          this is. */}
       <div class="flex flex-col leading-tight">
-        <span class="text-base font-semibold tracking-tight text-slate-900 dark:text-slate-100">
+        <span class="text-sm font-medium tracking-tight text-slate-700 dark:text-slate-300">
           ctxr-fsm
         </span>
         <span class="text-[10px] uppercase tracking-wider text-slate-500 dark:text-slate-400">
@@ -281,21 +273,24 @@ export function InfoTopBar(): JSX.Element {
         </span>
       </div>
 
-      {/* Band 2: project. ``project_slug`` answers "which project?";
-          the home-condensed root answers "where on disk?". When the
-          API is older / the DB is in-memory, ``project_slug`` and
-          ``project_root`` are null — render an explicit "no project
-          bound" label so the operator doesn't read "blank" as a bug. */}
+      {/* Band 2: project. W23c puts the project NAME (last segment of
+          project_root) front and centre — it's the dominant identifier
+          on every page. Path on a second line below, condensed via
+          $HOME / macOS / Linux heuristics so screenshots don't leak
+          the operator's username. Full absolute path on hover. When
+          the API is older / the DB is in-memory, project name + root
+          fall through to "no project bound" so the operator doesn't
+          read "blank" as a bug. */}
       {metadata ? (
         <div class="flex flex-col leading-tight min-w-0">
           <span
-            class="text-sm font-medium text-slate-900 dark:text-slate-100 truncate max-w-[24rem]"
-            title={metadata.project_slug ?? 'no project bound'}
+            class="text-xl md:text-2xl font-bold tracking-tight text-slate-900 dark:text-slate-100 truncate max-w-[20rem] md:max-w-[28rem]"
+            title={metadata.project_root ?? metadata.project_slug ?? 'no project bound'}
           >
-            {metadata.project_slug ?? <em class="text-slate-500 dark:text-slate-400">no project bound</em>}
+            {projectName ?? <em class="text-base font-medium text-slate-500 dark:text-slate-400">no project bound</em>}
           </span>
           <span
-            class="text-[10px] font-mono text-slate-500 dark:text-slate-400 truncate max-w-[24rem]"
+            class="text-[10px] font-mono text-slate-500 dark:text-slate-400 truncate max-w-[20rem] md:max-w-[28rem]"
             title={metadata.project_root ?? ''}
           >
             {projectRoot || <span class="italic">project root unknown</span>}

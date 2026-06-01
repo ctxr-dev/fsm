@@ -1,6 +1,6 @@
 import { render } from 'preact';
 import { App } from './app';
-import { loadStoredPrefs, wirePrefsPersistence } from './lib/store';
+import { loadStoredPrefs, wirePrefsPersistence, wireProjectMetadata } from './lib/store';
 
 // Hydrate persisted prefs (theme, density, urlStateEnabled, recents)
 // BEFORE first render so the initial paint reflects the user's last
@@ -8,6 +8,10 @@ import { loadStoredPrefs, wirePrefsPersistence } from './lib/store';
 // back to localStorage.
 loadStoredPrefs();
 wirePrefsPersistence();
+// W23c: fetch + memoise project metadata once at boot so every route
+// reads from the same signal instead of issuing redundant
+// /projects/current calls. Refreshes on window focus.
+wireProjectMetadata();
 
 const root = document.getElementById('app');
 if (!root) {
