@@ -23,7 +23,7 @@
  * onNodeClick.
  */
 
-import { useEffect, useMemo } from 'preact/hooks';
+import { useMemo } from 'preact/hooks';
 import type { JSX } from 'preact';
 import dagre from 'dagre';
 import {
@@ -42,7 +42,7 @@ import {
 import '@xyflow/react/dist/style.css';
 
 import { Tooltip } from './Tooltip';
-import { FsmEdge, setEdgeClickHandler } from './FsmEdge';
+import { FsmEdge, FsmEdgeClickContext } from './FsmEdge';
 
 export type FlowNodeKind = 'state' | 'worker' | 'terminal' | 'producer' | 'consumer' | 'inline';
 
@@ -143,8 +143,12 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
   return (
     <div
       class={[
-        'fsm-node relative rounded-md border-2 shadow-sm px-3 py-2',
-        'flex flex-col gap-0.5 overflow-hidden',
+        'fsm-node relative rounded-md border-2 shadow-sm px-4 py-3',
+        // justify-center centers the kind/label/sublabel block
+        // vertically within the (fixed) node height. gap-1 gives the
+        // three rows even breathing room instead of the previous
+        // gap-0.5 which clustered them too tightly at the top.
+        'flex flex-col gap-1 justify-center overflow-hidden',
         NODE_KIND_CLASSES[kind],
         selected ? 'ring-2 ring-emerald-400 ring-offset-1' : '',
       ].join(' ')}
@@ -361,16 +365,6 @@ export function FlowGraph({
   background = true,
   className,
 }: FlowGraphProps): JSX.Element {
-  // Publish the parent's onEdgeClick to the module-level registry so
-  // FsmEdge's label can dispatch through it. Clean up on unmount.
-  // Without this, clicking the rendered edge label (which lives in
-  // EdgeLabelRenderer's portal, not on the SVG path xyflow delegates
-  // from) silently no-ops.
-  useEffect(() => {
-    setEdgeClickHandler(onEdgeClick ?? null);
-    return () => setEdgeClickHandler(null);
-  }, [onEdgeClick]);
-
   const positioned = useMemo(() => {
     if (!autoLayout) {
       // Preserve caller-supplied positions but still tag every node
@@ -426,6 +420,7 @@ export function FlowGraph({
   // clip nodes at the viewport edges.
   const decoratedEdges = useMemo(() => decorateEdges(edges), [edges]);
   return (
+    <FsmEdgeClickContext.Provider value={onEdgeClick ?? null}>
     <div
       class={[
         'flow-graph relative h-full w-full min-h-[320px]',
@@ -500,6 +495,7 @@ export function FlowGraph({
         ) : null}
       </ReactFlow>
     </div>
+    </FsmEdgeClickContext.Provider>
   );
 }
 

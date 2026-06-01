@@ -268,6 +268,39 @@ describe('FlowGraph', () => {
     expect(edgeTypes.fsmEdge).toBeTypeOf('function');
   });
 
+  test('W21: FlowGraph dispatches edge clicks via Preact Context (not a module registry)', async () => {
+    // Render FsmEdge directly within a FlowGraph; the FsmEdge label
+    // click handler should read its dispatch target from the Context
+    // provider FlowGraph wraps around its subtree, not from any
+    // module-level singleton (which would leak across instances).
+    const { FsmEdgeClickContext, FsmEdge } = await import('../FsmEdge');
+    const handler = vi.fn();
+    const { getByText } = render(
+      <FsmEdgeClickContext.Provider value={handler}>
+        <FsmEdge
+          {...({
+            id: 'a-b',
+            sourceX: 0,
+            sourceY: 0,
+            targetX: 10,
+            targetY: 10,
+            sourcePosition: 'right',
+            targetPosition: 'left',
+            label: 'always',
+            data: { fullLabel: 'always', sourceId: 'a', targetId: 'b' },
+          } as unknown as Parameters<typeof FsmEdge>[0])}
+        />
+      </FsmEdgeClickContext.Provider>,
+    );
+    const label = getByText('always') as HTMLButtonElement;
+    label.click();
+    expect(handler).toHaveBeenCalledWith('a-b', expect.objectContaining({
+      fullLabel: 'always',
+      sourceId: 'a',
+      targetId: 'b',
+    }));
+  });
+
   test('W21: onEdgeClick receives edge.data as second arg', () => {
     const nodes: Node<FlowNodeData>[] = [
       { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },

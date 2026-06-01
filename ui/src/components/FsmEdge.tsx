@@ -23,10 +23,12 @@
  * Because clicking an HTML element inside EdgeLabelRenderer doesn't
  * fire xyflow's onEdgeClick (the SVG path is the only thing xyflow
  * delegates clicks from), we read the FlowGraph's onEdgeClick from a
- * module-level callback registry set by FlowGraph each render and
- * invoke it ourselves on label click.
+ * Preact Context (instance-scoped, so two FlowGraphs mounted at once
+ * dispatch to their own handlers — see W21 Copilot review #57).
  */
 
+import { createContext } from 'preact';
+import { useContext } from 'preact/hooks';
 import type { JSX } from 'preact';
 import {
   BaseEdge,
@@ -37,22 +39,17 @@ import {
 
 import { Tooltip } from './Tooltip';
 
-// Module-level callback registry. FlowGraph stamps the current
-// onEdgeClick handler here before each render; FsmEdge reads it on
-// click. This avoids a Preact Context for a single value, which would
-// otherwise require wrapping the whole ReactFlow subtree in a Provider.
-let edgeClickHandler: ((id: string, data?: Record<string, unknown>) => void) | null = null;
-
 /**
- * FlowGraph calls this once per render to publish the current
- * onEdgeClick callback so the rendered FsmEdge instances can dispatch
- * to it from their label click handler.
+ * Context that carries the parent FlowGraph's `onEdgeClick` handler
+ * down into every rendered FsmEdge. FlowGraph wraps its ReactFlow
+ * subtree in a Provider with the current handler. Using context (not
+ * a module-level registry) keeps each FlowGraph instance scoped to
+ * its own click target — critical if two graphs render at once or a
+ * graph unmounts/remounts in the same tree.
  */
-export function setEdgeClickHandler(
-  handler: ((id: string, data?: Record<string, unknown>) => void) | null,
-): void {
-  edgeClickHandler = handler;
-}
+export const FsmEdgeClickContext = createContext<
+  ((id: string, data?: Record<string, unknown>) => void) | null
+>(null);
 
 export interface FsmEdgeData extends Record<string, unknown> {
   fullLabel?: string;
@@ -77,6 +74,10 @@ export function FsmEdge(props: EdgeProps): JSX.Element {
     markerEnd,
     data,
   } = props;
+  // Per-instance click handler from the enclosing FlowGraph. Falls
+  // back to null when no FlowGraph wrapped this edge (e.g. an isolated
+  // unit-test render); the onClick path is a no-op in that case.
+  const onLabelClick = useContext(FsmEdgeClickContext);
 
   const [edgePath, labelX, labelY] = getSmoothStepPath({
     sourceX,
@@ -146,8 +147,7 @@ export function FsmEdge(props: EdgeProps): JSX.Element {
                 style={labelStyle as JSX.CSSProperties | undefined}
                 onClick={(e) => {
                   e.stopPropagation();
-                  // Dispatch through the registered FlowGraph onEdgeClick.
-                  edgeClickHandler?.(id, ed as Record<string, unknown>);
+                  onLabelClick?.(id, ed as Record<string, unknown>);
                 }}
                 aria-label={`Inspect transition: ${fullText}`}
               >

@@ -1,22 +1,67 @@
 /**
- * CodeBlock — monospace text rendering with copy / download / search / fullscreen.
+ * CodeBlock — monospace text rendering with copy / download / search / fullscreen
+ *               plus an opt-in Markdown rendered view.
  *
  * Used for non-JSON payloads: prompt templates, predicate DSL,
- * generated SQL fragments. Same toolbar contract as JsonViewer but
- * no tree, no chevrons. v1 has no syntax highlighting; a future
- * dynamic-import of Shiki can plug in if a real need arises.
+ * generated SQL fragments. Same toolbar contract as JsonViewer.
  *
- * Line gutter is auto-enabled for >5 lines.
+ * Markdown view (W21 user-requested): when the content looks like
+ * markdown (or the caller passes `language="markdown"`) the toolbar
+ * exposes a Rendered / Raw toggle. Rendered mode runs marked +
+ * DOMPurify and styles the output with Tailwind's @tailwindcss/
+ * typography `prose` classes, giving GitHub-flavored Markdown with
+ * proper headings, lists, fenced code blocks, links, tables, etc.
+ *
+ * Line gutter is auto-enabled for >5 lines (raw mode only).
  *
  * Search highlights matching substrings inline via `<mark>` for visual
- * parity with JsonViewer's match emphasis.
+ * parity with JsonViewer's match emphasis (raw mode only).
  */
 
 import { useCallback, useMemo, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
+import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 
 import { copyText } from '../lib/clipboard';
 import { Sheet } from './Sheet';
+
+// Configure marked once at module load. GFM enables tables, task
+// lists, strikethrough, auto-link, etc. breaks=true so single newlines
+// become <br>, matching GitHub's rendering on issues / PRs / comments.
+marked.use({
+  gfm: true,
+  breaks: false,
+});
+
+// Heuristic: does the text look like markdown? Used to default the
+// view mode when the caller didn't pass `language="markdown"`. This
+// keeps the FSM library domain-agnostic — it doesn't NEED to know its
+// prompt templates are markdown, the UI just notices when they are.
+function looksLikeMarkdown(text: string): boolean {
+  if (!text || text.length < 4) return false;
+  return (
+    /^#{1,6}\s/m.test(text) || // ATX headers
+    /^```/m.test(text) || // fenced code blocks
+    /\[[^\]]+\]\([^)]+\)/.test(text) || // [link](url)
+    /^\s*[-*+]\s+\S/m.test(text) || // unordered lists
+    /^\s*\d+\.\s+\S/m.test(text) || // ordered lists
+    /\*\*[^*]+\*\*/.test(text) || // **bold**
+    /^\s*>\s/m.test(text) // > blockquote
+  );
+}
+
+/** Render markdown to a safe HTML string. Synchronous marked is fine
+ *  for the prompt-template scale we're rendering; DOMPurify strips any
+ *  script tags / event handlers / data: URIs / etc. that the upstream
+ *  content might contain. */
+function renderMarkdown(text: string): string {
+  const raw = marked.parse(text, { async: false }) as string;
+  return DOMPurify.sanitize(raw, {
+    USE_PROFILES: { html: true },
+    FORBID_TAGS: ['style', 'script', 'iframe', 'object', 'embed'],
+  });
+}
 
 export interface CodeBlockProps {
   text: string;
@@ -26,6 +71,11 @@ export interface CodeBlockProps {
   filename?: string;
   ariaLabel?: string;
   className?: string;
+  /** Force markdown rendering mode regardless of heuristic detection.
+   *  Useful when the caller knows for certain the content is markdown
+   *  but doesn't want to declare `language="markdown"` (which would
+   *  imply other things about the file type for download / copy). */
+  renderMarkdown?: boolean;
 }
 
 function downloadAs(filename: string, text: string, mime = 'text/plain'): void {
@@ -105,7 +155,20 @@ export function CodeBlock({
   filename,
   ariaLabel = 'Code block',
   className,
+  renderMarkdown: renderMarkdownProp,
 }: CodeBlockProps): JSX.Element {
+  // markdownEligible: caller declared language=markdown OR explicitly
+  // opted in OR the heuristic says the content looks markdown-ish.
+  // When eligible, the toolbar exposes a Raw/Rendered toggle and we
+  // default to Rendered (the visually informative view).
+  const markdownEligible =
+    language === 'markdown' ||
+    renderMarkdownProp === true ||
+    (renderMarkdownProp !== false && looksLikeMarkdown(text));
+
+  const [view, setView] = useState<'raw' | 'rendered'>(
+    markdownEligible ? 'rendered' : 'raw',
+  );
   const [search, setSearch] = useState('');
   const [sheetOpen, setSheetOpen] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -114,6 +177,14 @@ export function CodeBlock({
   const showGutter = lineNumbers ?? lines.length > 5;
   const bytes = useMemo(() => new Blob([text]).size, [text]);
   const sizeLabel = bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} kB`;
+
+  // Memoise the rendered HTML: parsing markdown + DOMPurify on every
+  // render is wasteful for long prompts. Only recompute when the text
+  // changes or the view flips into 'rendered'.
+  const renderedHtml = useMemo(() => {
+    if (!markdownEligible) return '';
+    return renderMarkdown(text);
+  }, [text, markdownEligible]);
 
   const onCopy = useCallback(() => void copyText(text), [text]);
   const onDownload = useCallback(
@@ -155,16 +226,31 @@ export function CodeBlock({
         <span class="text-[10px] text-slate-400 dark:text-slate-500">
           {lines.length} lines · {sizeLabel}
         </span>
-        <input
-          ref={searchRef}
-          type="search"
-          placeholder="Search"
-          value={search}
-          onInput={(e) => setSearch((e.target as HTMLInputElement).value)}
-          onKeyDown={onSearchKey}
-          aria-label="Search inside code"
-          class="ml-auto h-6 w-32 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
-        />
+        {view === 'raw' ? (
+          <input
+            ref={searchRef}
+            type="search"
+            placeholder="Search"
+            value={search}
+            onInput={(e) => setSearch((e.target as HTMLInputElement).value)}
+            onKeyDown={onSearchKey}
+            aria-label="Search inside code"
+            class="ml-auto h-6 w-32 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+          />
+        ) : (
+          <span class="ml-auto" />
+        )}
+        {markdownEligible ? (
+          <button
+            type="button"
+            onClick={() => setView(view === 'raw' ? 'rendered' : 'raw')}
+            aria-label={`Show ${view === 'raw' ? 'rendered' : 'raw'} view`}
+            title={`Currently ${view}; click to switch`}
+            class="h-6 px-2 text-xs rounded text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+          >
+            {view === 'raw' ? 'Rendered' : 'Raw'}
+          </button>
+        ) : null}
         <button
           type="button"
           onClick={onCopy}
@@ -188,28 +274,56 @@ export function CodeBlock({
           onClick={onOpenSheet}
           aria-label="Open in full-screen sheet"
           title="Full-screen"
-          class="h-6 px-2 text-xs rounded text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+          class="h-6 px-2 text-xs rounded text-emerald-700 dark:text-emerald-400 border border-transparent hover:bg-slate-100 dark:hover:bg-slate-700 hover:border-emerald-500/40 font-semibold focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
         >
-          ↗
+          ⛶ Full-screen
         </button>
       </header>
-      <pre
-        class={[
-          'cb-body font-mono leading-snug bg-slate-50 dark:bg-slate-900/40 p-3 overflow-auto m-0',
-          maxInlineHeight,
-        ].join(' ')}
-      >
-        {lines.map((line, i) => (
-          <Line key={i} index={i} text={line} query={search} showGutter={showGutter} />
-        ))}
-      </pre>
+      {view === 'rendered' ? (
+        <div
+          class={[
+            'cb-body cb-markdown',
+            'prose prose-sm dark:prose-invert max-w-none',
+            'prose-headings:scroll-mt-4 prose-code:before:hidden prose-code:after:hidden',
+            'prose-pre:bg-slate-100 dark:prose-pre:bg-slate-900/60',
+            'bg-white dark:bg-slate-900/40 p-3 overflow-auto',
+            maxInlineHeight,
+          ].join(' ')}
+          // eslint-disable-next-line react/no-danger -- output is run through DOMPurify above; script / iframe / event-handler vectors are stripped before reaching the DOM
+          dangerouslySetInnerHTML={{ __html: renderedHtml }}
+        />
+      ) : (
+        <pre
+          class={[
+            'cb-body font-mono leading-snug bg-slate-50 dark:bg-slate-900/40 p-3 overflow-auto m-0',
+            maxInlineHeight,
+          ].join(' ')}
+        >
+          {lines.map((line, i) => (
+            <Line key={i} index={i} text={line} query={search} showGutter={showGutter} />
+          ))}
+        </pre>
+      )}
       <Sheet
         open={sheetOpen}
         onClose={onCloseSheet}
         title={`Code · ${language}`}
         width="right-half"
       >
-        <pre class="font-mono text-xs leading-snug whitespace-pre">{text}</pre>
+        {view === 'rendered' ? (
+          <div
+            class={[
+              'prose prose-sm dark:prose-invert max-w-none',
+              'prose-headings:scroll-mt-4 prose-code:before:hidden prose-code:after:hidden',
+              'prose-pre:bg-slate-100 dark:prose-pre:bg-slate-900/60',
+              'p-4',
+            ].join(' ')}
+            // eslint-disable-next-line react/no-danger -- output is run through DOMPurify above; same justification as the inline render path
+            dangerouslySetInnerHTML={{ __html: renderedHtml }}
+          />
+        ) : (
+          <pre class="font-mono text-xs leading-snug whitespace-pre p-4">{text}</pre>
+        )}
       </Sheet>
     </section>
   );

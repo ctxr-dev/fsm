@@ -338,6 +338,34 @@ describe('Tooltip', () => {
     expect(button.hasAttribute('aria-describedby')).toBe(false);
   });
 
+  test('aria-describedby is mirrored onto a DEEPLY NESTED focusable child, not just firstElementChild', () => {
+    // The trigger might wrap the focusable element in layout divs.
+    // querySelector for the standard focusable set covers any depth.
+    vi.useFakeTimers();
+    const { container, queryByRole } = render(
+      <Tooltip content="nested" delay={0}>
+        <span>
+          <div class="layout-wrap">
+            <button type="button" data-testid="deep">deep-target</button>
+          </div>
+        </span>
+      </Tooltip>,
+    );
+    const wrapper = container.firstChild as HTMLElement;
+    fireFocusIn(wrapper);
+    act(() => { vi.advanceTimersByTime(0); });
+    const tip = queryByRole('tooltip') as HTMLElement | null;
+    expect(tip).not.toBeNull();
+    // The button — NOT the wrapper-span or the layout-div — should
+    // carry aria-describedby pointing at the bubble id.
+    const button = wrapper.querySelector('[data-testid=deep]') as HTMLButtonElement;
+    expect(button.getAttribute('aria-describedby')).toBe(tip!.id);
+    // And the close path strips it cleanly.
+    fireFocusOut(wrapper);
+    act(() => { vi.advanceTimersByTime(101); });
+    expect(button.hasAttribute('aria-describedby')).toBe(false);
+  });
+
   test('singleton handoff seeds the warm window so the next tooltip opens instantly', () => {
     // When a second Tooltip's trigger fires while a first one is open,
     // closeNow() runs on the first as part of the handoff. That path

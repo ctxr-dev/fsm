@@ -372,37 +372,57 @@ export function Tooltip(props: TooltipProps): JSX.Element {
     };
   }, [scheduleOpen, scheduleClose]);
 
-  // Mirror aria-describedby onto the FIRST FOCUSABLE CHILD of the
-  // wrapper while open. The wrapper span itself isn't the focus target
-  // (a button or anchor child usually is), and aria-describedby does
-  // not propagate to descendants — so a screen reader on a focused
-  // button inside <Tooltip> wouldn't announce the tooltip body unless
-  // the button itself carries the attribute.
+  // Mirror aria-describedby onto EVERY focusable descendant of the
+  // wrapper while open. aria-describedby does not propagate to
+  // descendants, and the actual focus target can be ANY focusable
+  // element inside the trigger (nested arbitrarily — `<span><div>
+  // <button/></div></span>`), so setting it only on the first child
+  // misses the real focus target whenever a layout wrapper sits
+  // between the Tooltip and the focusable control. Querying for the
+  // standard set (button / a[href] / input / select / textarea /
+  // [tabindex]) covers every realistic trigger shape.
   useEffect(() => {
     if (!open) return undefined;
     const wrapper = triggerRef.current;
     if (!wrapper) return undefined;
-    const child = wrapper.firstElementChild as HTMLElement | null;
-    if (!child) return undefined;
-    const prev = child.getAttribute('aria-describedby');
-    child.setAttribute(
-      'aria-describedby',
-      prev ? `${prev} ${bubbleId}` : bubbleId,
+    const focusables = Array.from(
+      wrapper.querySelectorAll<HTMLElement>(
+        'button, a[href], input, select, textarea, [tabindex]',
+      ),
     );
+    // Fallback: if the trigger child isn't itself focusable (e.g. a
+    // plain text span) tag the first DOM child anyway so the wrapper
+    // still announces something when an assistive tech traverses to
+    // the visible label.
+    if (focusables.length === 0) {
+      const first = wrapper.firstElementChild as HTMLElement | null;
+      if (first) focusables.push(first);
+    }
+    // Snapshot prior aria-describedby on each so we can restore on
+    // close (or strip our id only when appending to an existing list).
+    const prev = new Map<HTMLElement, string | null>();
+    for (const el of focusables) {
+      const cur = el.getAttribute('aria-describedby');
+      prev.set(el, cur);
+      el.setAttribute(
+        'aria-describedby',
+        cur ? `${cur} ${bubbleId}` : bubbleId,
+      );
+    }
     return () => {
-      // Restore the caller's original value (or clear if there wasn't
-      // one). If the caller set aria-describedby AND we appended,
-      // strip our id only.
-      const current = child.getAttribute('aria-describedby');
-      if (prev === null) {
-        child.removeAttribute('aria-describedby');
-      } else if (current && current.includes(bubbleId)) {
-        const restored = current
-          .split(/\s+/)
-          .filter((id) => id !== bubbleId)
-          .join(' ');
-        if (restored) child.setAttribute('aria-describedby', restored);
-        else child.removeAttribute('aria-describedby');
+      for (const el of focusables) {
+        const original = prev.get(el) ?? null;
+        const current = el.getAttribute('aria-describedby');
+        if (original === null) {
+          el.removeAttribute('aria-describedby');
+        } else if (current && current.includes(bubbleId)) {
+          const restored = current
+            .split(/\s+/)
+            .filter((id) => id !== bubbleId)
+            .join(' ');
+          if (restored) el.setAttribute('aria-describedby', restored);
+          else el.removeAttribute('aria-describedby');
+        }
       }
     };
   }, [open, bubbleId]);

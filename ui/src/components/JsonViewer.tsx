@@ -346,9 +346,9 @@ export function JsonViewer({
           onClick={onOpenSheet}
           aria-label="Open in full-screen sheet"
           title="Full-screen"
-          class="h-6 px-2 text-xs rounded text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+          class="h-6 px-2 text-xs rounded text-emerald-700 dark:text-emerald-400 border border-transparent hover:bg-slate-100 dark:hover:bg-slate-700 hover:border-emerald-500/40 font-semibold focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
         >
-          ↗
+          ⛶ Full-screen
         </button>
       </header>
       <div
@@ -358,7 +358,20 @@ export function JsonViewer({
       >
         <JsonView
           value={value as object}
-          collapsed={currentMode === 'inline' ? 0 : defaultExpandDepth}
+          // currentMode==='inline' → collapsed at depth 0 (just root
+          // visible); currentMode==='expanded' → recursively expand
+          // EVERY nested level (the user-facing "Expand" button
+          // semantically promises "show me everything", not "show me
+          // the first two layers"). false at the library API expands
+          // all; defaultExpandDepth is preserved as the fallback when
+          // callers explicitly pin a partial depth via the prop.
+          collapsed={
+            currentMode === 'inline'
+              ? 0
+              : defaultExpandDepth !== 2
+              ? defaultExpandDepth
+              : false
+          }
           displayDataTypes={false}
           enableClipboard={false}
           highlightUpdates={false}
@@ -374,7 +387,10 @@ export function JsonViewer({
       >
         <JsonView
           value={value as object}
-          collapsed={Math.max(3, defaultExpandDepth)}
+          // Full-screen sheet ALWAYS expands every level — the user
+          // explicitly asked for full inspection, so depth-limiting
+          // would be a regression from intent.
+          collapsed={false}
           displayDataTypes={false}
           enableClipboard={true}
           shortenTextAfterLength={0}
