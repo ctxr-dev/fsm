@@ -38,10 +38,12 @@
  * Data acquisition: one call to ``api.getCurrentProject()`` at mount
  * + a window-focus refetch so a user who tabs back from Swagger sees
  * fresh subsystem state without a manual refresh. Health probes
- * (the ``healthz_url`` field) are re-issued in a small ``mapLimited``
- * fan-out so the pills can show green / amber / red rather than just
- * "configured". Failures collapse to a muted pill — the topbar must
- * never error out the dashboard.
+ * (the ``healthz_url`` field) are re-issued serially in metadata
+ * order — the canonical subsystem count is three (mcp / api / ui),
+ * so a serial walk completes in well under a second; a future
+ * deployment with more subsystems can lift the fan-out pattern from
+ * ``routes/drift.tsx`` (``mapLimited``). Failures collapse to a
+ * muted pill — the topbar must never error out the dashboard.
  *
  * Why a separate component rather than extending ``app.tsx``'s inline
  * ``TopBar`` directly? Two reasons: (a) the data layer is async
@@ -216,8 +218,14 @@ export function InfoTopBar(): JSX.Element {
     };
   }, []);
 
-  // Health probes whenever the metadata refreshes. Capped fan-out so a
-  // future "10 subsystems" scenario doesn't carpet-bomb the API at boot.
+  // Health probes whenever the metadata refreshes. Issued SERIALLY
+  // (one ``await`` per iteration) — the canonical subsystem count is
+  // three (mcp / api / ui), so a serial walk gives us back-to-back
+  // 200-ms-ish probes that complete inside half a second total. If a
+  // future deployment lifts the subsystem count past five-ish, this
+  // is the spot to bolt on the ``mapLimited`` pattern from
+  // routes/drift.tsx (the same fan-out cap). Today the simpler shape
+  // is easier to read.
   useEffect(() => {
     if (!metadata) return;
     let cancelled = false;

@@ -448,6 +448,15 @@ def get_current_project(project: ProjectDep, request: Request) -> ProjectMetadat
     # failure mode (file missing, malformed, partial keys) with an
     # empty map so the topbar shows "no subsystems reported" rather
     # than 500ing.
+    # ``.ctxr-fsm/active-mcp.json`` writes each subsystem's primary URL
+    # under the key ``http_url`` (see
+    # :func:`ctxr.fsm.cli.lifecycle.supervisor._subsystem_payload`); the
+    # API row additionally carries a ``docs_url``. We map both to
+    # ``SubsystemInfo.base_url`` so the UI doesn't need to know about
+    # the on-disk key vocabulary — its only contract is "give me a URL
+    # I can show + a healthz URL I can probe". The original draft of
+    # this route incorrectly looked for ``base_url`` and produced an
+    # empty subsystems map even with a live supervisor.
     subsystems: dict[str, SubsystemInfo] = {}
     if project_root_str is not None:
         doc = read_active_mcp_file(Path(project_root_str))
@@ -457,7 +466,7 @@ def get_current_project(project: ProjectDep, request: Request) -> ProjectMetadat
                 for name, block in raw_subsystems.items():
                     if not isinstance(block, dict):
                         continue
-                    base = block.get("base_url")
+                    base = block.get("http_url")
                     if not isinstance(base, str) or not base:
                         continue
                     healthz = block.get("healthz_url")
@@ -468,14 +477,22 @@ def get_current_project(project: ProjectDep, request: Request) -> ProjectMetadat
                         pid=pid if isinstance(pid, int) else None,
                     )
 
-    # Swagger + API base URL — ``request.base_url`` carries scheme +
-    # host + port + root_path (always trailing-slashed). Hard-code
-    # ``/docs`` since FastAPI's default Swagger mount lives there;
-    # avoids importing the app inside its own route to read
-    # ``app.docs_url``.
-    base_url = str(request.base_url).rstrip("/")
-    api_base_url = base_url
-    swagger_url = f"{base_url}/docs"
+    # Swagger + API base URL derivation. ``request.base_url`` is the
+    # bare ASGI mount point (scheme + host + port + root_path); the
+    # JSON routes in this app all live under the ``/api/v1`` prefix
+    # (this route itself is at ``/api/v1/projects/current``), so
+    # ``api_base_url`` MUST carry that prefix or every deep link the
+    # UI builds against it will 404. The original draft of this route
+    # returned the bare host URL, which produced broken links for
+    # consumers building URLs off the field.
+    #
+    # Swagger lives at ``/docs`` on the FastAPI app — outside the
+    # ``/api/v1`` prefix because FastAPI mounts the docs viewer at the
+    # app root by default. We hard-code that suffix here rather than
+    # importing the app inside its own route to read ``app.docs_url``.
+    host_url = str(request.base_url).rstrip("/")
+    api_base_url = f"{host_url}/api/v1"
+    swagger_url = f"{host_url}/docs"
 
     return ProjectMetadata(
         fsm_version=ctxr.fsm.__version__,
