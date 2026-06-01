@@ -66,11 +66,14 @@ describe('CommandPalette', () => {
     expect(commandPaletteOpen.value).toBe(false);
   });
 
-  test('default results include the route entries (e.g. "Runs")', () => {
+  test('default results include the route entries (e.g. "Specs", "All runs")', () => {
     commandPaletteOpen.value = true;
     const { getByText } = render(<CommandPalette />);
-    expect(getByText('Runs')).toBeInTheDocument();
+    // W19 sidebar shows "Specs" (primary) and "All runs" (admin
+    // section). Both must appear in the palette so users can jump
+    // anywhere with Cmd+K.
     expect(getByText('Specs')).toBeInTheDocument();
+    expect(getByText('All runs')).toBeInTheDocument();
   });
 
   test('typing filters the result list', async () => {

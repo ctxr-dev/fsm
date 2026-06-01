@@ -139,25 +139,18 @@ interface NavLinkDef {
   matchPrefix: string;
 }
 
-// W18 sidebar nav is derived from the ROUTES registry so adding a
-// new route (W18f Topology / W18g Drift / W18h Journal) automatically
-// surfaces here without sidebar-side edits. Static fallbacks for the
-// label come from each registry entry; the matchPrefix is the route's
-// own path (or its first /-segment for nested routes).
+// W19 sidebar splits into two groups: PRIMARY (spec-first workflow:
+// just Specs) and ADMIN (cross-spec views). The split makes the
+// spec-first IA visually obvious — users see Specs at the top, and
+// the cross-spec admin tools sit below a divider as secondary.
 import { primaryRoutes, adminRoutes } from './routes';
 
-const NAV_LINKS: readonly NavLinkDef[] = [
-  ...primaryRoutes().map((r) => ({
-    href: r.path,
-    label: r.label,
-    matchPrefix: r.path === '/' ? '/runs' : r.path,
-  })),
-  ...adminRoutes().map((r) => ({
-    href: r.path,
-    label: r.label,
-    matchPrefix: r.path,
-  })),
-];
+function toNavLink(r: { path: string; label: string }): NavLinkDef {
+  return { href: r.path, label: r.label, matchPrefix: r.path };
+}
+
+const PRIMARY_NAV: readonly NavLinkDef[] = primaryRoutes().map(toNavLink);
+const ADMIN_NAV: readonly NavLinkDef[] = adminRoutes().map(toNavLink);
 
 /** Highlight a nav link when the current path lives under its prefix. */
 function isActive(currentPath: string, prefix: string): boolean {
@@ -173,15 +166,36 @@ function isActive(currentPath: string, prefix: string): boolean {
  * ``<a>`` so :class:`LocationProvider`'s click interceptor catches them
  * (it only intercepts left-clicks on anchors with matching origin).
  */
+function NavLink({ link, active }: { link: NavLinkDef; active: boolean }): JSX.Element {
+  return (
+    <li>
+      <a
+        href={link.href}
+        aria-current={active ? 'page' : undefined}
+        class={[
+          'block rounded-md px-3 py-2 text-sm font-medium',
+          'transition-colors duration-(--duration-fast) ease-(--ease-default)',
+          'focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500',
+          active
+            ? 'bg-emerald-50 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-100'
+            : 'text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-700',
+        ].join(' ')}
+      >
+        {link.label}
+      </a>
+    </li>
+  );
+}
+
 function Sidebar(): JSX.Element {
   const { path } = useLocation();
   return (
     <nav
       aria-label="Primary"
-      class="flex h-full w-56 shrink-0 flex-col gap-6 border-r border-slate-200 bg-white px-4 py-6 dark:border-slate-700 dark:bg-slate-800"
+      class="flex h-full w-56 shrink-0 flex-col gap-4 border-r border-slate-200 bg-white px-4 py-6 dark:border-slate-700 dark:bg-slate-800"
     >
       <a
-        href="/runs"
+        href="/specs"
         class="flex items-center gap-2 text-lg font-semibold text-slate-900 dark:text-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded-sm"
       >
         <span
@@ -191,28 +205,24 @@ function Sidebar(): JSX.Element {
         <span>ctxr-fsm</span>
       </a>
       <ul class="flex flex-col gap-1">
-        {NAV_LINKS.map((link) => {
-          const active = isActive(path, link.matchPrefix);
-          return (
-            <li key={link.href}>
-              <a
-                href={link.href}
-                aria-current={active ? 'page' : undefined}
-                class={[
-                  'block rounded-md px-3 py-2 text-sm font-medium',
-                  'transition-colors duration-(--duration-fast) ease-(--ease-default)',
-                  'focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500',
-                  active
-                    ? 'bg-emerald-50 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-100'
-                    : 'text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-700',
-                ].join(' ')}
-              >
-                {link.label}
-              </a>
-            </li>
-          );
-        })}
+        {PRIMARY_NAV.map((link) => (
+          <NavLink key={link.href} link={link} active={isActive(path, link.matchPrefix)} />
+        ))}
       </ul>
+      {ADMIN_NAV.length > 0 ? (
+        <>
+          <div class="pt-3 border-t border-slate-200 dark:border-slate-700">
+            <h3 class="text-[10px] uppercase tracking-wide text-slate-500 dark:text-slate-400 px-3 py-1">
+              Admin
+            </h3>
+          </div>
+          <ul class="flex flex-col gap-1">
+            {ADMIN_NAV.map((link) => (
+              <NavLink key={link.href} link={link} active={isActive(path, link.matchPrefix)} />
+            ))}
+          </ul>
+        </>
+      ) : null}
     </nav>
   );
 }
