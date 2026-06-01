@@ -278,7 +278,11 @@ export interface CommitSignatureRecord {
 
 /** Admin: doctor-report payload (mirrors ``ctxr-fsm doctor``). */
 export interface DoctorReport {
-  /** Absolute filesystem path of the open DB file. */
+  /** Absolute filesystem path of the open DB file when filesystem-
+   *  backed. For non-file backends (`:memory:`, `file:`-URI variants,
+   *  future remote backends) this is the rendered SQLAlchemy URL
+   *  string instead. Distinguish the two cases by checking whether
+   *  `project_root` / `db_path_relative` are non-null. */
   db_path: string;
   /** Absolute path of the project root that hosts ``.ctxr-fsm/``.
    *  ``null`` when the DB has no filesystem path (in-memory / non-

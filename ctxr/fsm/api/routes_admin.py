@@ -138,7 +138,18 @@ class DoctorReport(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
-    db_path: str = Field(..., description="Absolute filesystem path of the open DB file.")
+    db_path: str = Field(
+        ...,
+        description=(
+            "Absolute filesystem path of the open DB file when"
+            " filesystem-backed (normalised via :meth:`Path.resolve`)."
+            " For non-file backends (``:memory:``, ``file:``-URI"
+            " variants, future remote backends) this is the rendered"
+            " SQLAlchemy URL string instead — clients distinguish the"
+            " two cases by ``project_root`` / ``db_path_relative``"
+            " being ``None``."
+        ),
+    )
     project_root: str | None = Field(
         None,
         description=(

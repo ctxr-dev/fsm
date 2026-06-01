@@ -224,7 +224,20 @@ class ProjectMetadata(BaseModel):
 
     fsm_version: str = Field(..., description="The ``ctxr.fsm`` package version.")
     project_open: bool = Field(..., description="Whether the :class:`Project` is bound.")
-    db_path: str = Field(..., description="Absolute filesystem path of the open SQLite database.")
+    db_path: str = Field(
+        ...,
+        description=(
+            "Absolute filesystem path of the open SQLite database when"
+            " filesystem-backed (normalised via :meth:`Path.resolve` so"
+            " the value is uniform across hosts regardless of how the"
+            " engine was opened). For non-file backends (``:memory:``,"
+            " ``file:``-URI variants, future remote backends) this is"
+            " the rendered SQLAlchemy URL string instead — UI clients"
+            " should treat the value as opaque + paired with the"
+            " ``project_root`` / ``db_path_relative`` nullability to"
+            " tell the two cases apart."
+        ),
+    )
     project_root: str | None = Field(
         None,
         description=(

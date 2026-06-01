@@ -73,14 +73,21 @@ def project_root_and_relative(db_path: str) -> tuple[Path, str]:
     rather than a navigation target.
     """
     abs_db = Path(db_path).resolve()
+    # The returned relative path goes on the wire to the UI + into
+    # committed-to-git configs, so render with POSIX separators
+    # regardless of host OS. ``str(Path('.ctxr-fsm/fsm.db'))`` on
+    # Windows would emit ``.ctxr-fsm\fsm.db``, which the UI's
+    # documented contract expects to be ``.ctxr-fsm/fsm.db`` (the
+    # value an operator commits to a shared config so a teammate on
+    # a different OS still sees the same path).
     for ancestor in abs_db.parents:
         if ancestor.name == ".ctxr-fsm":
             root = ancestor.parent
-            return root, str(abs_db.relative_to(root))
+            return root, abs_db.relative_to(root).as_posix()
     # Non-canonical layout: fall back to the DB's parent.
     fallback_root = abs_db.parent
     try:
-        return fallback_root, str(abs_db.relative_to(fallback_root))
+        return fallback_root, abs_db.relative_to(fallback_root).as_posix()
     except ValueError:
         return fallback_root, abs_db.name
 
