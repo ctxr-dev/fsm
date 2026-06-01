@@ -136,9 +136,16 @@ function StateInspectorBody({ state, isEntry }: StateInspectorBodyProps): JSX.El
           <h4 class="text-xs uppercase tracking-wide text-slate-600 dark:text-slate-400 mb-1">
             Prompt template
           </h4>
+          {/* No language= hint: the FSM library treats prompt_template
+              as an opaque string. The consuming skill / agent
+              orchestrator owns the template's MIME type / language
+              convention (could be markdown, jinja, plain prose, json,
+              anything else). Rendering as plain text is the only
+              correct domain-agnostic default. If a future spec gains
+              a `prompt_template_language` (or similar) declared
+              field, plumb it through here. */}
           <CodeBlock
             text={String(worker.prompt_template)}
-            language="markdown"
             maxInlineHeight="max-h-64"
             ariaLabel={`${id} worker prompt template`}
           />

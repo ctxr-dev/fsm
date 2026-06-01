@@ -315,6 +315,61 @@ describe('Tooltip', () => {
     expect(getByText('trigger')).toBeInTheDocument();
   });
 
+  test('mirrors aria-describedby onto the focused child element (not just the wrapper)', () => {
+    // aria-describedby does NOT propagate to descendants, so a focused
+    // <button> inside the Tooltip wrapper must carry the attribute too
+    // for screen readers to announce the tooltip body.
+    vi.useFakeTimers();
+    const { container, queryByRole } = render(
+      <Tooltip content="full" delay={0}>
+        <button type="button">trigger</button>
+      </Tooltip>,
+    );
+    const wrapper = container.firstChild as HTMLElement;
+    fireFocusIn(wrapper);
+    act(() => { vi.advanceTimersByTime(0); });
+    const tip = queryByRole('tooltip') as HTMLElement | null;
+    expect(tip).not.toBeNull();
+    const button = wrapper.querySelector('button') as HTMLButtonElement;
+    expect(button.getAttribute('aria-describedby')).toBe(tip!.id);
+    // Closing strips the attribute from the child again.
+    fireFocusOut(wrapper);
+    act(() => { vi.advanceTimersByTime(101); });
+    expect(button.hasAttribute('aria-describedby')).toBe(false);
+  });
+
+  test('singleton handoff seeds the warm window so the next tooltip opens instantly', () => {
+    // When a second Tooltip's trigger fires while a first one is open,
+    // closeNow() runs on the first as part of the handoff. That path
+    // must seed warmUntil so the second tooltip opens without the
+    // 400 ms delay (the user is actively scanning, not browsing).
+    vi.useFakeTimers();
+    const { getByText, queryByRole } = render(
+      <div>
+        <Tooltip content="first" delay={400}>
+          <span>a</span>
+        </Tooltip>
+        <Tooltip content="second" delay={400}>
+          <span>b</span>
+        </Tooltip>
+      </div>,
+    );
+    const a = getByText('a').parentElement as HTMLElement;
+    const b = getByText('b').parentElement as HTMLElement;
+    fireEvent.mouseEnter(a);
+    act(() => { vi.advanceTimersByTime(400); });
+    expect(queryByRole('tooltip')!.textContent).toBe('first');
+    // Without leaving 'a' explicitly, hover 'b'. The singleton handoff
+    // closes 'first' (via closeNow which now seeds warmUntil).
+    fireEvent.mouseEnter(b);
+    act(() => { vi.advanceTimersByTime(0); });
+    // Should be open INSTANTLY thanks to the warm window seeded by
+    // the handoff, NOT requiring another 400 ms wait.
+    const tip = queryByRole('tooltip');
+    expect(tip).not.toBeNull();
+    expect(tip!.textContent).toBe('second');
+  });
+
   test('strips and restores native title= so the browser does not double-tooltip', () => {
     vi.useFakeTimers();
     const { container, getByText, queryByRole } = render(

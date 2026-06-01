@@ -188,6 +188,16 @@ export function Tooltip(props: TooltipProps): JSX.Element {
   const closeNow = useCallback((): void => {
     clearOpenTimer();
     clearCloseTimer();
+    // closeNow fires from Escape (intentional dismiss), scroll, outside
+    // pointerdown, and singleton-handoff (a new Tooltip taking over).
+    // All of those need to restore any suppressed title so the wrapper
+    // doesn't leak the stripped-while-open state, AND should seed the
+    // warm window so the next hover (e.g. the new tooltip in the
+    // singleton-handoff case) opens instantly. Escape's separate
+    // `warmUntil = 0` reset in the keydown handler still wins for the
+    // genuine "dismiss intent" path.
+    restoreTitle();
+    warmUntil = Date.now() + 300;
     setOpen(false);
   }, []);
 
@@ -361,6 +371,41 @@ export function Tooltip(props: TooltipProps): JSX.Element {
       el.removeEventListener('focusout', onFocusOut);
     };
   }, [scheduleOpen, scheduleClose]);
+
+  // Mirror aria-describedby onto the FIRST FOCUSABLE CHILD of the
+  // wrapper while open. The wrapper span itself isn't the focus target
+  // (a button or anchor child usually is), and aria-describedby does
+  // not propagate to descendants — so a screen reader on a focused
+  // button inside <Tooltip> wouldn't announce the tooltip body unless
+  // the button itself carries the attribute.
+  useEffect(() => {
+    if (!open) return undefined;
+    const wrapper = triggerRef.current;
+    if (!wrapper) return undefined;
+    const child = wrapper.firstElementChild as HTMLElement | null;
+    if (!child) return undefined;
+    const prev = child.getAttribute('aria-describedby');
+    child.setAttribute(
+      'aria-describedby',
+      prev ? `${prev} ${bubbleId}` : bubbleId,
+    );
+    return () => {
+      // Restore the caller's original value (or clear if there wasn't
+      // one). If the caller set aria-describedby AND we appended,
+      // strip our id only.
+      const current = child.getAttribute('aria-describedby');
+      if (prev === null) {
+        child.removeAttribute('aria-describedby');
+      } else if (current && current.includes(bubbleId)) {
+        const restored = current
+          .split(/\s+/)
+          .filter((id) => id !== bubbleId)
+          .join(' ');
+        if (restored) child.setAttribute('aria-describedby', restored);
+        else child.removeAttribute('aria-describedby');
+      }
+    };
+  }, [open, bubbleId]);
 
   if (disabled || isEmpty) {
     return children;
