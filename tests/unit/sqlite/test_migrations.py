@@ -71,6 +71,8 @@ _EXPECTED_TABLES: frozenset[str] = frozenset(
         "drift_signals",
         "commit_signatures",
         "commit_tokens",
+        # models_gates (W23g)
+        "gate_bindings",
     }
 )
 
@@ -84,7 +86,7 @@ _STRICT_SAMPLES: tuple[str, ...] = ("projects", "events", "commit_tokens")
 
 # Revision label of the head migration; mirrors
 # ``migrations/versions/0001_initial.py::revision``.
-_HEAD_REVISION: str = "0001_initial"
+_HEAD_REVISION: str = "0002_gate_bindings"
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +213,7 @@ def test_upgrade_head_creates_all_expected_tables(restore_env: object) -> None:
         )
         # Sanity: the explicit expected count (18 tables) is what the spec
         # asks us to verify, so we assert it directly as well.
-        assert len(tables) == 18
+        assert len(tables) == 19
 
         # ``alembic_version`` should now carry the head revision.
         assert _alembic_version(db_path) == _HEAD_REVISION
