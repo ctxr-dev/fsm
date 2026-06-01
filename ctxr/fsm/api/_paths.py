@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+
 def looks_like_filesystem_db_path(db_url_database: str | None) -> bool:
     """Return whether ``db_url_database`` is plausibly a real on-disk path.
 
@@ -46,9 +47,7 @@ def looks_like_filesystem_db_path(db_url_database: str | None) -> bool:
         return False
     if db_url_database == ":memory:":
         return False
-    if db_url_database.lower().startswith("file:"):
-        return False
-    return True
+    return not db_url_database.lower().startswith("file:")
 
 
 def project_root_and_relative(db_path: str) -> tuple[Path, str]:

@@ -22,7 +22,6 @@ from ctxr.fsm.api._paths import (
     project_root_and_relative,
 )
 
-
 # ---------------------------------------------------------------------------
 # looks_like_filesystem_db_path — sentinel matrix
 # ---------------------------------------------------------------------------
