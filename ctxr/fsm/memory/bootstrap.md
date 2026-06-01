@@ -7,8 +7,14 @@
 **Decision tree (no improvising):**
 
 ```bash
-# Detect. STDERR-silent so command-not-found doesn't pollute logs.
-uv run --quiet --no-project ctxr-fsm --version 2>/dev/null \
+# Detect. Clear PACKAGE_MISSING first so a pre-set env var from the
+# parent shell can't force-install. Probe via `uv run` (without
+# --no-project so a project-installed ctxr-fsm IS picked up; the bare
+# `uv run` will fall back to a UV_PROJECT_ENVIRONMENT cache if no
+# workdir pyproject.toml exists). The `command -v` fallback catches
+# pipx / pip --user installs that don't live in a uv environment.
+unset PACKAGE_MISSING
+uv run --quiet ctxr-fsm --version 2>/dev/null \
   || command -v ctxr-fsm >/dev/null \
   || PACKAGE_MISSING=1
 ```
@@ -28,7 +34,7 @@ After the install command completes, re-run the version check from the top of th
 - **Resolve "this workdir" BEFORE installing.** Walk up from `cwd` looking for `pyproject.toml`; if none, treat `cwd` as the workdir. Run the install command from that directory and nowhere else. An install in the wrong directory lands in the wrong project venv and the next session sees a "missing" package again.
 - **Do not run a second installer in a different directory.** One per workdir, ever. If the first command fails, surface the error to the user, do not silently try the next row.
 - **Do not try the three installers in sequence "just in case".** Each one targets a different install scope (project venv vs user-isolated vs system); chaining them creates multiple installs that drift and confuse the next session.
-- **Concurrency:** if `.ctxr-fsm/install.lock/` exists (mkdir-based lock), another session is mid-install. Wait or back off; do not run the install command. The lock is acquired by the installer (`mkdir .ctxr-fsm/install.lock` before, `rmdir` after); on a crash the operator unwedges with `rmdir .ctxr-fsm/install.lock`.
+- **Concurrency:** if `.ctxr-fsm/install.lock/` exists, another session is mid-install. Wait or back off; do not run the install command. **The CALLER (you, the skill or agent following this doc) wraps the install in the lock — `uv add` / `pipx install` do NOT manage it themselves.** The contract is `mkdir .ctxr-fsm/install.lock` BEFORE the install command, `rmdir .ctxr-fsm/install.lock` AFTER (success or failure), using `mkdir` so the directory-create acts as the atomic lock acquisition. On a crash that leaves the lock dangling, the operator unwedges with `rmdir .ctxr-fsm/install.lock`.
 
 If the install fails for any reason (permission, network, version pin), return `MissingRequirement` to the caller with the captured stderr and STOP. Do not improvise.
 
