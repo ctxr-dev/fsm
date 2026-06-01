@@ -72,13 +72,27 @@ describe('FlowGraph', () => {
     expect(positioned.every((n) => n.type === 'fsmNode')).toBe(true);
   });
 
-  test('autoLayout=false passes nodes through untouched', () => {
+  test('autoLayout=false preserves caller positions but stamps direction-aware handle sides', () => {
     const nodes: Node<FlowNodeData>[] = [
       { id: 'a', position: { x: 100, y: 200 }, data: { kind: 'state', label: 'a' } },
     ];
-    render(<FlowGraph nodes={nodes} edges={[]} autoLayout={false} />);
-    const passed = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
-    expect(passed[0].position).toEqual({ x: 100, y: 200 });
+    render(<FlowGraph nodes={nodes} edges={[]} autoLayout={false} direction="TB" />);
+    const passedTB = lastReactFlowProps!.nodes as Array<
+      Node<FlowNodeData> & { sourcePosition?: string; targetPosition?: string; type?: string }
+    >;
+    expect(passedTB[0].position).toEqual({ x: 100, y: 200 });
+    // TB: edges attach to bottom of source, top of target.
+    expect(passedTB[0].sourcePosition).toBe('bottom');
+    expect(passedTB[0].targetPosition).toBe('top');
+    expect(passedTB[0].type).toBe('fsmNode');
+
+    // Same nodes but LR direction → handles flip to right/left.
+    render(<FlowGraph nodes={nodes} edges={[]} autoLayout={false} direction="LR" />);
+    const passedLR = lastReactFlowProps!.nodes as Array<
+      Node<FlowNodeData> & { sourcePosition?: string; targetPosition?: string }
+    >;
+    expect(passedLR[0].sourcePosition).toBe('right');
+    expect(passedLR[0].targetPosition).toBe('left');
   });
 
   test('selectedNodeId decorates the matching node with selected=true', () => {

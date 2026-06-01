@@ -304,7 +304,22 @@ export function FlowGraph({
   className,
 }: FlowGraphProps): JSX.Element {
   const positioned = useMemo(() => {
-    if (!autoLayout) return [...nodes];
+    if (!autoLayout) {
+      // Preserve caller-supplied positions but still tag every node
+      // with the source/target Position that matches the active
+      // direction. Without this, FsmNode falls back to its Right/Left
+      // defaults and a TB graph would render edges attaching to the
+      // wrong sides (W20 Copilot finding on #56). The custom node
+      // type is also applied so callers don't have to set it manually.
+      const sp = direction === 'LR' ? Position.Right : Position.Bottom;
+      const tp = direction === 'LR' ? Position.Left : Position.Top;
+      return nodes.map((n) => ({
+        ...n,
+        sourcePosition: n.sourcePosition ?? sp,
+        targetPosition: n.targetPosition ?? tp,
+        type: n.type ?? 'fsmNode',
+      }));
+    }
     return applyDagreLayout(nodes, edges, direction);
   }, [nodes, edges, autoLayout, direction]);
 
