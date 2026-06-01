@@ -122,3 +122,14 @@ html {
 body {
   margin: 0;
 }
+
+/* xyflow edge-label background colour (W20): light theme uses page
+   background; dark theme uses slate-800. FlowGraph passes
+   `fill: var(--xy-label-bg)` so the predicate-text badge stays
+   readable when an edge passes near another node. */
+:root {
+  --xy-label-bg: #ffffff;
+}
+.dark {
+  --xy-label-bg: #1e293b;
+}

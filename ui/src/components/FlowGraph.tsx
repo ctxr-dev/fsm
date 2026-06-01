@@ -54,7 +54,8 @@ export interface FlowGraphProps {
   edges: readonly Edge[];
   /** When true (default), runs a dagre layered layout if nodes lack positions. */
   autoLayout?: boolean;
-  /** Layout direction. Default 'LR' (left to right). */
+  /** Layout direction. Default 'TB' (top to bottom) — natural reading for
+   * FSMs, and fits a viewport-bounded panel better than LR for long chains. */
   direction?: 'LR' | 'TB';
   /** Click handler on a node (e.g. open the state-details Sheet). */
   onNodeClick?: (id: string, data: FlowNodeData) => void;
@@ -142,7 +143,37 @@ const NODE_TYPES = { fsmNode: FsmNode };
  * Run dagre layered layout to position nodes. Returns a fresh node
  * array with positions filled in. Idempotent — re-running on already-
  * positioned nodes produces the same result.
+ *
+ * W20 tuning: the previous nodesep=40 / ranksep=80 (with LR default)
+ * produced layouts where a 15-state FSM (skill-code-review) sprawled
+ * 6000+ px wide off-screen and predicate labels (e.g. `tier ==
+ * 'trivial' AND len(risk_signals) == 0 AND NOT scope_overrides_...`)
+ * crossed over unrelated nodes. The new defaults move FSMs to a TB
+ * (top-to-bottom) layout that fits the viewport vertically and gives
+ * dagre enough lateral slack to route long-predicate edges around
+ * sibling nodes:
+ *
+ *   nodesep: 70      horizontal gap between sibling nodes in same rank (TB)
+ *   ranksep: 90      vertical gap between consecutive ranks (TB)
+ *   edgesep: 30      minimum gap between adjacent edges
+ *   marginx: 30      graph padding left/right
+ *   marginy: 30      graph padding top/bottom
+ *   ranker: 'tight-tree'  prefers compact ranks over absolute shortest
+ *                         paths; for FSMs with branchy predicates this
+ *                         keeps the visual centre line stable
+ *
+ * Edge labels reserve dagre space proportional to text length so dagre
+ * routes around them (see g.setEdge below). Labels themselves are
+ * truncated by decorateEdges to LABEL_MAX_CHARS so they stay legible.
+ *
+ * We also pass per-edge label dimensions (LABEL_WIDTH / LABEL_HEIGHT)
+ * so dagre reserves space for the label and routes the edge around
+ * the surrounding nodes. Edge labels are truncated by decorateEdges
+ * to LABEL_MAX_CHARS so they stay within LABEL_WIDTH.
  */
+const LABEL_WIDTH = 160;
+const LABEL_HEIGHT = 18;
+
 function applyDagreLayout(
   nodes: readonly Node<FlowNodeData>[],
   edges: readonly Edge[],
@@ -150,9 +181,27 @@ function applyDagreLayout(
 ): Node<FlowNodeData>[] {
   const g = new dagre.graphlib.Graph();
   g.setDefaultEdgeLabel(() => ({}));
-  g.setGraph({ rankdir: direction, nodesep: 40, ranksep: 80 });
+  g.setGraph({
+    rankdir: direction,
+    nodesep: direction === 'TB' ? 70 : 90,
+    ranksep: direction === 'TB' ? 90 : 200,
+    edgesep: 30,
+    marginx: 30,
+    marginy: 30,
+    ranker: 'tight-tree',
+  });
   for (const n of nodes) g.setNode(n.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
-  for (const e of edges) g.setEdge(e.source, e.target);
+  for (const e of edges) {
+    const labelLen = typeof e.label === 'string' ? e.label.length : 0;
+    // Reserve label space proportionally so dagre routes around
+    // long predicate labels instead of letting them collide with
+    // nodes downstream.
+    g.setEdge(e.source, e.target, {
+      width: labelLen > 0 ? Math.min(LABEL_WIDTH, Math.max(40, labelLen * 7)) : 0,
+      height: labelLen > 0 ? LABEL_HEIGHT : 0,
+      labelpos: 'c',
+    });
+  }
   dagre.layout(g);
 
   return nodes.map((n) => {
@@ -167,38 +216,67 @@ function applyDagreLayout(
   });
 }
 
+// Truncate predicate strings so a single edge label can't sprawl over
+// downstream nodes. Full text remains available in the tooltip
+// (xyflow surfaces edge.data.fullLabel via our hover handler in a
+// future iteration; today the truncated text is enough for the
+// at-a-glance layout). Truncation point chosen empirically: 28 chars
+// fits comfortably within the dagre-allocated LABEL_WIDTH (160 px) at
+// the 10 px font-size we use.
+const LABEL_MAX_CHARS = 28;
+function truncateLabel(text: string): string {
+  if (text.length <= LABEL_MAX_CHARS) return text;
+  return text.slice(0, LABEL_MAX_CHARS - 1) + '…';
+}
+
 // Decorate edges so they render visibly in both themes: stroke via
 // currentColor (the outer container sets text-color per theme), arrow
-// markers so direction is unambiguous, labels with a themed fill.
+// markers so direction is unambiguous, labels with a themed fill +
+// solid background rect so the text is always legible against the
+// graph background.
 function decorateEdges(edges: readonly Edge[]): Edge[] {
-  return edges.map((e) => ({
-    ...e,
-    type: e.type ?? 'default',
-    animated: e.animated ?? false,
-    style: {
-      strokeWidth: 1.5,
-      stroke: 'currentColor',
-      ...(e.style ?? {}),
-    },
-    markerEnd: e.markerEnd ?? {
-      type: MarkerType.ArrowClosed,
-      width: 18,
-      height: 18,
-      color: 'currentColor',
-    },
-    labelStyle: {
-      fontSize: 10,
-      fill: 'currentColor',
-      ...(e.labelStyle ?? {}),
-    },
-  }));
+  return edges.map((e) => {
+    const labelText = typeof e.label === 'string' ? truncateLabel(e.label) : e.label;
+    return {
+      ...e,
+      type: e.type ?? 'default',
+      animated: e.animated ?? false,
+      label: labelText,
+      style: {
+        strokeWidth: 1.5,
+        stroke: 'currentColor',
+        ...(e.style ?? {}),
+      },
+      markerEnd: e.markerEnd ?? {
+        type: MarkerType.ArrowClosed,
+        width: 18,
+        height: 18,
+        color: 'currentColor',
+      },
+      labelStyle: {
+        fontSize: 10,
+        fill: 'currentColor',
+        ...(e.labelStyle ?? {}),
+      },
+      // Render a solid background rect under each label so an
+      // edge that happens to pass close to another node still has
+      // a readable label badge.
+      labelShowBg: true,
+      labelBgStyle: {
+        fill: 'var(--xy-label-bg, #ffffff)',
+        fillOpacity: 0.92,
+      },
+      labelBgPadding: [6, 4] as [number, number],
+      labelBgBorderRadius: 4,
+    };
+  });
 }
 
 export function FlowGraph({
   nodes,
   edges,
   autoLayout = true,
-  direction = 'LR',
+  direction = 'TB',
   onNodeClick,
   onEdgeClick,
   selectedNodeId,
