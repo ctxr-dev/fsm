@@ -9,6 +9,13 @@ This package directory holds:
   skill / agent should ensure ``ctxr-fsm`` is ready before any work.
   The repo-root ``BOOTSTRAP.md`` is a generated mirror of this file
   (see ``scripts/sync_bootstrap_doc.py``).
+* W23-SSOT canonical reference docs that any skill / agent in the
+  workspace links to instead of inlining the contract themselves:
+  ``AGENT_QUICKSTART.md`` (five-minute orientation),
+  ``SKILL_TEMPLATE.md`` (skill authoring template),
+  ``GATE_CONTRACT.md`` (cross-FSM gate protocol). These are reachable
+  from any Python consumer via :func:`get_ssot_doc_path` so no caller
+  needs to know the on-disk layout.
 
 The adapters are byte-stable re-emits of ``principles.md`` with the
 right per-client frontmatter and a generated-from header. Regenerate
@@ -33,6 +40,17 @@ _CLIENT_FILENAMES: dict[str, str] = {
     "claude": "principles.claude.md",
     "codex": "principles.codex.md",
     "cursor": "principles.cursor.md",
+}
+
+# W23-SSOT canonical reference docs. Keyed by short slug so callers
+# (skills, CLI commands, IDE integrations) reference them by name
+# rather than open-coding the on-disk filename. Adding a new SSOT doc
+# means landing the file under this directory and adding one entry
+# here; nothing else needs to know.
+_SSOT_FILENAMES: dict[str, str] = {
+    "agent_quickstart": "AGENT_QUICKSTART.md",
+    "skill_template": "SKILL_TEMPLATE.md",
+    "gate_contract": "GATE_CONTRACT.md",
 }
 
 
@@ -89,9 +107,59 @@ def get_bootstrap_path() -> Path:
     return path
 
 
+def get_ssot_doc_path(slug: str) -> Path:
+    """Return the absolute path to a W23-SSOT canonical reference doc.
+
+    Parameters
+    ----------
+    slug:
+        One of ``"agent_quickstart"``, ``"skill_template"``,
+        ``"gate_contract"``.
+
+    Raises
+    ------
+    ValueError
+        If ``slug`` is not a recognised SSOT doc key.
+    FileNotFoundError
+        If the doc is missing from the installed package — a packaging
+        bug the caller should surface rather than paper over.
+
+    The SSOT docs are intentionally client-agnostic plain Markdown. A
+    skill or agent that needs the contract reads the file via this
+    helper rather than re-deriving the same content; that way an update
+    to the contract lands in one place and propagates uniformly.
+    """
+
+    try:
+        filename = _SSOT_FILENAMES[slug]
+    except KeyError as exc:
+        valid = ", ".join(sorted(_SSOT_FILENAMES))
+        raise ValueError(
+            f"unknown SSOT doc slug {slug!r}; expected one of: {valid}"
+        ) from exc
+
+    path = PRINCIPLES_DIR / filename
+    if not path.is_file():
+        raise FileNotFoundError(f"SSOT doc missing in package: {path}")
+    return path
+
+
+def list_ssot_doc_slugs() -> list[str]:
+    """Return the sorted list of known W23-SSOT doc slugs.
+
+    Useful for CLI commands that iterate over the full set (e.g.
+    ``ctxr-fsm doctor --skill-consumer`` checks each one is reachable
+    after install) without hard-coding the slug list.
+    """
+
+    return sorted(_SSOT_FILENAMES)
+
+
 __all__ = [
     "BOOTSTRAP_FILENAME",
     "PRINCIPLES_DIR",
     "get_bootstrap_path",
     "get_principles_path",
+    "get_ssot_doc_path",
+    "list_ssot_doc_slugs",
 ]

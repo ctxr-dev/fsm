@@ -311,3 +311,50 @@ def test_doctor_json_alembic_revision_is_non_empty_string() -> None:
         revision = payload["alembic_revision"]
         assert isinstance(revision, str)
         assert revision  # not empty
+
+
+# ---------------------------------------------------------------------------
+# W23-SSOT: ``--skill-consumer`` flag
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_without_skill_consumer_flag_omits_section() -> None:
+    """The new section is opt-in; default invocations stay byte-stable.
+
+    Existing scripts that parse the doctor JSON envelope must not see
+    a surprise new key. The ``--skill-consumer`` flag adds the section;
+    without it, the output shape is unchanged.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "fsm.db"
+        _init_project(db_path)
+
+        result = runner.invoke(app, ["doctor", "--db", str(db_path), "--json"])
+
+        assert result.exit_code == 0, result.stderr
+        payload = json.loads(result.stdout)
+        assert "skill_consumer" not in payload
+
+
+def test_doctor_with_skill_consumer_flag_reports_all_docs_present() -> None:
+    """W23-SSOT happy path: every canonical doc resolves in the install."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "fsm.db"
+        _init_project(db_path)
+
+        result = runner.invoke(
+            app, ["doctor", "--db", str(db_path), "--json", "--skill-consumer"]
+        )
+
+        assert result.exit_code == 0, result.stderr
+        payload = json.loads(result.stdout)
+        section = payload["skill_consumer"]
+        assert section["status"] == "ok"
+        assert section["missing"] == []
+        assert section["principles_path"].endswith("principles.claude.md")
+        assert section["bootstrap_path"].endswith("bootstrap.md")
+        # Every SSOT doc is present with an existing file path.
+        for slug in ("agent_quickstart", "skill_template", "gate_contract"):
+            entry = section["ssot_docs"][slug]
+            assert entry["exists"] is True
+            assert entry["path"].endswith(".md")
