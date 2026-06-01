@@ -59,6 +59,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -315,6 +316,10 @@ def get_current_project(project: ProjectDep) -> ProjectMetadata:
     # rather than emit nonsense (e.g. treating ``sqlite://`` as a
     # filesystem path).
     db_url_database = project.engine.url.database
+    # For non-file backends fall back to the rendered URL so the field
+    # still has SOMETHING useful; for file backends we resolve below
+    # so the doc-promised "absolute filesystem path" actually holds
+    # even when the engine was opened with a relative ``--db`` arg.
     db_path = db_url_database or str(project.engine.url)
     project_root_str: str | None = None
     db_relative: str | None = None
@@ -325,6 +330,12 @@ def get_current_project(project: ProjectDep) -> ProjectMetadata:
     if looks_like_filesystem_db_path(db_url_database):
         project_root_path, db_relative = project_root_and_relative(db_url_database)
         project_root_str = str(project_root_path)
+        # Normalise db_path to absolute too — `project_root_and_relative`
+        # already resolves the path internally, and the doc string says
+        # this field is "absolute". When the engine was opened with a
+        # relative path the raw url.database would be relative too,
+        # contradicting the doc.
+        db_path = str(Path(db_url_database).resolve())
     return ProjectMetadata(
         fsm_version=ctxr.fsm.__version__,
         project_open=True,

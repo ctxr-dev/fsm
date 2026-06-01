@@ -224,9 +224,14 @@ function StateInspectorBody({ state, isEntry }: StateInspectorBodyProps): JSX.El
               // conditions that actually MATTER for understanding why
               // the FSM branched. always / otherwise stay slate.
               const isPredicate = tKind === 'deterministic' || tKind === 'judgement';
+              // `min-w-0` is mandatory on a `truncate` flex item: without
+              // it the item's intrinsic min-content width wins and a long
+              // predicate overflows the row instead of truncating with
+              // ellipsis. `flex-1` only gives the item room to grow, not
+              // permission to shrink below its content width.
               const whenClass = isPredicate
-                ? 'font-mono text-amber-700 dark:text-amber-300 font-semibold truncate flex-1 px-1.5 py-0.5 rounded bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-700/50'
-                : 'font-mono text-slate-500 dark:text-slate-400 truncate flex-1';
+                ? 'font-mono text-amber-700 dark:text-amber-300 font-semibold truncate flex-1 min-w-0 px-1.5 py-0.5 rounded bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-700/50'
+                : 'font-mono text-slate-500 dark:text-slate-400 truncate flex-1 min-w-0';
               return (
                 <li key={`${target}-${idx}`} class="py-1.5 flex items-center gap-2">
                   {tKind ? <Pill variant={transitionKindVariant(tKind)} size="sm">{tKind}</Pill> : null}

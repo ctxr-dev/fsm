@@ -43,6 +43,7 @@ Design notes
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -425,6 +426,12 @@ def _build_doctor_report(
     if looks_like_filesystem_db_path(db_url_database):
         project_root_path, db_path_relative = project_root_and_relative(db_url_database)
         project_root_str = str(project_root_path)
+        # Normalise db_path to absolute (matches the field's doc
+        # contract). When the engine was opened with a relative path
+        # the raw url.database would be relative too — `Path.resolve`
+        # plus the canonical layout walk-up keeps the wire shape
+        # uniform across hosts.
+        db_path = str(Path(db_url_database).resolve())
     return DoctorReport(
         db_path=db_path,
         project_root=project_root_str,
