@@ -19,14 +19,17 @@ import { useRoute } from 'preact-iso';
 
 import {
   Card,
+  CodeBlock,
   Diff,
   EmptyState,
   FlowGraph,
   JsonViewer,
+  KeyValueTable,
   Pill,
   Spinner,
   Table,
   Tabs,
+  type KvRow,
   type PillVariant,
   type TabSpec,
   type TableColumn,
@@ -39,7 +42,8 @@ import {
   type SpecSummary,
 } from '../lib/api';
 import { canonicalJson } from '../lib/canonicalJson';
-import { specToGraph } from '../lib/specGraph';
+import { specToGraph, transitionKind } from '../lib/specGraph';
+import { openSheet } from '../lib/store';
 
 const shortHash = (h: string): string => (h.length > 12 ? h.slice(0, 12) : h);
 const shortId = (id: string): string => (id.length > 7 ? id.slice(0, 7) : id);
@@ -83,8 +87,261 @@ function siblingsOf(detail: SpecDetail, all: SpecSummary[]): SpecSummary[] {
 // Tab panels
 // ---------------------------------------------------------------------------
 
-function GraphPanel({ detail }: { detail: SpecDetail }): JSX.Element {
+// ---------------------------------------------------------------------------
+// W21: Graph inspectors — click a node or edge to open a Sheet with the
+// full payload (worker prompt, response_schema, allowed_tools, loop,
+// inline handler, transitions out; or transition kind + full predicate +
+// source/target).
+// ---------------------------------------------------------------------------
+
+interface StateInspectorBodyProps {
+  state: Record<string, unknown>;
+  isEntry: boolean;
+}
+
+function transitionKindVariant(kind: string | undefined): PillVariant {
+  switch (kind) {
+    case 'judgement': return 'success';
+    case 'deterministic': return 'info';
+    case 'otherwise': return 'warning';
+    default: return 'neutral';
+  }
+}
+
+function StateInspectorBody({ state, isEntry }: StateInspectorBodyProps): JSX.Element {
+  const id = typeof state.id === 'string' ? state.id : '(unknown)';
+  const kind = typeof state.kind === 'string' ? state.kind : '—';
+  const worker = state.worker as Record<string, unknown> | undefined;
+  const inline = state.inline as Record<string, unknown> | undefined;
+  const loop = state.loop as unknown;
+  const transitions = Array.isArray(state.transitions)
+    ? (state.transitions as Array<Record<string, unknown>>)
+    : [];
+
+  const rows: KvRow[] = [
+    { key: 'id', value: id },
+    { key: 'kind', value: kind },
+  ];
+  if (isEntry) rows.push({ key: 'entry', value: true, hint: 'spec entry state' });
+  if (worker?.role) rows.push({ key: 'worker.role', value: String(worker.role) });
+  if (inline?.handler_id) rows.push({ key: 'inline.handler_id', value: String(inline.handler_id) });
+  const allowedTools = Array.isArray(worker?.allowed_tools) ? worker?.allowed_tools : null;
+  if (allowedTools) rows.push({ key: 'worker.allowed_tools', value: allowedTools });
+
+  return (
+    <div class="space-y-4 p-3">
+      <KeyValueTable rows={rows} caption="State metadata" />
+      {/* Every section heading below is the LITERAL FSM library field
+          name (worker.prompt_template / worker.response_schema /
+          state.loop / state.transitions). No consumer-specific text:
+          the FSM UI is agnostic to which skill / agent system is
+          using the library, and labels its sections after the field
+          paths the Worker / State models actually expose. */}
+      {worker?.prompt_template ? (
+        <section>
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            worker.prompt_template
+            {worker.prompt_template_language ? (
+              <span class="ml-2 text-slate-400 dark:text-slate-500">
+                · language={String(worker.prompt_template_language)}
+              </span>
+            ) : null}
+          </h4>
+          {/* The consumer's `prompt_template_language` field (defined
+              on the FSM library's Worker model since W21) tells the
+              UI how to render. When set, CodeBlock honours it
+              verbatim; when omitted, the markdown content heuristic
+              acts as a courtesy fallback. */}
+          <CodeBlock
+            text={String(worker.prompt_template)}
+            language={
+              typeof worker.prompt_template_language === 'string'
+                ? worker.prompt_template_language
+                : undefined
+            }
+            maxInlineHeight="max-h-64"
+            ariaLabel={`${id} worker prompt template`}
+          />
+        </section>
+      ) : null}
+      {worker?.response_schema ? (
+        <section>
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            worker.response_schema
+          </h4>
+          <JsonViewer
+            value={worker.response_schema}
+            rootLabel="response_schema"
+            mode="inline"
+            maxInlineHeight="max-h-64"
+          />
+        </section>
+      ) : null}
+      {loop ? (
+        <section>
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            state.loop
+          </h4>
+          <JsonViewer value={loop} rootLabel="loop" mode="inline" maxInlineHeight="max-h-48" />
+        </section>
+      ) : null}
+      {transitions.length > 0 ? (
+        <section>
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            state.transitions ({transitions.length})
+          </h4>
+          <ul class="divide-y divide-slate-100 dark:divide-slate-800 text-xs">
+            {transitions.map((t, idx) => {
+              const target = typeof t.to === 'string' ? t.to : '(unknown)';
+              // Derive the kind from the `when` payload via the shared
+              // helper — the FSM library's Transition model has no
+              // top-level `kind` field, so reading t.kind would always
+              // be undefined for spec-authored data. Mirrors how the
+              // graph edge data.kind is computed.
+              const tKind = transitionKind(t);
+              // Mirror specGraph.predicateLabel(): a `when` dict can
+              // encode the human-readable guard text under any of
+              // `.predicate` (bare Predicate dump), `.expression`
+              // (deterministic kind), or `.criteria` (judgement
+              // kind). Checking only some of them leaves the
+              // inspector blank for judgement transitions while the
+              // edge label / tooltip still renders text — confusing.
+              const when = typeof t.when === 'string'
+                ? t.when
+                : t.when && typeof t.when === 'object'
+                ? (((t.when as Record<string, unknown>).predicate as string | undefined)
+                    ?? ((t.when as Record<string, unknown>).expression as string | undefined)
+                    ?? ((t.when as Record<string, unknown>).criteria as string | undefined)
+                    ?? '')
+                : '';
+              return (
+                <li key={`${target}-${idx}`} class="py-1.5 flex items-center gap-2">
+                  {tKind ? <Pill variant={transitionKindVariant(tKind)} size="sm">{tKind}</Pill> : null}
+                  <code class="font-mono text-slate-700 dark:text-slate-300">{target}</code>
+                  {when ? (
+                    <code class="font-mono text-slate-500 dark:text-slate-400 truncate flex-1" title={when}>
+                      {when}
+                    </code>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
+interface TransitionInspectorBodyProps {
+  source: string;
+  target: string;
+  kind?: string;
+  predicate?: string;
+  transition: Record<string, unknown> | undefined;
+}
+
+function TransitionInspectorBody({
+  source,
+  target,
+  kind,
+  predicate,
+  transition,
+}: TransitionInspectorBodyProps): JSX.Element {
+  const rows: KvRow[] = [
+    { key: 'source', value: source },
+    { key: 'target', value: target },
+    { key: 'kind', value: kind ?? '—' },
+  ];
+  return (
+    <div class="space-y-4 p-3">
+      <div class="flex items-center gap-2">
+        {kind ? <Pill variant={transitionKindVariant(kind)} size="sm">{kind}</Pill> : null}
+        <code class="text-sm font-mono">
+          <span class="text-slate-700 dark:text-slate-300">{source}</span>
+          <span class="text-slate-500 mx-1">→</span>
+          <span class="text-slate-700 dark:text-slate-300">{target}</span>
+        </code>
+      </div>
+      <KeyValueTable rows={rows} caption="Transition metadata" />
+      {/* Same convention as StateInspectorBody above: headings are
+          the FSM library's literal transition-shape paths so the
+          operator sees field names, not designer text. */}
+      {predicate ? (
+        <section>
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            transition.when
+          </h4>
+          <CodeBlock
+            text={predicate}
+            language="plain"
+            maxInlineHeight="max-h-64"
+            ariaLabel={`${source} to ${target} predicate`}
+          />
+        </section>
+      ) : null}
+      {transition ? (
+        <section>
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            transition (raw)
+          </h4>
+          <JsonViewer
+            value={transition}
+            rootLabel="transition"
+            mode="inline"
+            maxInlineHeight="max-h-48"
+          />
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
+interface GraphPanelProps {
+  detail: SpecDetail;
+}
+
+function GraphPanel({ detail }: GraphPanelProps): JSX.Element {
   const graph = useMemo(() => specToGraph(detail.definition), [detail.definition]);
+
+  const handleNodeClick = (id: string, data: Record<string, unknown>): void => {
+    const state = (data.state as Record<string, unknown> | undefined) ?? null;
+    if (!state) return;
+    const def = detail.definition as Record<string, unknown> | undefined;
+    const entryId = def && typeof def.entry === 'string' ? def.entry : null;
+    openSheet({
+      id: `state:${detail.id}:${id}`,
+      title: id,
+      width: 'right-half',
+      urlFragment: `state-${id}`,
+      content: <StateInspectorBody state={state} isEntry={entryId === id} />,
+    });
+  };
+
+  const handleEdgeClick = (edgeId: string, data?: Record<string, unknown>): void => {
+    if (!data) return;
+    const source = typeof data.sourceId === 'string' ? data.sourceId : '';
+    const target = typeof data.targetId === 'string' ? data.targetId : '';
+    const kind = typeof data.kind === 'string' ? data.kind : undefined;
+    const fullLabel = typeof data.fullLabel === 'string' ? data.fullLabel : undefined;
+    const transition = data.transition as Record<string, unknown> | undefined;
+    openSheet({
+      id: `transition:${detail.id}:${edgeId}`,
+      title: `${source} → ${target}`,
+      width: 'right-third',
+      urlFragment: `edge-${edgeId}`,
+      content: (
+        <TransitionInspectorBody
+          source={source}
+          target={target}
+          kind={kind}
+          predicate={fullLabel}
+          transition={transition}
+        />
+      ),
+    });
+  };
+
   return (
     <div class="h-[70vh] p-3">
       <FlowGraph
@@ -92,6 +349,8 @@ function GraphPanel({ detail }: { detail: SpecDetail }): JSX.Element {
         edges={graph.edges}
         autoLayout={true}
         direction="TB"
+        onNodeClick={handleNodeClick}
+        onEdgeClick={handleEdgeClick}
       />
     </div>
   );

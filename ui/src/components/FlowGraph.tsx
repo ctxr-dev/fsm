@@ -41,12 +41,27 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
+import { Tooltip } from './Tooltip';
+import { FsmEdge, FsmEdgeClickContext } from './FsmEdge';
+
 export type FlowNodeKind = 'state' | 'worker' | 'terminal' | 'producer' | 'consumer' | 'inline';
 
 export interface FlowNodeData extends Record<string, unknown> {
   kind: FlowNodeKind;
+  /** Visible (truncated) label rendered inside the node. */
   label: string;
+  /** Visible (truncated) sublabel under the main label. */
   sublabel?: string;
+  /** Full untruncated label surfaced via hover tooltip + click-to-Sheet.
+   *  Defaults to `label` when omitted. */
+  fullLabel?: string;
+  /** Full untruncated sublabel surfaced via hover tooltip.
+   *  Defaults to `sublabel` when omitted. */
+  fullSublabel?: string;
+  /** Original spec state object (typed loosely so FlowGraph stays
+   *  domain-agnostic for Topology / Drift consumers). Surfaced to
+   *  onNodeClick so the caller can render an inspector Sheet. */
+  state?: Record<string, unknown>;
 }
 
 export interface FlowGraphProps {
@@ -61,8 +76,11 @@ export interface FlowGraphProps {
   direction?: 'LR' | 'TB';
   /** Click handler on a node (e.g. open the state-details Sheet). */
   onNodeClick?: (id: string, data: FlowNodeData) => void;
-  /** Click handler on an edge. */
-  onEdgeClick?: (id: string) => void;
+  /** Click handler on an edge. The second arg carries the edge's
+   *  data payload (set by decorateEdges); typed loosely so callers can
+   *  cast to FsmEdgeData or their own shape. Backward-compatible:
+   *  existing handlers that take only `id` keep working. */
+  onEdgeClick?: (id: string, data?: Record<string, unknown>) => void;
   /** Selected node id; renders with an emphasis ring. */
   selectedNodeId?: string;
   /** Show the mini-map control. Default true for >10 nodes, false otherwise. */
@@ -75,8 +93,13 @@ export interface FlowGraphProps {
   className?: string;
 }
 
-const NODE_WIDTH = 180;
-const NODE_HEIGHT = 56;
+// W21 user-requested: 50% bigger than the W20 sizes (180x56 → 270x84)
+// so long state ids (e.g. `synthesize_release_readiness`) fit on one
+// line and the kind badge no longer competes for horizontal room.
+// Dagre layout constants below are tuned proportionally to keep edges
+// clear of the larger node boxes.
+const NODE_WIDTH = 270;
+const NODE_HEIGHT = 84;
 
 const NODE_KIND_CLASSES: Record<FlowNodeKind, string> = {
   state:
@@ -105,10 +128,27 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
   // layout numbers; staying inline keeps the two values in literal
   // sync. Suppress the no-inline-styles lint for this single case.
   /* eslint-disable-next-line react/forbid-dom-props -- xyflow nodes need fixed pixel dimensions matched to dagre layout */
+  // Layout (W21, post 50% size bump):
+  //   ┌──────────────────────────────────────────────┐
+  //   │ KIND                                         │  row 1: kind chip (tiny)
+  //   │ synthesize_release_readiness                 │  row 2: label, FULL width
+  //   │ inline: synthesize_release_handler           │  row 3: sublabel, full width
+  //   └──────────────────────────────────────────────┘
+  // Moving the kind label to its own row above the main label gives
+  // the state id the entire 270-px node width to expand into, which is
+  // what the user asked for: "make sure all labels and texts fit the
+  // node shape, not going outside of it". Long ids (>~32 chars) still
+  // truncate visually but their full text remains reachable via the
+  // Tooltip wrapper.
   return (
     <div
       class={[
-        'fsm-node relative rounded-md border-2 shadow-sm px-3 py-2 text-xs',
+        'fsm-node relative rounded-md border-2 shadow-sm px-4 py-3',
+        // justify-center centers the kind/label/sublabel block
+        // vertically within the (fixed) node height. gap-1 gives the
+        // three rows even breathing room instead of the previous
+        // gap-0.5 which clustered them too tightly at the top.
+        'flex flex-col gap-1 justify-center overflow-hidden',
         NODE_KIND_CLASSES[kind],
         selected ? 'ring-2 ring-emerald-400 ring-offset-1' : '',
       ].join(' ')}
@@ -119,16 +159,24 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
         position={tp}
         style={{ background: 'currentColor', width: 8, height: 8, border: 'none' }}
       />
-      <div class="flex items-center justify-between gap-1">
-        <span class="font-semibold truncate" title={data.label}>
+      <span class="text-[9px] uppercase tracking-wider opacity-60 leading-none">
+        {kind}
+      </span>
+      <Tooltip content={data.fullLabel ?? data.label} delay={400}>
+        <span class="font-semibold text-sm truncate block w-full leading-tight">
           {data.label}
         </span>
-        <span class="text-[10px] uppercase tracking-wide opacity-60">{kind}</span>
-      </div>
+      </Tooltip>
       {data.sublabel ? (
-        <div class="text-[10px] opacity-70 truncate" title={data.sublabel}>
-          {data.sublabel}
-        </div>
+        <Tooltip content={data.fullSublabel ?? data.sublabel} delay={400}>
+          {/* <span> not <div>: Tooltip's wrapper renders as a <span>,
+              and HTML doesn't allow <div> inside <span>. The `block`
+              class restores div-like layout without invalidating the
+              DOM. */}
+          <span class="text-[11px] opacity-70 truncate block w-full leading-tight">
+            {data.sublabel}
+          </span>
+        </Tooltip>
       ) : null}
       <Handle
         type="source"
@@ -140,6 +188,7 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
 }
 
 const NODE_TYPES = { fsmNode: FsmNode };
+const EDGE_TYPES = { fsmEdge: FsmEdge };
 
 /**
  * Run dagre layered layout to position nodes. Returns a fresh node
@@ -189,11 +238,14 @@ function applyDagreLayout(
   g.setDefaultEdgeLabel(() => ({}));
   g.setGraph({
     rankdir: direction,
-    nodesep: direction === 'TB' ? 70 : 90,
-    ranksep: direction === 'TB' ? 90 : 200,
-    edgesep: 30,
-    marginx: 30,
-    marginy: 30,
+    // W21: node size bumped 50% (180x56 → 270x84), so dagre needs
+    // proportionally more inter-node room to keep edges + labels from
+    // colliding with the larger boxes.
+    nodesep: direction === 'TB' ? 90 : 110,
+    ranksep: direction === 'TB' ? 110 : 240,
+    edgesep: 36,
+    marginx: 36,
+    marginy: 36,
     ranker: 'tight-tree',
   });
   for (const n of nodes) g.setNode(n.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
@@ -230,12 +282,18 @@ function applyDagreLayout(
 }
 
 // Truncate predicate strings so a single edge label can't sprawl over
-// downstream nodes. Full text remains available in the tooltip
-// (xyflow surfaces edge.data.fullLabel via our hover handler in a
-// future iteration; today the truncated text is enough for the
-// at-a-glance layout). Truncation point chosen empirically: 28 chars
-// fits comfortably within the dagre-allocated LABEL_WIDTH (160 px) at
-// the 10 px font-size we use.
+// downstream nodes. The FULL text is preserved on edge.data.fullLabel
+// (W21) and surfaced via the FsmEdge custom edge type's Tooltip on
+// hover + click-to-Sheet.
+//
+// Note on dagre slack: applyDagreLayout above computes per-edge label
+// dimensions from the ORIGINAL (pre-decoration) label length and
+// clamps to LABEL_WIDTH (160 px). The truncation that happens in
+// decorateEdges only affects the VISIBLE text the user reads — dagre
+// never sees the truncated string, so its routing slack stays
+// proportional to the actual predicate complexity. Truncation point
+// chosen empirically: 28 chars fits comfortably within LABEL_WIDTH
+// at the 10 px font-size we use.
 const LABEL_MAX_CHARS = 28;
 function truncateLabel(text: string): string {
   if (text.length <= LABEL_MAX_CHARS) return text;
@@ -249,17 +307,31 @@ function truncateLabel(text: string): string {
 // graph background.
 function decorateEdges(edges: readonly Edge[]): Edge[] {
   return edges.map((e) => {
+    const original = typeof e.label === 'string' ? e.label : undefined;
     const labelText = typeof e.label === 'string' ? truncateLabel(e.label) : e.label;
+    // Carry the full predicate + transition metadata on edge.data so the
+    // custom FsmEdge type can Tooltip it AND so onEdgeClick consumers
+    // (specDetail's inspector Sheet) can render the full payload without
+    // re-walking the spec.
+    const incomingData = (e.data ?? {}) as Record<string, unknown>;
+    const data: Record<string, unknown> = {
+      ...incomingData,
+      fullLabel: typeof incomingData.fullLabel === 'string'
+        ? incomingData.fullLabel
+        : original,
+      sourceId: e.source,
+      targetId: e.target,
+    };
     return {
       ...e,
-      // W20: default to 'step' (sharp 90-degree corners) instead of
-      // 'default' (smooth bezier). For FSM graphs, orthogonal routing
-      // makes the topology easier to trace at a glance — every edge
-      // changes direction at the layer boundary, so the visual centre
-      // line stays stable and parallel transitions stack cleanly.
-      type: e.type ?? 'step',
+      // W21: use FsmEdge custom type which wraps the label in a Tooltip
+      // and exposes the full predicate via hover/focus. Defaults to
+      // 'step' visual routing under the hood (sharp 90-degree corners,
+      // matches PR #56's orthogonal routing).
+      type: e.type ?? 'fsmEdge',
       animated: e.animated ?? false,
       label: labelText,
+      data,
       style: {
         strokeWidth: 1.5,
         stroke: 'currentColor',
@@ -333,6 +405,13 @@ export function FlowGraph({
 
   const showMiniMap = miniMap ?? nodes.length > 10;
 
+  // Compute decorated edges BEFORE any conditional return. React's
+  // rules-of-hooks require every hook to be called in the same order
+  // on every render; the previous version put this useMemo after the
+  // empty-graph early return, which threw when the same FlowGraph
+  // flipped between 0 nodes and >0 nodes (Copilot finding on PR #57).
+  const decoratedEdges = useMemo(() => decorateEdges(edges), [edges]);
+
   if (nodes.length === 0) {
     return (
       <div
@@ -356,8 +435,8 @@ export function FlowGraph({
   // stroke colour via currentColor (see decorateEdges). The fitView
   // padding adds breathing room so dagre's wide LR layout doesn't
   // clip nodes at the viewport edges.
-  const decoratedEdges = useMemo(() => decorateEdges(edges), [edges]);
   return (
+    <FsmEdgeClickContext.Provider value={onEdgeClick ?? null}>
     <div
       class={[
         'flow-graph relative h-full w-full min-h-[320px]',
@@ -369,10 +448,14 @@ export function FlowGraph({
         nodes={decoratedNodes}
         edges={decoratedEdges}
         nodeTypes={NODE_TYPES}
+        edgeTypes={EDGE_TYPES}
         fitView
         fitViewOptions={{ padding: 0.2, includeHiddenNodes: false }}
         proOptions={{ hideAttribution: true }}
         defaultEdgeOptions={{
+          // Edges that bypass decorateEdges (e.g. ad-hoc test fixtures)
+          // fall back to plain 'step' routing instead of fsmEdge so
+          // they don't break in absence of FsmEdgeData on data.
           type: 'step',
           style: { stroke: 'currentColor', strokeWidth: 1.5 },
           markerEnd: {
@@ -383,7 +466,9 @@ export function FlowGraph({
           },
         }}
         onNodeClick={(_e, node) => onNodeClick?.(node.id, node.data as FlowNodeData)}
-        onEdgeClick={(_e, edge) => onEdgeClick?.(edge.id)}
+        onEdgeClick={(_e, edge) =>
+          onEdgeClick?.(edge.id, edge.data as Record<string, unknown> | undefined)
+        }
       >
         {background ? (
           <Background
@@ -426,6 +511,7 @@ export function FlowGraph({
         ) : null}
       </ReactFlow>
     </div>
+    </FsmEdgeClickContext.Provider>
   );
 }
 

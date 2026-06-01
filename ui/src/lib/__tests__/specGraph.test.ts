@@ -131,4 +131,134 @@ describe('specToGraph', () => {
       b.edges.map(({ id: _id, ...rest }) => rest),
     );
   });
+
+  // -------------------------------------------------------------------------
+  // W21: data carriers for the click-Sheet inspectors.
+  // -------------------------------------------------------------------------
+
+  test('W21: node.data.state carries the original spec state object', () => {
+    const stateA = {
+      id: 'a',
+      worker: { role: 'planner', prompt_template: 'plan this', allowed_tools: ['x'] },
+      transitions: [{ to: 'b', when: 'always' }],
+    };
+    const g = specToGraph({ entry: 'a', states: [stateA, { id: 'b' }] });
+    expect(g.nodes[0].data.state).toBeDefined();
+    const carried = g.nodes[0].data.state as Record<string, unknown>;
+    expect(carried.id).toBe('a');
+    expect(carried.worker).toEqual(stateA.worker);
+    expect(carried.transitions).toEqual(stateA.transitions);
+  });
+
+  test('W21: node.data.fullLabel mirrors the state id', () => {
+    const g = specToGraph({
+      states: [{ id: 'risk_tier_triage_super_long_name', inline: { handler_id: 'h' } }],
+    });
+    expect(g.nodes[0].data.fullLabel).toBe('risk_tier_triage_super_long_name');
+  });
+
+  test('W21: node.data.fullSublabel carries the un-projected sublabel', () => {
+    const g = specToGraph({
+      states: [{ id: 's', worker: { role: 'specialist' }, transitions: [] }],
+    });
+    expect(g.nodes[0].data.fullSublabel).toContain('specialist');
+  });
+
+  test('W21: entry-state fullSublabel mirrors the visible "entry · ..." string', () => {
+    const g = specToGraph({
+      entry: 's',
+      states: [{ id: 's', worker: { role: 'planner' } }],
+    });
+    expect(g.nodes[0].data.fullSublabel).toBe(g.nodes[0].data.sublabel);
+    expect(g.nodes[0].data.fullSublabel).toContain('entry');
+  });
+
+  test('W21: edge.data carries kind, transition, source, target, fullLabel', () => {
+    const longPredicate = "tier == 'trivial' AND len(risk_signals) == 0 AND NOT scope_overrides_present";
+    const g = specToGraph({
+      states: [
+        { id: 'a', transitions: [{ to: 'b', kind: 'deterministic', when: longPredicate }] },
+        { id: 'b' },
+      ],
+    });
+    const data = g.edges[0].data as Record<string, unknown>;
+    expect(data).toBeDefined();
+    expect(data.fullLabel).toBe(longPredicate);
+    expect(data.kind).toBe('deterministic');
+    expect(data.sourceId).toBe('a');
+    expect(data.targetId).toBe('b');
+    expect((data.transition as Record<string, unknown>).to).toBe('b');
+  });
+
+  test('W21: edge.data.fullLabel undefined when transition has no predicate', () => {
+    const g = specToGraph({
+      states: [
+        { id: 'a', transitions: [{ to: 'b' }] },
+        { id: 'b' },
+      ],
+    });
+    const data = g.edges[0].data as Record<string, unknown>;
+    expect(data.fullLabel).toBeUndefined();
+  });
+
+  // -------------------------------------------------------------------------
+  // W21 follow-up: kind derived from `when` (not top-level t.kind);
+  // criteria fallback for judgement transitions.
+  // -------------------------------------------------------------------------
+
+  test('W21: edge.data.kind for bare "always" string transition', () => {
+    const g = specToGraph({
+      states: [{ id: 'a', transitions: [{ to: 'b', when: 'always' }] }, { id: 'b' }],
+    });
+    expect((g.edges[0].data as Record<string, unknown>).kind).toBe('always');
+  });
+
+  test('W21: edge.data.kind for bare "otherwise" string transition', () => {
+    const g = specToGraph({
+      states: [{ id: 'a', transitions: [{ to: 'b', when: 'otherwise' }] }, { id: 'b' }],
+    });
+    expect((g.edges[0].data as Record<string, unknown>).kind).toBe('otherwise');
+  });
+
+  test('W21: edge.data.kind for {kind:"judgement", criteria:"..."} dict-form when', () => {
+    const g = specToGraph({
+      states: [
+        {
+          id: 'a',
+          transitions: [{ to: 'b', when: { kind: 'judgement', criteria: 'verdict is GO' } }],
+        },
+        { id: 'b' },
+      ],
+    });
+    const data = g.edges[0].data as Record<string, unknown>;
+    expect(data.kind).toBe('judgement');
+    // And the fullLabel should fall through to criteria text.
+    expect(data.fullLabel).toBe('verdict is GO');
+  });
+
+  test('W21: edge.data.kind for {kind:"deterministic", expression:"..."} dict', () => {
+    const g = specToGraph({
+      states: [
+        {
+          id: 'a',
+          transitions: [{ to: 'b', when: { kind: 'deterministic', expression: 'x > 0' } }],
+        },
+        { id: 'b' },
+      ],
+    });
+    const data = g.edges[0].data as Record<string, unknown>;
+    expect(data.kind).toBe('deterministic');
+    expect(data.fullLabel).toBe('x > 0');
+  });
+
+  test('W21: bare predicate-string when is treated as deterministic', () => {
+    const g = specToGraph({
+      states: [
+        { id: 'a', transitions: [{ to: 'b', when: 'verdict == "GO"' }] },
+        { id: 'b' },
+      ],
+    });
+    const data = g.edges[0].data as Record<string, unknown>;
+    expect(data.kind).toBe('deterministic');
+  });
 });

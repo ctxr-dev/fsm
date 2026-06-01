@@ -70,10 +70,43 @@ function predicateLabel(t: SpecTransitionShape): string {
   if (typeof t.when === 'string') return t.when;
   if (t.when && typeof t.when === 'object') {
     const obj = t.when as Record<string, unknown>;
+    // The FSM library's Transition model encodes the human-readable
+    // text in different keys depending on the kind: deterministic
+    // puts it in `.expression`, judgement in `.criteria`, and bare
+    // Predicate dumps map to `.predicate`. Check all three so the
+    // visible edge label never goes blank for a transition that
+    // genuinely has guard text.
     if (typeof obj.predicate === 'string') return obj.predicate;
     if (typeof obj.expression === 'string') return obj.expression;
+    if (typeof obj.criteria === 'string') return obj.criteria;
   }
   return '';
+}
+
+/** Derive the transition kind (always / otherwise / deterministic /
+ *  judgement) from the various `when` shapes the FSM library emits.
+ *  The Transition model does NOT carry a top-level `kind` field — it
+ *  lives inside `when` (or is the bare string "always"/"otherwise").
+ *  Returns undefined when the shape isn't recognised.
+ *
+ *  Exported so other inspector surfaces (the transitions list in
+ *  StateInspectorBody, etc.) can derive the kind the same way as the
+ *  graph edge, instead of duplicating the logic and drifting. */
+export function transitionKind(t: { when?: unknown }): string | undefined {
+  if (typeof t.when === 'string') {
+    if (t.when === 'always' || t.when === 'otherwise') return t.when;
+    // A bare predicate-string (anything else) lifts to deterministic
+    // per the Python Transition normaliser.
+    return 'deterministic';
+  }
+  if (t.when && typeof t.when === 'object') {
+    const obj = t.when as Record<string, unknown>;
+    if (typeof obj.kind === 'string') return obj.kind;
+    // A dict with only `.expression` is deterministic per the
+    // Python Transition.normalise_when contract.
+    if (typeof obj.expression === 'string') return 'deterministic';
+  }
+  return undefined;
 }
 
 export interface SpecGraph {
@@ -104,7 +137,19 @@ export function specToGraph(definition: unknown): SpecGraph {
     return {
       id: s.id,
       position: { x: 0, y: 0 }, // dagre fills these in
-      data: { kind, label: s.id, sublabel },
+      // W21: copy the FULL spec state object onto data.state so the
+      // click handler can render a State Inspector Sheet without
+      // re-walking the spec. fullLabel/fullSublabel mirror the
+      // visible strings; node-label tooltip falls back to label when
+      // these are absent.
+      data: {
+        kind,
+        label: s.id,
+        sublabel,
+        fullLabel: s.id,
+        fullSublabel: sublabel || undefined,
+        state: s as unknown as Record<string, unknown>,
+      },
     };
   });
 
@@ -112,11 +157,13 @@ export function specToGraph(definition: unknown): SpecGraph {
   if (def.entry) {
     const entry = nodes.find((n) => n.id === def.entry);
     if (entry) {
+      const newSub = entry.data.sublabel
+        ? `entry · ${entry.data.sublabel}`
+        : 'entry';
       entry.data = {
         ...entry.data,
-        sublabel: entry.data.sublabel
-          ? `entry · ${entry.data.sublabel}`
-          : 'entry',
+        sublabel: newSub,
+        fullSublabel: newSub,
       };
     }
   }
@@ -132,6 +179,18 @@ export function specToGraph(definition: unknown): SpecGraph {
         target: t.to,
         label: label || undefined,
         labelStyle: { fontSize: 10 },
+        // W21: carry the FULL transition metadata so the Tooltip and
+        // click-Sheet have access to kind + raw predicate + source/
+        // target without walking the spec twice. The kind is derived
+        // from `when` (the Transition model doesn't have a top-level
+        // `kind` field — it's encoded inside the `when` payload).
+        data: {
+          fullLabel: label || undefined,
+          kind: transitionKind(t),
+          transition: t as unknown as Record<string, unknown>,
+          sourceId: s.id,
+          targetId: t.to,
+        },
       });
     }
   }

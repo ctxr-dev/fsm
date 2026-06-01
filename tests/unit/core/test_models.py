@@ -530,3 +530,76 @@ def test_commit_token_issue_rejects_zero_or_negative_ttl() -> None:
         CommitToken.issue(run_id, "s", "n", ttl_seconds=0)
     with pytest.raises(ValueError):
         CommitToken.issue(run_id, "s", "n", ttl_seconds=-1)
+
+
+# ---------------------------------------------------------------------------
+# Worker.prompt_template_language (W21 — optional format hint)
+# ---------------------------------------------------------------------------
+
+
+def test_worker_prompt_template_language_defaults_to_none() -> None:
+    w = Worker(role="r", prompt_template="x")
+    assert w.prompt_template_language is None
+
+
+@pytest.mark.parametrize("language", ["markdown", "jinja", "plain", "json", "yaml"])
+def test_worker_prompt_template_language_accepts_arbitrary_string(language: str) -> None:
+    # The field is intentionally free-form (not a closed enum) so
+    # consumers own the convention. The library only checks it isn't
+    # blank when set.
+    w = Worker(role="r", prompt_template="x", prompt_template_language=language)
+    assert w.prompt_template_language == language
+
+
+def test_worker_prompt_template_language_strips_surrounding_whitespace() -> None:
+    w = Worker(role="r", prompt_template="x", prompt_template_language="  markdown  ")
+    assert w.prompt_template_language == "markdown"
+
+
+def test_worker_rejects_blank_prompt_template_language() -> None:
+    # Empty / whitespace-only is a typo not a deliberate omission;
+    # raise rather than silently accept (which would mimic the
+    # "no hint" path and hide the bug).
+    with pytest.raises(ValidationError):
+        Worker(role="r", prompt_template="x", prompt_template_language="")
+    with pytest.raises(ValidationError):
+        Worker(role="r", prompt_template="x", prompt_template_language="   ")
+
+
+def test_worker_serialises_prompt_template_language_when_set() -> None:
+    w = Worker(role="r", prompt_template="x", prompt_template_language="markdown")
+    dumped = w.model_dump()
+    assert dumped["prompt_template_language"] == "markdown"
+
+
+def test_worker_serialises_prompt_template_language_as_null_when_unset() -> None:
+    w = Worker(role="r", prompt_template="x")
+    dumped = w.model_dump()
+    assert dumped["prompt_template_language"] is None
+
+
+def test_worker_round_trips_through_json_with_language() -> None:
+    w = Worker(role="r", prompt_template="x", prompt_template_language="markdown")
+    raw = w.model_dump_json()
+    restored = Worker.model_validate_json(raw)
+    assert restored.prompt_template_language == "markdown"
+    assert restored == w
+
+
+def test_verifier_spec_prompt_template_language_same_contract() -> None:
+    schema = ResponseSchema(schema={"type": "object", "properties": {}})
+    vs = VerifierSpec(
+        role="judge",
+        prompt_template="rate the output",
+        prompt_template_language="markdown",
+        response_schema=schema,
+    )
+    assert vs.prompt_template_language == "markdown"
+    # Same validation as Worker.
+    with pytest.raises(ValidationError):
+        VerifierSpec(
+            role="judge",
+            prompt_template="x",
+            prompt_template_language="",
+            response_schema=schema,
+        )

@@ -328,12 +328,27 @@ class ResponseSchema(BaseModel):
 
 
 class Worker(BaseModel):
-    """A worker specification: who to call and with which prompt + schema."""
+    """A worker specification: who to call and with which prompt + schema.
+
+    ``prompt_template_language`` is an optional, free-form format hint
+    the consuming spec uses to tell downstream tooling how to render
+    the prompt body. The FSM library itself treats ``prompt_template``
+    as an opaque string regardless of the hint, but UI surfaces (the
+    fsm-ui specDetail inspector, future spec-doc generators, etc.) can
+    pick syntax highlighting / markdown rendering / etc. based on this
+    declaration without resorting to content heuristics. Common
+    values: ``"markdown"``, ``"jinja"``, ``"plain"``, ``"json"``. The
+    field is intentionally a free string, not an enum, because the
+    library shouldn't curate the universe of template formats consumers
+    might use; consumers own the convention and the renderer that
+    honours it.
+    """
 
     model_config = _DOMAIN_CFG
 
     role: str
     prompt_template: str
+    prompt_template_language: str | None = None
     inputs: list[str] = Field(default_factory=list)
     response_schema: ResponseSchema | None = None
 
@@ -344,14 +359,39 @@ class Worker(BaseModel):
             raise ValueError("must be a non-empty string")
         return value
 
+    @field_validator("prompt_template_language")
+    @classmethod
+    def _language_non_empty(cls, value: str | None) -> str | None:
+        # None (= no hint) is legal. Empty/whitespace strings are not:
+        # if a consumer cares enough to set the field, they must put a
+        # real value in it. Catches typos like
+        # ``prompt_template_language=""`` that would otherwise silently
+        # behave the same as omitting the field.
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError(
+                "prompt_template_language must be a non-empty string "
+                "(or omitted entirely if no hint applies)"
+            )
+        return stripped
+
 
 class VerifierSpec(BaseModel):
-    """A verifier panel specification."""
+    """A verifier panel specification.
+
+    Same ``prompt_template_language`` semantics as :class:`Worker`: an
+    optional free-form format hint the consumer declares so renderers
+    can pick the right view without content heuristics. See
+    :class:`Worker` for the full contract.
+    """
 
     model_config = _DOMAIN_CFG
 
     role: str
     prompt_template: str
+    prompt_template_language: str | None = None
     response_schema: ResponseSchema
     majority_threshold: int = 2
     parallel_count: int = 3
@@ -362,6 +402,19 @@ class VerifierSpec(BaseModel):
         if not value or not value.strip():
             raise ValueError("must be a non-empty string")
         return value
+
+    @field_validator("prompt_template_language")
+    @classmethod
+    def _language_non_empty(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError(
+                "prompt_template_language must be a non-empty string "
+                "(or omitted entirely if no hint applies)"
+            )
+        return stripped
 
     @field_validator("majority_threshold")
     @classmethod

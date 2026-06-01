@@ -127,7 +127,12 @@ export interface JsonViewerProps {
   value: unknown;
   /** Default render mode. Inline = scrollable max-h-40 box. Expanded = tree. */
   mode?: JsonViewerMode;
-  /** Initial collapse depth in expanded mode. Default 2. */
+  /** Initial collapse depth in expanded mode. When OMITTED, the
+   *  "Expanded" view recursively expands every level (the user-
+   *  facing "Expand" button promises full inspection). When
+   *  explicitly passed (even `0`), the caller's number is honoured —
+   *  use this only when the JSON is large enough that auto-expanding
+   *  everything would overwhelm the inline view. */
   defaultExpandDepth?: number;
   /** Inline-mode height cap. Default `max-h-40`. */
   maxInlineHeight?: string;
@@ -179,7 +184,7 @@ function downloadAs(filename: string, text: string): void {
 export function JsonViewer({
   value,
   mode = 'inline',
-  defaultExpandDepth = 2,
+  defaultExpandDepth,
   maxInlineHeight = 'max-h-40',
   rootLabel = 'value',
   onSelect,
@@ -346,9 +351,9 @@ export function JsonViewer({
           onClick={onOpenSheet}
           aria-label="Open in full-screen sheet"
           title="Full-screen"
-          class="h-6 px-2 text-xs rounded text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+          class="h-6 px-2 text-xs rounded text-emerald-700 dark:text-emerald-400 border border-transparent hover:bg-slate-100 dark:hover:bg-slate-700 hover:border-emerald-500/40 font-semibold focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
         >
-          ↗
+          ⛶ Full-screen
         </button>
       </header>
       <div
@@ -358,7 +363,18 @@ export function JsonViewer({
       >
         <JsonView
           value={value as object}
-          collapsed={currentMode === 'inline' ? 0 : defaultExpandDepth}
+          // currentMode==='inline' → collapsed at depth 0 (just root
+          // visible); currentMode==='expanded' → expand recursively
+          // unless the caller pinned a specific depth via the prop.
+          // `undefined` (the default) gets full expansion via the
+          // library's `collapsed={false}` semantics.
+          collapsed={
+            currentMode === 'inline'
+              ? 0
+              : defaultExpandDepth === undefined
+              ? false
+              : defaultExpandDepth
+          }
           displayDataTypes={false}
           enableClipboard={false}
           highlightUpdates={false}
@@ -374,7 +390,10 @@ export function JsonViewer({
       >
         <JsonView
           value={value as object}
-          collapsed={Math.max(3, defaultExpandDepth)}
+          // Full-screen sheet ALWAYS expands every level — the user
+          // explicitly asked for full inspection, so depth-limiting
+          // would be a regression from intent.
+          collapsed={false}
           displayDataTypes={false}
           enableClipboard={true}
           shortenTextAfterLength={0}
