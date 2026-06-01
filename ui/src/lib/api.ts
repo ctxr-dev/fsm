@@ -421,6 +421,37 @@ export interface ListSpecVersionsParams extends PageParams {
   project_slug?: string;
 }
 
+/** W23e: request body for ``POST /api/v1/admin/ports``. */
+export interface PortChangeRequest {
+  subsystem: 'mcp' | 'api' | 'ui';
+  new_port: number;
+}
+
+/** W23e: response shape for ``POST /api/v1/admin/ports`` (202 Accepted). */
+export interface PortChangeAccepted {
+  accepted: true;
+  request_id: string;
+  subsystem: 'mcp' | 'api' | 'ui';
+  new_port: number;
+  old_port: number | null;
+  new_url_when_ready: string;
+  estimated_restart_ms: number;
+  status_poll_url: string;
+}
+
+/** W23e: response shape for the status-poll endpoint. */
+export interface PortChangeStatusBody {
+  request_id: string;
+  status: 'pending' | 'success' | 'failed' | 'unknown';
+  subsystem?: 'mcp' | 'api' | 'ui' | null;
+  old_port?: number | null;
+  new_port?: number | null;
+  new_url?: string | null;
+  error?: Record<string, unknown> | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -889,6 +920,29 @@ export class ApiClient {
   /** ``POST /admin/db/doctor`` — diagnostic dump of the project DB. */
   doctor(): Promise<DoctorReport> {
     return this.request<DoctorReport>('POST', '/admin/db/doctor');
+  }
+
+  /**
+   * ``POST /admin/ports`` (W23e) — queue a port-change request.
+   *
+   * Returns 202 + the new URL the UI should land on once the
+   * supervisor finishes the restart, plus a poll URL for status.
+   */
+  changePort(body: PortChangeRequest): Promise<PortChangeAccepted> {
+    return this.request<PortChangeAccepted>('POST', '/admin/ports', undefined, body);
+  }
+
+  /**
+   * ``GET /admin/ports/status/{request_id}`` (W23e) — poll the
+   * supervisor's per-request status document. Returns ``status:
+   * 'unknown'`` (not 404) when the request isn't surfaced yet so
+   * the UI can poll aggressively without 404 noise.
+   */
+  portChangeStatus(requestId: string): Promise<PortChangeStatusBody> {
+    return this.request<PortChangeStatusBody>(
+      'GET',
+      `/admin/ports/status/${encodeURIComponent(requestId)}`,
+    );
   }
 
   /**

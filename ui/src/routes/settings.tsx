@@ -12,8 +12,9 @@
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 
-import { Button, Card, Pill, Spinner } from '../components';
+import { Button, Card, Dialog, Pill, Spinner, useToast } from '../components';
 import { api, ApiError, type DoctorReport } from '../lib/api';
+import { lastPortChangeRequest, projectMetadata } from '../lib/store';
 
 type Theme = 'light' | 'dark' | 'system';
 
@@ -122,14 +123,7 @@ export function SettingsRoute(): JSX.Element {
         )}
       </Card>
 
-      <Card title="Port assignments">
-        <div class="flex items-center justify-between gap-3">
-          <p class="text-sm text-slate-600 dark:text-slate-400">
-            API port and memory-injection wiring will be surfaced here once the W11 infrastructure ships.
-          </p>
-          <Pill variant="warning">W11 placeholder</Pill>
-        </div>
-      </Card>
+      <PortAssignmentsCard />
 
       <Card title="Drift detector">
         <div class="flex items-center justify-between gap-3">
@@ -166,3 +160,159 @@ export function SettingsRoute(): JSX.Element {
 }
 
 export default SettingsRoute;
+
+
+// ---------------------------------------------------------------------------
+// W23e: PortAssignmentsCard — read current ports from project metadata,
+// edit + apply via POST /admin/ports; the global ReconnectingOverlay
+// (mounted in app.tsx) takes over once a request is in flight.
+// ---------------------------------------------------------------------------
+
+type Subsystem = 'mcp' | 'api' | 'ui';
+
+function PortAssignmentsCard(): JSX.Element {
+  const metadata = projectMetadata.value;
+  const subsystems = metadata?.subsystems ?? {};
+  return (
+    <Card title="Port assignments">
+      <div class="space-y-3">
+        <p class="text-sm text-slate-600 dark:text-slate-400">
+          Change a subsystem's port. The supervisor drains and respawns the
+          named process; the UI shows a reconnecting overlay and redirects
+          automatically when the new port is healthy.
+        </p>
+        {(['mcp', 'api', 'ui'] as const).map((sub) => (
+          <PortRow key={sub} subsystem={sub} info={subsystems[sub] ?? null} />
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+function portFromUrl(url: string | undefined | null): number | null {
+  if (!url) return null;
+  try {
+    return Number(new URL(url).port) || null;
+  } catch {
+    return null;
+  }
+}
+
+interface PortRowProps {
+  subsystem: Subsystem;
+  info: { base_url: string; healthz_url: string | null; pid: number | null } | null;
+}
+
+function PortRow({ subsystem, info }: PortRowProps): JSX.Element {
+  const currentPort = portFromUrl(info?.base_url);
+  const [draft, setDraft] = useState<number | ''>(currentPort ?? '');
+  const [confirming, setConfirming] = useState<boolean>(false);
+  const [applying, setApplying] = useState<boolean>(false);
+  const toast = useToast();
+
+  // When metadata refreshes (e.g. after a successful port change), pull
+  // the new port into the draft so the input reflects reality.
+  useEffect(() => {
+    if (currentPort != null) setDraft(currentPort);
+  }, [currentPort]);
+
+  const valid = typeof draft === 'number' && draft >= 1024 && draft <= 65535;
+  const disabled = !valid || draft === currentPort || applying;
+
+  const onApply = async () => {
+    if (!valid || draft === currentPort) return;
+    setApplying(true);
+    try {
+      const accepted = await api.changePort({ subsystem, new_port: draft });
+      lastPortChangeRequest.value = {
+        requestId: accepted.request_id,
+        subsystem,
+        newPort: draft,
+        newUrlWhenReady: accepted.new_url_when_ready,
+        startedAt: new Date().toISOString(),
+        estimatedRestartMs: accepted.estimated_restart_ms,
+      };
+      // Overlay takes over; we don't need to do anything else.
+    } catch (err) {
+      if (err instanceof ApiError) {
+        const msg = typeof err.detail === 'string' ? err.detail : err.message;
+        toast.danger(`Port change rejected: ${msg}`);
+      } else {
+        toast.danger(`Port change failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } finally {
+      setApplying(false);
+      setConfirming(false);
+    }
+  };
+
+  return (
+    <div class="flex items-center gap-3 text-sm">
+      <span class="w-20 font-mono text-slate-700 dark:text-slate-300">{subsystem}</span>
+      <span class="text-xs text-slate-500 dark:text-slate-400">
+        current: <code class="font-mono">{currentPort ?? '—'}</code>
+      </span>
+      <input
+        type="number"
+        min={1024}
+        max={65535}
+        value={draft}
+        onInput={(e) => {
+          const v = (e.currentTarget as HTMLInputElement).value;
+          setDraft(v === '' ? '' : Number(v));
+        }}
+        aria-label={`New port for ${subsystem}`}
+        class={[
+          'w-24 rounded border px-2 py-1 text-sm font-mono',
+          'border-slate-300 dark:border-slate-600',
+          'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200',
+          'focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500',
+        ].join(' ')}
+      />
+      <Button
+        variant={subsystem === 'ui' ? 'danger' : 'primary'}
+        size="sm"
+        disabled={disabled}
+        onClick={() => setConfirming(true)}
+      >
+        {applying ? 'Applying…' : 'Apply'}
+      </Button>
+      <Dialog
+        open={confirming}
+        onClose={() => setConfirming(false)}
+        title={`Restart ${subsystem} on port ${draft}?`}
+        widthClassName="max-w-md"
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setConfirming(false)} disabled={applying}>
+              Cancel
+            </Button>
+            <Button
+              variant={subsystem === 'ui' ? 'danger' : 'primary'}
+              onClick={onApply}
+              loading={applying}
+            >
+              {subsystem === 'ui' ? 'Confirm and redirect' : 'Confirm'}
+            </Button>
+          </>
+        }
+      >
+        <p class="text-sm">
+          The {subsystem} subsystem will drain (SIGTERM, 5s budget) and respawn
+          on port {draft}. Other subsystems are unaffected.
+        </p>
+        {subsystem === 'ui' ? (
+          <p class="mt-2 text-sm font-medium">
+            Heads-up: this tab will redirect to the new UI URL once the new
+            server is ready. Unsaved work in browser tabs pointing at the
+            current URL will be lost.
+          </p>
+        ) : (
+          <p class="mt-2 text-sm">
+            Active SSE connections will drop and reconnect automatically.
+          </p>
+        )}
+      </Dialog>
+    </div>
+  );
+}

@@ -516,10 +516,12 @@ def get_current_project(project: ProjectDep, request: Request) -> ProjectMetadat
 
 from ctxr.fsm.api.routes_admin import router as _admin_router
 from ctxr.fsm.api.routes_events import router as _events_router
+from ctxr.fsm.api.routes_ports import router as _ports_router
 from ctxr.fsm.api.routes_runs import router as _runs_router
 from ctxr.fsm.api.routes_specs import router as _specs_router
 
 app.include_router(_admin_router)
 app.include_router(_events_router)
+app.include_router(_ports_router)
 app.include_router(_runs_router)
 app.include_router(_specs_router)

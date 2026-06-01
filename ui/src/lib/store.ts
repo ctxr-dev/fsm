@@ -275,6 +275,28 @@ export const projectMetadata: Signal<ProjectMetadata | null> = signal<ProjectMet
 export const projectMetadataError: Signal<string | null> = signal<string | null>(null);
 export const projectMetadataLoading: Signal<boolean> = signal<boolean>(true);
 
+// ---------------------------------------------------------------------------
+// W23e — in-flight port-change request (UI ↔ ReconnectingOverlay coupling)
+// ---------------------------------------------------------------------------
+//
+// Settings form writes this signal on a successful POST /admin/ports.
+// ReconnectingOverlay reads it as the "show me / hide me" signal.
+// In-memory only — a page reload clears it (which is exactly what we
+// want: post-redirect, the overlay should NOT auto-reappear on the
+// new origin).
+
+export interface PortChangeRequestRecord {
+  requestId: string;
+  subsystem: 'mcp' | 'api' | 'ui';
+  newPort: number;
+  newUrlWhenReady: string;
+  startedAt: string;
+  estimatedRestartMs: number;
+}
+
+export const lastPortChangeRequest: Signal<PortChangeRequestRecord | null> =
+  signal<PortChangeRequestRecord | null>(null);
+
 let _metadataWired = false;
 
 /**
