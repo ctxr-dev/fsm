@@ -252,7 +252,12 @@ function decorateEdges(edges: readonly Edge[]): Edge[] {
     const labelText = typeof e.label === 'string' ? truncateLabel(e.label) : e.label;
     return {
       ...e,
-      type: e.type ?? 'default',
+      // W20: default to 'step' (sharp 90-degree corners) instead of
+      // 'default' (smooth bezier). For FSM graphs, orthogonal routing
+      // makes the topology easier to trace at a glance — every edge
+      // changes direction at the layer boundary, so the visual centre
+      // line stays stable and parallel transitions stack cleanly.
+      type: e.type ?? 'step',
       animated: e.animated ?? false,
       label: labelText,
       style: {
@@ -353,6 +358,7 @@ export function FlowGraph({
         fitViewOptions={{ padding: 0.2, includeHiddenNodes: false }}
         proOptions={{ hideAttribution: true }}
         defaultEdgeOptions={{
+          type: 'step',
           style: { stroke: 'currentColor', strokeWidth: 1.5 },
           markerEnd: {
             type: MarkerType.ArrowClosed,
