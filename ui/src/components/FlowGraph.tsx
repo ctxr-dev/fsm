@@ -76,7 +76,6 @@ export interface FlowGraphProps {
   direction?: 'LR' | 'TB';
   /** Click handler on a node (e.g. open the state-details Sheet). */
   onNodeClick?: (id: string, data: FlowNodeData) => void;
-  /** Click handler on an edge. */
   /** Click handler on an edge. The second arg carries the edge's
    *  data payload (set by decorateEdges); typed loosely so callers can
    *  cast to FsmEdgeData or their own shape. Backward-compatible:

@@ -82,19 +82,21 @@ describe('Tooltip', () => {
     expect(tip!.textContent).toBe('full string');
   });
 
-  test('focus opens the tooltip without a delay-via-hover (focus is instant)', () => {
-    // The W21 contract says focus opens after the same delay as hover
-    // (the delay is "intent", not motion). Verify the focus path uses
-    // the same scheduleOpen.
+  test('focus opens the tooltip INSTANTLY (ignores the 400 ms hover delay)', () => {
+    // W21 contract: keyboard focus is intentional, so the hover-style
+    // delay would be sluggish. Even with delay=400 set, focus must
+    // open the tooltip on the next microtask, not after 400 ms.
     vi.useFakeTimers();
     const { getByText, queryByRole } = render(
-      <Tooltip content="focused" delay={0}>
+      <Tooltip content="focused" delay={400}>
         <button type="button">trigger</button>
       </Tooltip>,
     );
     const wrapper = getByText('trigger').parentElement as HTMLElement;
     fireFocusIn(wrapper);
     act(() => {
+      // Just flush the setTimeout(0) that scheduleOpen uses for
+      // preact re-render flushability; do NOT advance to 400 ms.
       vi.advanceTimersByTime(0);
     });
     expect(queryByRole('tooltip')).not.toBeNull();

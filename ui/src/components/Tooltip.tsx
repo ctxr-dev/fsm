@@ -7,7 +7,9 @@
  * Sheet's job; Tooltip is the at-a-glance preview.
  *
  * Contract (matches the W18 interaction grammar):
- *   - Open on mouseenter (after 400 ms delay) OR focus (immediate).
+ *   - Open on mouseenter (after 400 ms delay) OR focus (instant —
+ *     keyboard navigation is intentional, so a hover-style delay
+ *     would feel sluggish).
  *   - Close on mouseleave (100 ms grace), blur, Escape, scroll, or
  *     pointerdown outside both trigger and bubble.
  *   - role="tooltip" on the floating element; trigger gains
@@ -51,14 +53,23 @@ function ensurePortalTarget(): HTMLDivElement {
   return el;
 }
 
-export type TooltipPlacement = 'top' | 'bottom' | 'left' | 'right' | 'auto';
+// Placement contract is currently 'top' | 'bottom'. The bubble auto-
+// flips between the two when the preferred side would clip the
+// viewport. 'left' / 'right' / 'auto' are NOT supported in v1 — if a
+// future caller needs side placement, computePosition() needs to grow
+// the corresponding cases first. Keeping the type narrow prevents
+// callers from passing values the layout engine silently ignores.
+export type TooltipPlacement = 'top' | 'bottom';
 
 export interface TooltipProps {
   /** The full-detail body shown when the tooltip surfaces. */
   content: ComponentChild;
-  /** Open delay in ms. Default 400. Set 0 for an instant tooltip. */
+  /** Open delay in ms applied to hover. Focus always opens instantly
+   *  (keyboard navigation is intentional, so a hover-style delay would
+   *  feel sluggish to keyboard users). Default 400. */
   delay?: number;
-  /** Preferred placement; auto-flips on viewport-edge clip. Default 'top'. */
+  /** Preferred side. The bubble auto-flips to the opposite side if the
+   *  preferred side would clip the viewport. Default 'top'. */
   placement?: TooltipPlacement;
   /** When true, the trigger is wrapped verbatim with no listeners. */
   disabled?: boolean;
@@ -195,7 +206,7 @@ export function Tooltip(props: TooltipProps): JSX.Element {
     }
   };
 
-  const scheduleOpen = useCallback((): void => {
+  const scheduleOpen = useCallback((opts?: { instant?: boolean }): void => {
     if (disabled || isEmpty) return;
     clearOpenTimer();
     clearCloseTimer();
@@ -207,7 +218,11 @@ export function Tooltip(props: TooltipProps): JSX.Element {
       prev();
     }
     const now = Date.now();
-    const useDelay = now < warmUntil ? 0 : delay;
+    // Focus path passes instant=true: keyboard navigation already
+    // signals intent, so the hover-style delay is wrong there. Warm
+    // window also produces delay=0 for the second-hover-within-300ms
+    // path.
+    const useDelay = opts?.instant === true || now < warmUntil ? 0 : delay;
     // Always route through setTimeout (even for delay=0) so the
     // Preact re-render is flushable by vi.advanceTimersByTime in
     // tests. Going synchronous on delay<=0 left the re-render
@@ -315,7 +330,11 @@ export function Tooltip(props: TooltipProps): JSX.Element {
     if (!el) return undefined;
     const onEnter = (): void => scheduleOpen();
     const onLeave = (): void => scheduleClose();
-    const onFocusIn = (): void => scheduleOpen();
+    // Focus path opens IMMEDIATELY (delay forced to 0) — keyboard
+    // navigation is an intentional act, so honouring the hover-style
+    // 400 ms delay would feel sluggish to keyboard users. The W18
+    // contract treats `delay` as hover intent specifically.
+    const onFocusIn = (): void => scheduleOpen({ instant: true });
     const onFocusOut = (): void => scheduleClose();
     el.addEventListener('mouseenter', onEnter);
     el.addEventListener('mouseleave', onLeave);

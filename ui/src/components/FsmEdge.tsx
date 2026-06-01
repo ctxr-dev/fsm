@@ -138,7 +138,10 @@ export function FsmEdge(props: EdgeProps): JSX.Element {
                   'text-slate-700 dark:text-slate-200',
                   'focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500',
                 ].join(' ')}
-                title={fullText}
+                // No native title= here: the custom Tooltip already
+                // surfaces fullText with the right delay + ARIA wiring,
+                // and a sibling native title would produce a double
+                // bubble (instant + delayed) on hover.
                 // eslint-disable-next-line react/forbid-dom-props -- font-size is xyflow's edge-label convention; matches the legacy decorateEdges labelStyle
                 style={labelStyle as JSX.CSSProperties | undefined}
                 onClick={(e) => {
