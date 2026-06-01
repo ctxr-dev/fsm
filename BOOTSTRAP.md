@@ -8,16 +8,26 @@
 **Decision tree (no improvising):**
 
 ```bash
-# Detect. Clear PACKAGE_MISSING first so a pre-set env var from the
-# parent shell can't force-install. Probe via `uv run` (without
-# --no-project so a project-installed ctxr-fsm IS picked up; the bare
-# `uv run` will fall back to a UV_PROJECT_ENVIRONMENT cache if no
-# workdir pyproject.toml exists). The `command -v` fallback catches
-# pipx / pip --user installs that don't live in a uv environment.
-unset PACKAGE_MISSING
-uv run --quiet ctxr-fsm --version 2>/dev/null \
-  || command -v ctxr-fsm >/dev/null \
-  || PACKAGE_MISSING=1
+# Detect. Clear PACKAGE_MISSING and FSM_CMD first so pre-set env vars
+# from the parent shell can't force-install or wedge the runner. Try
+# `uv run` first (project-installed ctxr-fsm wins; `uv run` honours
+# the workdir pyproject.toml when present and falls back to the
+# UV_PROJECT_ENVIRONMENT cache otherwise). On miss, fall through to
+# `command -v` (catches pipx / pip --user installs that don't live
+# in a uv environment).
+#
+# FSM_CMD captures the runner that succeeded so Step 2 invokes the
+# same one — otherwise `uv run ctxr-fsm ensure` would fail for a
+# pipx-installed package and send the caller back to Step 1
+# (risking duplicate installs, which this doc is trying to prevent).
+unset PACKAGE_MISSING FSM_CMD
+if uv run --quiet ctxr-fsm --version >/dev/null 2>&1; then
+  FSM_CMD="uv run ctxr-fsm"
+elif command -v ctxr-fsm >/dev/null 2>&1; then
+  FSM_CMD="ctxr-fsm"
+else
+  PACKAGE_MISSING=1
+fi
 ```
 
 If `PACKAGE_MISSING` is set, follow this rule **exactly once**, in this order:
@@ -41,10 +51,10 @@ If the install fails for any reason (permission, network, version pin), return `
 
 ## Step 2 — bootstrap the project (`ctxr-fsm ensure`)
 
-**Probe first to short-circuit on a warm project.** `ensure --check` is the read-only probe; if it reports `ready`, you are done and MUST skip the rest of this file:
+**Probe first to short-circuit on a warm project.** `ensure --check` is the read-only probe; if it reports `ready`, you are done and MUST skip the rest of this file. Use `$FSM_CMD` carried forward from Step 1 so a pipx-installed package isn't re-probed via `uv run` (which would fail and falsely report missing):
 
 ```bash
-uv run ctxr-fsm ensure --check --json
+$FSM_CMD ensure --check --json
 ```
 
 Routing rule (no improvising):
@@ -56,10 +66,10 @@ Routing rule (no improvising):
 | `failed` | The check itself succeeded but the project is in an unrecoverable state (e.g. corrupt DB). Return `MissingRequirement` to the caller with the JSON envelope and STOP — do not re-run `ensure --json` blindly. |
 | Exit non-zero AND no JSON on stdout | The package itself isn't installed in this workdir — go back to Step 1. |
 
-When you need to apply changes (anything other than `ready`):
+When the status is `missing_*` (and ONLY then), apply the changes by re-invoking with the same runner:
 
 ```bash
-uv run ctxr-fsm ensure --json
+$FSM_CMD ensure --json
 ```
 
 This is idempotent. On a cold project it: creates `.ctxr-fsm/fsm.db`, runs migrations, installs principles into CLAUDE.md/AGENTS.md/.cursor/rules, registers `ctxr-fsm` as an MCP server in the active client config(s), boots the supervisor (MCP + FastAPI + UI). On a warm project it returns in <500ms confirming everything is up.
@@ -104,7 +114,7 @@ This is the path skills should default to when invoked from a Bash-driven shell 
 Skills that ship an FsmSpec must register it before `start_run`:
 
 ```bash
-uv run ctxr-fsm spec register <your.module.path:fsm>
+$FSM_CMD spec register <your.module.path:fsm>
 ```
 
 Idempotent — re-registering the same spec at the same version is a no-op. If the spec's body changed, fsm bumps `fsm_specs.version` automatically.
