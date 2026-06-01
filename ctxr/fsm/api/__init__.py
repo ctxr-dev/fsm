@@ -211,11 +211,14 @@ class ReadinessResponse(BaseModel):
 class ProjectMetadata(BaseModel):
     """Metadata payload returned by ``GET /api/v1/projects/current``.
 
-    Intentionally minimal in this bootstrap phase — later waves
-    extend this with project name, root path, registered spec
-    counts, etc. The route exists now so the UI can issue a single
-    discovery call against a running API and know it's talking to a
-    live, project-bound server.
+    W22 added ``project_root`` + ``db_path_relative`` so the UI
+    topbar / Settings surface can render portable, committable
+    project-relative paths instead of absolute filesystem strings.
+    Future waves will extend this further with a project name (slug
+    pulled from ``.ctxr-fsm/``), registered spec + run counts, and
+    workspace metadata; the route already exists so the UI can issue
+    a single discovery call against a running API and know it's
+    talking to a live, project-bound server.
     """
 
     fsm_version: str = Field(..., description="The ``ctxr.fsm`` package version.")

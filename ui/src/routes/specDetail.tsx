@@ -280,11 +280,11 @@ function TransitionInspectorBody({
       {/* Same convention as StateInspectorBody above: headings are
           the FSM library's literal transition-shape paths so the
           operator sees field names, not designer text. */}
+      {/* W22 Fix 3 site 3: predicate section gets an amber frame +
+          header colour so it visually pops the moment the inspector
+          opens. always / otherwise transitions skip this section
+          entirely (they have no predicate to render). */}
       {predicate ? (
-        // W22 Fix 3 site 3: predicate section gets an amber frame +
-        // header colour so it visually pops the moment the inspector
-        // opens. always / otherwise transitions skip this section
-        // entirely (they have no predicate to render).
         <section class="rounded-md border border-amber-300 dark:border-amber-700/50 bg-amber-50/40 dark:bg-amber-900/10 p-2">
           <h4 class="text-[11px] font-mono text-amber-700 dark:text-amber-300 mb-1 font-semibold">
             transition.when

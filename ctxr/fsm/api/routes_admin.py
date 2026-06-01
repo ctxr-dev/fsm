@@ -124,10 +124,15 @@ class DriftSignalsResponse(BaseModel):
 class DoctorReport(BaseModel):
     """HTTP shape of the ``ctxr-fsm doctor`` report.
 
-    Mirrors the dict produced by :func:`ctxr.fsm.cli.doctor_cmd.doctor`
-    so an operator can move freely between the CLI and the API without
-    relearning field names. Field-by-field commentary lives on each
-    attribute below.
+    Mostly mirrors the dict produced by
+    :func:`ctxr.fsm.cli.doctor_cmd.doctor`, but the HTTP surface is
+    a strict superset: it additionally carries ``project_root`` +
+    ``db_path_relative`` (W22) so UI consumers can display portable,
+    project-relative paths without re-deriving them. A follow-up
+    will plumb the same fields into the CLI's ``--json`` output so
+    the two surfaces converge; today, an operator reading the CLI
+    JSON will see the absolute ``db_path`` only. Field-by-field
+    commentary lives on each attribute below.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid")
