@@ -198,6 +198,7 @@ export function RunProgressGraph({
         <FlowGraph
           nodes={overlaid.nodes}
           edges={overlaid.edges}
+          viewportKey={specId ? `runs.progress:${specId}` : undefined}
         />
       </div>
     </Card>
