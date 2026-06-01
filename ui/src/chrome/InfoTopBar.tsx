@@ -226,9 +226,24 @@ export function InfoTopBar(): JSX.Element {
   // is the spot to bolt on the ``mapLimited`` pattern from
   // routes/drift.tsx (the same fan-out cap). Today the simpler shape
   // is easier to read.
+  //
+  // Stale-state contract: every metadata refresh starts by REPLACING
+  // (not merging into) the probe map. Without this reset, a previous
+  // metadata that reported ``mcp``/``api``/``ui`` but a fresh one
+  // that omits ``api`` would leave the swagger/api probes "healthy"
+  // from the previous round even though the subsystems no longer
+  // exist. Same hazard when switching projects: subsystems lingering
+  // from project A would render alongside project B's set.
   useEffect(() => {
     if (!metadata) return;
     let cancelled = false;
+    // Reset to the per-subsystem ``unknown`` baseline before re-probing
+    // so any subsystem that vanished from the new metadata loses its
+    // stale healthy/degraded indicator.
+    const initial: Record<string, ProbeStatus> = {};
+    for (const name of Object.keys(metadata.subsystems)) initial[name] = 'unknown';
+    initial.swagger = 'unknown';
+    setProbes(initial);
     (async () => {
       const next: Record<string, ProbeStatus> = {};
       const subs = Object.entries(metadata.subsystems);

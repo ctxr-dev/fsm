@@ -56,6 +56,7 @@ the exact predicate.
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -73,6 +74,9 @@ from ctxr.fsm.cli.lifecycle.primitives import read_active_mcp_file
 from ctxr.fsm.sqlite import Project
 
 __all__ = ["ProjectMetadata", "app", "lifespan_handler"]
+
+
+_LOG = logging.getLogger(__name__)
 
 
 # ── CORS allowlist construction ────────────────────────────────────
@@ -441,6 +445,17 @@ def get_current_project(project: ProjectDep, request: Request) -> ProjectMetadat
         # UI's info-rich topbar would lose its slug for a transient DB
         # blip and the operator would see "no project yet" rather than
         # the real error context (the rest of the payload still lands).
+        # We DO log the exception at WARNING with full traceback so a
+        # real DB / schema failure is debuggable from the server log
+        # rather than vanishing into a silent "no project bound" pill.
+        _LOG.warning(
+            "Failed to derive project_slug for /api/v1/projects/current; "
+            "the topbar will render 'no project bound'. This is a soft "
+            "failure (the rest of ProjectMetadata still lands) but the "
+            "stack trace below is the canonical source for diagnosing "
+            "the underlying issue.",
+            exc_info=True,
+        )
         project_slug = None
 
     # Subsystem map — read the supervisor's discovery doc from
