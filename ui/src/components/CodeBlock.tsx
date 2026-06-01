@@ -103,6 +103,18 @@ function renderMarkdown(text: string): string {
       'meta',
       'base',
     ],
+    // Belt + braces on the network-fetch guarantee: the forbidden
+    // tags above can't render at all, but `<input>` is intentionally
+    // allowed (GFM task-list checkboxes), and `<input type="image"
+    // src="https://..."/>` would beacon on render via the still-
+    // allowed src attribute. Strip every attribute that fetches a
+    // remote resource on render — src / srcset (img-style inputs +
+    // any future tag we forget to forbid), poster (video; defensive
+    // even though video is forbidden today), background (legacy td
+    // attr that still fetches in some engines), formaction (button
+    // submit override). href stays allowed so anchor links work; the
+    // DOMPurify default rules still strip javascript:/data: URIs.
+    FORBID_ATTR: ['src', 'srcset', 'poster', 'background', 'formaction'],
   });
 }
 

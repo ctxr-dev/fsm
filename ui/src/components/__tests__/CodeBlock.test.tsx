@@ -140,6 +140,31 @@ describe('CodeBlock', () => {
     expect((inputs[1] as HTMLInputElement).checked).toBe(true);
   });
 
+  test('rendered markdown strips src/srcset/poster/formaction even on allowed tags', () => {
+    // <input> is allowed (for GFM task-list checkboxes) so a naive
+    // FORBID_TAGS list would still permit
+    // `<input type="image" src="https://attacker/beacon.gif">` —
+    // which fetches the URL on render and leaks the operator's IP.
+    // Verify the FORBID_ATTR config strips these network-fetch
+    // attributes regardless of which (allowed) tag carries them.
+    const dangerous = [
+      '# Title',
+      '',
+      '<input type="image" src="https://example.com/x.png">',
+      '<a href="https://example.com" poster="https://example.com/y.gif">link</a>',
+    ].join('\n');
+    const { container } = render(<CodeBlock text={dangerous} />);
+    const body = container.querySelector('.cb-markdown');
+    expect(body).not.toBeNull();
+    const html = body!.innerHTML;
+    expect(html).not.toContain('src=');
+    expect(html).not.toContain('poster=');
+    expect(html).not.toContain('srcset=');
+    expect(html).not.toContain('formaction=');
+    // The legitimate href on the anchor is preserved.
+    expect(html).toContain('href="https://example.com"');
+  });
+
   test('rendered markdown forbids img / svg / iframe / script for security', () => {
     const dangerous = [
       '# Safe',
