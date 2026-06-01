@@ -281,12 +281,15 @@ export interface DoctorReport {
   /** Absolute filesystem path of the open DB file. */
   db_path: string;
   /** Absolute path of the project root that hosts ``.ctxr-fsm/``.
-   *  Optional so the UI handles servers older than W22 gracefully. */
-  project_root?: string;
+   *  ``null`` when the DB has no filesystem path (in-memory / non-
+   *  file backends — derivation is meaningless then). ``undefined``
+   *  when talking to a server older than W22. */
+  project_root?: string | null;
   /** DB path rendered relative to ``project_root``. UI surfaces
    *  prefer this so the displayed value stays portable. Canonical
-   *  layout: ``.ctxr-fsm/fsm.db``. */
-  db_path_relative?: string;
+   *  layout: ``.ctxr-fsm/fsm.db``. ``null`` when ``project_root`` is
+   *  also ``null``; ``undefined`` on a pre-W22 server. */
+  db_path_relative?: string | null;
   pragmas: JsonObject;
   tables_with_row_counts: Record<string, number>;
   alembic_revision: string | null;

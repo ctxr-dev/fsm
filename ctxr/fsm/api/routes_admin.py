@@ -138,24 +138,27 @@ class DoctorReport(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     db_path: str = Field(..., description="Absolute filesystem path of the open DB file.")
-    project_root: str = Field(
-        ...,
+    project_root: str | None = Field(
+        None,
         description=(
             "Absolute path of the project root that hosts ``.ctxr-fsm/``."
             " Computed by walking up from the resolved DB path; falls"
             " back to the DB's parent directory when no ``.ctxr-fsm/``"
             " ancestor is found (operator passed a non-canonical"
             " ``--db``). UI surfaces use this as the anchor for"
-            " portable, relative display of the DB path."
+            " portable, relative display of the DB path. ``None`` when"
+            " the DB URL has no filesystem path (in-memory / non-file"
+            " backends) — derivation is meaningless in that case."
         ),
     )
-    db_path_relative: str = Field(
-        ...,
+    db_path_relative: str | None = Field(
+        None,
         description=(
             "DB path rendered relative to ``project_root``. Canonical"
             " layout: ``.ctxr-fsm/fsm.db``. UI prefers this over"
             " ``db_path`` so the displayed value stays portable across"
-            " machines and committable to shared configs."
+            " machines and committable to shared configs. ``None`` when"
+            " ``project_root`` is also ``None``."
         ),
     )
     pragmas: dict[str, Any] = Field(
@@ -399,7 +402,14 @@ def _build_doctor_report(
     :func:`run_in_threadpool` and the tests can call this directly
     without spinning up FastAPI.
     """
-    db_path = engine.url.database or str(engine.url)
+    # ``engine.url.database`` is the filesystem path for SQLite URLs.
+    # When it's missing (in-memory backend, non-file URL) we still
+    # surface a ``db_path`` derived from the rendered URL for
+    # legibility, but skip the portable-path derivation — calling
+    # project_root_and_relative on ``sqlite://`` would produce
+    # misleading values.
+    db_url_database = engine.url.database
+    db_path = db_url_database or str(engine.url)
     pragmas = detect_journal_state(engine)
     tables = _list_user_tables(engine)
     row_counts = {name: _count_table_rows(engine, name) for name in tables}
@@ -407,10 +417,14 @@ def _build_doctor_report(
     journal_breakdown = _journal_status_breakdown(session_factory)
     lock_count = _lock_table_count(session_factory)
 
-    project_root, db_path_relative = project_root_and_relative(db_path)
+    project_root_str: str | None = None
+    db_path_relative: str | None = None
+    if db_url_database:
+        project_root_path, db_path_relative = project_root_and_relative(db_url_database)
+        project_root_str = str(project_root_path)
     return DoctorReport(
         db_path=db_path,
-        project_root=str(project_root),
+        project_root=project_root_str,
         db_path_relative=db_path_relative,
         pragmas=pragmas,
         tables_with_row_counts=row_counts,

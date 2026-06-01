@@ -224,23 +224,27 @@ class ProjectMetadata(BaseModel):
     fsm_version: str = Field(..., description="The ``ctxr.fsm`` package version.")
     project_open: bool = Field(..., description="Whether the :class:`Project` is bound.")
     db_path: str = Field(..., description="Absolute filesystem path of the open SQLite database.")
-    project_root: str = Field(
-        ...,
+    project_root: str | None = Field(
+        None,
         description=(
             "Absolute path of the project root that hosts ``.ctxr-fsm/``."
             " Computed by walking up from the resolved DB path; falls"
             " back to the DB's parent directory when no ``.ctxr-fsm/``"
             " ancestor is found (operator passed a non-canonical"
-            " ``--db``)."
+            " ``--db``). ``None`` when the DB URL has no filesystem"
+            " path (in-memory / non-file backends) — derivation is"
+            " meaningless in that case."
         ),
     )
-    db_path_relative: str = Field(
-        ...,
+    db_path_relative: str | None = Field(
+        None,
         description=(
             "Path of the open DB relative to ``project_root``. For the"
             " canonical layout this is ``.ctxr-fsm/fsm.db``. UI surfaces"
             " prefer this over ``db_path`` so the value stays portable"
             " across machines and committable to shared configs."
+            " ``None`` when ``project_root`` is also ``None`` (paired"
+            " field; see above)."
         ),
     )
 
@@ -306,18 +310,22 @@ def get_current_project(project: ProjectDep) -> ProjectMetadata:
     # attribute is the filesystem path for SQLite URLs. Falls back to
     # the rendered URL string so a future swap to a non-file backend
     # (memory, network) still returns something useful instead of
-    # ``None``.
-    db_path = project.engine.url.database or str(project.engine.url)
-    # Derive project_root + db_path_relative for portable display
-    # (the UI prefers the relative form for the topbar / Settings
-    # surface — sharing absolute paths across machines is exactly
-    # what this contract avoids).
-    project_root_path, db_relative = project_root_and_relative(db_path)
+    # ``None`` — but in that case we cannot meaningfully derive a
+    # project root / relative path, so the paired fields stay ``None``
+    # rather than emit nonsense (e.g. treating ``sqlite://`` as a
+    # filesystem path).
+    db_url_database = project.engine.url.database
+    db_path = db_url_database or str(project.engine.url)
+    project_root_str: str | None = None
+    db_relative: str | None = None
+    if db_url_database:
+        project_root_path, db_relative = project_root_and_relative(db_url_database)
+        project_root_str = str(project_root_path)
     return ProjectMetadata(
         fsm_version=ctxr.fsm.__version__,
         project_open=True,
         db_path=db_path,
-        project_root=str(project_root_path),
+        project_root=project_root_str,
         db_path_relative=db_relative,
     )
 
