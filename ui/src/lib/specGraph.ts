@@ -70,10 +70,39 @@ function predicateLabel(t: SpecTransitionShape): string {
   if (typeof t.when === 'string') return t.when;
   if (t.when && typeof t.when === 'object') {
     const obj = t.when as Record<string, unknown>;
+    // The FSM library's Transition model encodes the human-readable
+    // text in different keys depending on the kind: deterministic
+    // puts it in `.expression`, judgement in `.criteria`, and bare
+    // Predicate dumps map to `.predicate`. Check all three so the
+    // visible edge label never goes blank for a transition that
+    // genuinely has guard text.
     if (typeof obj.predicate === 'string') return obj.predicate;
     if (typeof obj.expression === 'string') return obj.expression;
+    if (typeof obj.criteria === 'string') return obj.criteria;
   }
   return '';
+}
+
+/** Derive the transition kind (always / otherwise / deterministic /
+ *  judgement) from the various `when` shapes the FSM library emits.
+ *  The Transition model does NOT carry a top-level `kind` field — it
+ *  lives inside `when` (or is the bare string "always"/"otherwise").
+ *  Returns undefined when the shape isn't recognised. */
+function transitionKind(t: SpecTransitionShape): string | undefined {
+  if (typeof t.when === 'string') {
+    if (t.when === 'always' || t.when === 'otherwise') return t.when;
+    // A bare predicate-string (anything else) lifts to deterministic
+    // per the Python Transition normaliser.
+    return 'deterministic';
+  }
+  if (t.when && typeof t.when === 'object') {
+    const obj = t.when as Record<string, unknown>;
+    if (typeof obj.kind === 'string') return obj.kind;
+    // A dict with only `.expression` is deterministic per the
+    // Python Transition.normalise_when contract.
+    if (typeof obj.expression === 'string') return 'deterministic';
+  }
+  return undefined;
 }
 
 export interface SpecGraph {
@@ -148,10 +177,12 @@ export function specToGraph(definition: unknown): SpecGraph {
         labelStyle: { fontSize: 10 },
         // W21: carry the FULL transition metadata so the Tooltip and
         // click-Sheet have access to kind + raw predicate + source/
-        // target without walking the spec twice.
+        // target without walking the spec twice. The kind is derived
+        // from `when` (the Transition model doesn't have a top-level
+        // `kind` field — it's encoded inside the `when` payload).
         data: {
           fullLabel: label || undefined,
-          kind: t.kind,
+          kind: transitionKind(t),
           transition: t as unknown as Record<string, unknown>,
           sourceId: s.id,
           targetId: t.to,

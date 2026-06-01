@@ -282,12 +282,18 @@ function applyDagreLayout(
 }
 
 // Truncate predicate strings so a single edge label can't sprawl over
-// downstream nodes. The FULL text is now preserved on edge.data.fullLabel
-// (W21) and surfaced via the FsmEdge custom edge type's Tooltip on hover
-// + click-to-Sheet. The dagre layout still reserves space based on the
-// TRUNCATED text width so the graph stays autobalanced (PR #56).
-// Truncation point chosen empirically: 28 chars fits comfortably within
-// the dagre-allocated LABEL_WIDTH (160 px) at the 10 px font-size we use.
+// downstream nodes. The FULL text is preserved on edge.data.fullLabel
+// (W21) and surfaced via the FsmEdge custom edge type's Tooltip on
+// hover + click-to-Sheet.
+//
+// Note on dagre slack: applyDagreLayout above computes per-edge label
+// dimensions from the ORIGINAL (pre-decoration) label length and
+// clamps to LABEL_WIDTH (160 px). The truncation that happens in
+// decorateEdges only affects the VISIBLE text the user reads — dagre
+// never sees the truncated string, so its routing slack stays
+// proportional to the actual predicate complexity. Truncation point
+// chosen empirically: 28 chars fits comfortably within LABEL_WIDTH
+// at the 10 px font-size we use.
 const LABEL_MAX_CHARS = 28;
 function truncateLabel(text: string): string {
   if (text.length <= LABEL_MAX_CHARS) return text;

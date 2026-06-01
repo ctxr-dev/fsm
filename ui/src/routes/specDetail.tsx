@@ -141,9 +141,24 @@ function StateInspectorBody({ state, isEntry }: StateInspectorBodyProps): JSX.El
         <section>
           <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
             worker.prompt_template
+            {worker.prompt_template_language ? (
+              <span class="ml-2 text-slate-400 dark:text-slate-500">
+                · language={String(worker.prompt_template_language)}
+              </span>
+            ) : null}
           </h4>
+          {/* The consumer's `prompt_template_language` field (defined
+              on the FSM library's Worker model since W21) tells the
+              UI how to render. When set, CodeBlock honours it
+              verbatim; when omitted, the markdown content heuristic
+              acts as a courtesy fallback. */}
           <CodeBlock
             text={String(worker.prompt_template)}
+            language={
+              typeof worker.prompt_template_language === 'string'
+                ? worker.prompt_template_language
+                : undefined
+            }
             maxInlineHeight="max-h-64"
             ariaLabel={`${id} worker prompt template`}
           />
@@ -179,16 +194,19 @@ function StateInspectorBody({ state, isEntry }: StateInspectorBodyProps): JSX.El
             {transitions.map((t, idx) => {
               const target = typeof t.to === 'string' ? t.to : '(unknown)';
               const tKind = typeof t.kind === 'string' ? t.kind : undefined;
-              // Mirror specGraph.predicateLabel(): an object-form
-              // `when` can encode the predicate under EITHER `.predicate`
-              // OR `.expression`. Checking only one of the two leaves
-              // the inspector blank for transitions whose graph edge
-              // label/tooltip is non-empty — a confusing divergence.
+              // Mirror specGraph.predicateLabel(): a `when` dict can
+              // encode the human-readable guard text under any of
+              // `.predicate` (bare Predicate dump), `.expression`
+              // (deterministic kind), or `.criteria` (judgement
+              // kind). Checking only some of them leaves the
+              // inspector blank for judgement transitions while the
+              // edge label / tooltip still renders text — confusing.
               const when = typeof t.when === 'string'
                 ? t.when
                 : t.when && typeof t.when === 'object'
                 ? (((t.when as Record<string, unknown>).predicate as string | undefined)
                     ?? ((t.when as Record<string, unknown>).expression as string | undefined)
+                    ?? ((t.when as Record<string, unknown>).criteria as string | undefined)
                     ?? '')
                 : '';
               return (

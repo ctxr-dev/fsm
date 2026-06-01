@@ -200,4 +200,65 @@ describe('specToGraph', () => {
     const data = g.edges[0].data as Record<string, unknown>;
     expect(data.fullLabel).toBeUndefined();
   });
+
+  // -------------------------------------------------------------------------
+  // W21 follow-up: kind derived from `when` (not top-level t.kind);
+  // criteria fallback for judgement transitions.
+  // -------------------------------------------------------------------------
+
+  test('W21: edge.data.kind for bare "always" string transition', () => {
+    const g = specToGraph({
+      states: [{ id: 'a', transitions: [{ to: 'b', when: 'always' }] }, { id: 'b' }],
+    });
+    expect((g.edges[0].data as Record<string, unknown>).kind).toBe('always');
+  });
+
+  test('W21: edge.data.kind for bare "otherwise" string transition', () => {
+    const g = specToGraph({
+      states: [{ id: 'a', transitions: [{ to: 'b', when: 'otherwise' }] }, { id: 'b' }],
+    });
+    expect((g.edges[0].data as Record<string, unknown>).kind).toBe('otherwise');
+  });
+
+  test('W21: edge.data.kind for {kind:"judgement", criteria:"..."} dict-form when', () => {
+    const g = specToGraph({
+      states: [
+        {
+          id: 'a',
+          transitions: [{ to: 'b', when: { kind: 'judgement', criteria: 'verdict is GO' } }],
+        },
+        { id: 'b' },
+      ],
+    });
+    const data = g.edges[0].data as Record<string, unknown>;
+    expect(data.kind).toBe('judgement');
+    // And the fullLabel should fall through to criteria text.
+    expect(data.fullLabel).toBe('verdict is GO');
+  });
+
+  test('W21: edge.data.kind for {kind:"deterministic", expression:"..."} dict', () => {
+    const g = specToGraph({
+      states: [
+        {
+          id: 'a',
+          transitions: [{ to: 'b', when: { kind: 'deterministic', expression: 'x > 0' } }],
+        },
+        { id: 'b' },
+      ],
+    });
+    const data = g.edges[0].data as Record<string, unknown>;
+    expect(data.kind).toBe('deterministic');
+    expect(data.fullLabel).toBe('x > 0');
+  });
+
+  test('W21: bare predicate-string when is treated as deterministic', () => {
+    const g = specToGraph({
+      states: [
+        { id: 'a', transitions: [{ to: 'b', when: 'verdict == "GO"' }] },
+        { id: 'b' },
+      ],
+    });
+    const data = g.edges[0].data as Record<string, unknown>;
+    expect(data.kind).toBe('deterministic');
+  });
 });

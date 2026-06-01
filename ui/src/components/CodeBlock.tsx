@@ -108,7 +108,13 @@ function renderMarkdown(text: string): string {
 
 export interface CodeBlockProps {
   text: string;
-  language?: 'plain' | 'sql' | 'python' | 'markdown' | 'jinja';
+  /** Format hint declared by the consumer (e.g. an FSM Worker's
+   *  ``prompt_template_language``). Free-form string so consumers
+   *  own the convention; common values include 'markdown', 'jinja',
+   *  'plain', 'json'. When omitted or unknown to this component the
+   *  body renders as plain monospace (with the markdown heuristic
+   *  applying as a courtesy fallback). */
+  language?: string;
   lineNumbers?: boolean;
   maxInlineHeight?: string;
   filename?: string;
