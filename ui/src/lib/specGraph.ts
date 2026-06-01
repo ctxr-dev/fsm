@@ -104,7 +104,19 @@ export function specToGraph(definition: unknown): SpecGraph {
     return {
       id: s.id,
       position: { x: 0, y: 0 }, // dagre fills these in
-      data: { kind, label: s.id, sublabel },
+      // W21: copy the FULL spec state object onto data.state so the
+      // click handler can render a State Inspector Sheet without
+      // re-walking the spec. fullLabel/fullSublabel mirror the
+      // visible strings; node-label tooltip falls back to label when
+      // these are absent.
+      data: {
+        kind,
+        label: s.id,
+        sublabel,
+        fullLabel: s.id,
+        fullSublabel: sublabel || undefined,
+        state: s as unknown as Record<string, unknown>,
+      },
     };
   });
 
@@ -112,11 +124,13 @@ export function specToGraph(definition: unknown): SpecGraph {
   if (def.entry) {
     const entry = nodes.find((n) => n.id === def.entry);
     if (entry) {
+      const newSub = entry.data.sublabel
+        ? `entry · ${entry.data.sublabel}`
+        : 'entry';
       entry.data = {
         ...entry.data,
-        sublabel: entry.data.sublabel
-          ? `entry · ${entry.data.sublabel}`
-          : 'entry',
+        sublabel: newSub,
+        fullSublabel: newSub,
       };
     }
   }
@@ -132,6 +146,16 @@ export function specToGraph(definition: unknown): SpecGraph {
         target: t.to,
         label: label || undefined,
         labelStyle: { fontSize: 10 },
+        // W21: carry the FULL transition metadata so the Tooltip and
+        // click-Sheet have access to kind + raw predicate + source/
+        // target without walking the spec twice.
+        data: {
+          fullLabel: label || undefined,
+          kind: t.kind,
+          transition: t as unknown as Record<string, unknown>,
+          sourceId: s.id,
+          targetId: t.to,
+        },
       });
     }
   }

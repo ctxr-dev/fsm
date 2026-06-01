@@ -56,3 +56,6 @@ export type { TabsProps, TabSpec } from './Tabs';
 
 export { FlowGraph } from './FlowGraph';
 export type { FlowGraphProps, FlowNodeData, FlowNodeKind } from './FlowGraph';
+
+export { Tooltip } from './Tooltip';
+export type { TooltipProps, TooltipPlacement } from './Tooltip';

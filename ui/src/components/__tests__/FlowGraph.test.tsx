@@ -23,6 +23,10 @@ vi.mock('@xyflow/react', () => ({
   Background: () => <div data-testid="bg" />,
   Controls: () => <div data-testid="controls" />,
   MiniMap: () => <div data-testid="minimap" />,
+  Handle: () => null,
+  BaseEdge: () => null,
+  EdgeLabelRenderer: (p: { children?: unknown }) => <>{p.children as any}</>,
+  getSmoothStepPath: () => ['M0,0 L1,1', 0, 0, 0, 0],
   Position: { Left: 'left', Right: 'right', Top: 'top', Bottom: 'bottom' },
   BackgroundVariant: { Dots: 'dots', Lines: 'lines', Cross: 'cross' },
   MarkerType: { ArrowClosed: 'arrowclosed', Arrow: 'arrow' },
@@ -235,6 +239,53 @@ describe('FlowGraph', () => {
     } finally {
       graphlib.Graph = realGraph;
     }
+  });
+
+  test('W21: decorateEdges sets type=fsmEdge and copies full label onto edge.data', () => {
+    const nodes: Node<FlowNodeData>[] = [
+      { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+      { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
+    ];
+    const fullPredicate = "tier == 'trivial' AND len(risk_signals) == 0 AND NOT scope_overrides_present";
+    const edges: Edge[] = [{ id: 'a-b', source: 'a', target: 'b', label: fullPredicate }];
+    render(<FlowGraph nodes={nodes} edges={edges} autoLayout={false} />);
+    const decorated = lastReactFlowProps!.edges as Array<Edge & { type?: string; data?: Record<string, unknown> }>;
+    expect(decorated[0].type).toBe('fsmEdge');
+    expect(decorated[0].data?.fullLabel).toBe(fullPredicate);
+    expect(decorated[0].data?.sourceId).toBe('a');
+    expect(decorated[0].data?.targetId).toBe('b');
+    // The visible label is truncated but the full text is preserved on data.
+    expect((decorated[0].label as string).length).toBeLessThanOrEqual(28);
+  });
+
+  test('W21: FlowGraph registers fsmEdge as a custom edge type', () => {
+    const nodes: Node<FlowNodeData>[] = [
+      { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+    ];
+    render(<FlowGraph nodes={nodes} edges={[]} />);
+    const edgeTypes = lastReactFlowProps!.edgeTypes as Record<string, unknown>;
+    expect(edgeTypes).toBeDefined();
+    expect(edgeTypes.fsmEdge).toBeTypeOf('function');
+  });
+
+  test('W21: onEdgeClick receives edge.data as second arg', () => {
+    const nodes: Node<FlowNodeData>[] = [
+      { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+      { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
+    ];
+    const edges: Edge[] = [{ id: 'a-b', source: 'a', target: 'b', label: 'always' }];
+    const onEdgeClick = vi.fn();
+    render(<FlowGraph nodes={nodes} edges={edges} onEdgeClick={onEdgeClick} autoLayout={false} />);
+    // Pull the onEdgeClick out of the forwarded ReactFlow props and
+    // invoke it with a synthetic (event, edge) pair (mirrors how
+    // xyflow would dispatch on a real click).
+    const rfOnEdgeClick = lastReactFlowProps!.onEdgeClick as (e: unknown, edge: Edge) => void;
+    rfOnEdgeClick({}, { id: 'a-b', source: 'a', target: 'b', data: { fullLabel: 'always', sourceId: 'a', targetId: 'b' } } as unknown as Edge);
+    expect(onEdgeClick).toHaveBeenCalledWith('a-b', expect.objectContaining({
+      fullLabel: 'always',
+      sourceId: 'a',
+      targetId: 'b',
+    }));
   });
 
   test('default direction is TB (top-to-bottom) when not specified', () => {
