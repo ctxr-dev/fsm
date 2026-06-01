@@ -203,14 +203,24 @@ export function specToGraph(definition: unknown): SpecGraph {
       // re-walking the spec. fullLabel/fullSublabel mirror the
       // visible strings; the Tooltip falls back to label when
       // fullLabel is absent.
-      data: {
-        kind,
-        label: s.id,
-        sublabel,
-        fullLabel: s.id,
-        fullSublabel: canonicalSublabel ?? sublabel ?? undefined,
-        state: s as unknown as Record<string, unknown>,
-      },
+      // Compose fullSublabel via `||` (not `??`) so an empty-string
+      // `sublabel` (the initial value when no worker/inline/terminal
+      // applies) falls through to undefined instead of pinning the
+      // tooltip content to '' — which downstream `?? data.sublabel`
+      // wouldn't short-circuit past. Empty-content Tooltip auto-no-
+      // renders, but having `fullSublabel = ''` would suppress the
+      // hover fallback even when `sublabel` IS non-empty.
+      data: (() => {
+        const fs = canonicalSublabel ?? sublabel;
+        return {
+          kind,
+          label: s.id,
+          sublabel,
+          fullLabel: s.id,
+          fullSublabel: fs && fs.length > 0 ? fs : undefined,
+          state: s as unknown as Record<string, unknown>,
+        };
+      })(),
     };
   });
 
