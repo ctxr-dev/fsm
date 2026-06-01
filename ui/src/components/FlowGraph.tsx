@@ -162,14 +162,18 @@ const NODE_TYPES = { fsmNode: FsmNode };
  *                         paths; for FSMs with branchy predicates this
  *                         keeps the visual centre line stable
  *
- * Edge labels reserve dagre space proportional to text length so dagre
- * routes around them (see g.setEdge below). Labels themselves are
- * truncated by decorateEdges to LABEL_MAX_CHARS so they stay legible.
+ * Edge labels reserve dagre space proportional to text length (see
+ * g.setEdge below) so dagre routes around them. Labels themselves are
+ * truncated by decorateEdges to LABEL_MAX_CHARS so they stay legible
+ * inside the reserved LABEL_WIDTH box.
  *
- * We also pass per-edge label dimensions (LABEL_WIDTH / LABEL_HEIGHT)
- * so dagre reserves space for the label and routes the edge around
- * the surrounding nodes. Edge labels are truncated by decorateEdges
- * to LABEL_MAX_CHARS so they stay within LABEL_WIDTH.
+ * The graph is constructed as a multigraph because specToGraph can
+ * legitimately emit two transitions with the same (source, target)
+ * pair (e.g. a deterministic predicate plus an `otherwise` fallback
+ * between the same two states). A non-multigraph Graph would silently
+ * collapse them under `setEdge(v, w, ...)` and lose layout slack for
+ * the dropped label. Multigraph mode requires a per-edge `name` so
+ * dagre distinguishes parallel edges; we pass the React Flow edge id.
  */
 const LABEL_WIDTH = 160;
 const LABEL_HEIGHT = 18;
@@ -179,7 +183,7 @@ function applyDagreLayout(
   edges: readonly Edge[],
   direction: 'LR' | 'TB',
 ): Node<FlowNodeData>[] {
-  const g = new dagre.graphlib.Graph();
+  const g = new dagre.graphlib.Graph({ multigraph: true });
   g.setDefaultEdgeLabel(() => ({}));
   g.setGraph({
     rankdir: direction,
@@ -195,12 +199,19 @@ function applyDagreLayout(
     const labelLen = typeof e.label === 'string' ? e.label.length : 0;
     // Reserve label space proportionally so dagre routes around
     // long predicate labels instead of letting them collide with
-    // nodes downstream.
-    g.setEdge(e.source, e.target, {
-      width: labelLen > 0 ? Math.min(LABEL_WIDTH, Math.max(40, labelLen * 7)) : 0,
-      height: labelLen > 0 ? LABEL_HEIGHT : 0,
-      labelpos: 'c',
-    });
+    // nodes downstream. The fourth argument is the edge name; under
+    // multigraph mode it disambiguates parallel edges so a second
+    // predicate between the same two states doesn't clobber the first.
+    g.setEdge(
+      e.source,
+      e.target,
+      {
+        width: labelLen > 0 ? Math.min(LABEL_WIDTH, Math.max(40, labelLen * 7)) : 0,
+        height: labelLen > 0 ? LABEL_HEIGHT : 0,
+        labelpos: 'c',
+      },
+      e.id,
+    );
   }
   dagre.layout(g);
 

@@ -117,4 +117,83 @@ describe('FlowGraph', () => {
     expect(queryByTestId('bg')).toBeNull();
     expect(queryByTestId('controls')).toBeNull();
   });
+
+  test('decorateEdges truncates labels longer than LABEL_MAX_CHARS', () => {
+    const nodes: Node<FlowNodeData>[] = [
+      { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+      { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
+    ];
+    const longLabel =
+      "tier == 'trivial' AND len(risk_signals) == 0 AND NOT scope_overrides_present";
+    const edges: Edge[] = [{ id: 'a-b', source: 'a', target: 'b', label: longLabel }];
+    render(<FlowGraph nodes={nodes} edges={edges} autoLayout={false} />);
+    const decorated = lastReactFlowProps!.edges as Edge[];
+    const lbl = decorated[0].label as string;
+    expect(lbl.length).toBeLessThanOrEqual(28);
+    expect(lbl.endsWith('…')).toBe(true);
+    expect(longLabel.startsWith(lbl.slice(0, -1))).toBe(true);
+  });
+
+  test('decorateEdges leaves short labels untouched', () => {
+    const nodes: Node<FlowNodeData>[] = [
+      { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+      { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
+    ];
+    const edges: Edge[] = [{ id: 'a-b', source: 'a', target: 'b', label: 'always' }];
+    render(<FlowGraph nodes={nodes} edges={edges} autoLayout={false} />);
+    const decorated = lastReactFlowProps!.edges as Edge[];
+    expect(decorated[0].label).toBe('always');
+  });
+
+  test('decorateEdges enables themed label background badge', () => {
+    const nodes: Node<FlowNodeData>[] = [
+      { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+      { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
+    ];
+    const edges: Edge[] = [{ id: 'a-b', source: 'a', target: 'b', label: 'always' }];
+    render(<FlowGraph nodes={nodes} edges={edges} autoLayout={false} />);
+    const decorated = lastReactFlowProps!.edges as Array<
+      Edge & {
+        labelShowBg?: boolean;
+        labelBgStyle?: { fill?: string };
+      }
+    >;
+    expect(decorated[0].labelShowBg).toBe(true);
+    expect(decorated[0].labelBgStyle?.fill).toContain('--xy-label-bg');
+  });
+
+  test('multigraph layout preserves parallel edges between the same node pair', () => {
+    // specToGraph emits two transitions between the same (source, target):
+    // a deterministic predicate and an `otherwise` fallback. A non-
+    // multigraph dagre Graph would collapse them under setEdge(v, w, ...)
+    // and lose one label's layout slack. With multigraph: true and a
+    // per-edge name (the edge id), both survive.
+    const nodes: Node<FlowNodeData>[] = [
+      { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+      { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
+    ];
+    const edges: Edge[] = [
+      { id: 'a-b-0', source: 'a', target: 'b', label: 'predicate' },
+      { id: 'a-b-1', source: 'a', target: 'b', label: 'otherwise' },
+    ];
+    render(<FlowGraph nodes={nodes} edges={edges} autoLayout={true} direction="TB" />);
+    const decoratedEdges = lastReactFlowProps!.edges as Edge[];
+    expect(decoratedEdges).toHaveLength(2);
+    expect(decoratedEdges.map((e) => e.id).sort()).toEqual(['a-b-0', 'a-b-1']);
+    expect(decoratedEdges.map((e) => e.label).sort()).toEqual(['otherwise', 'predicate']);
+  });
+
+  test('default direction is TB (top-to-bottom) when not specified', () => {
+    const nodes: Node<FlowNodeData>[] = [
+      { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+      { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
+    ];
+    const edges: Edge[] = [{ id: 'a-b', source: 'a', target: 'b' }];
+    // No direction prop. With TB, dagre stacks ranks vertically, so the
+    // y coordinates differ but the x coordinates align.
+    render(<FlowGraph nodes={nodes} edges={edges} autoLayout={true} />);
+    const positioned = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
+    const ys = positioned.map((n) => n.position.y);
+    expect(new Set(ys).size).toBe(2);
+  });
 });
