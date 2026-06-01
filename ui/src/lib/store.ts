@@ -29,7 +29,7 @@
 import { signal, type Signal, effect } from '@preact/signals';
 
 import type { ConnectionState } from './sse';
-import type { Event as FsmEvent, RunSummary } from './api';
+import type { Event as FsmEvent, ProjectMetadata, RunSummary } from './api';
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -264,6 +264,48 @@ export const runComparisonContext: Signal<{ a: string; b: string | null } | null
   a: string;
   b: string | null;
 } | null>(null);
+
+// ---------------------------------------------------------------------------
+// W23c — hoisted project metadata
+// Single source of truth so InfoTopBar, Settings, PageHeader, and any
+// future consumer reach the same value without re-fetching.
+// ---------------------------------------------------------------------------
+
+export const projectMetadata: Signal<ProjectMetadata | null> = signal<ProjectMetadata | null>(null);
+export const projectMetadataError: Signal<string | null> = signal<string | null>(null);
+export const projectMetadataLoading: Signal<boolean> = signal<boolean>(true);
+
+let _metadataWired = false;
+
+/**
+ * One-shot wiring: fetches the current project metadata and refreshes
+ * it whenever the browser tab regains focus. Idempotent; safe to call
+ * from app boot. NO-OP in non-browser environments (SSR / tests).
+ */
+export function wireProjectMetadata(): void {
+  if (_metadataWired || typeof window === 'undefined') return;
+  _metadataWired = true;
+
+  const load = async (): Promise<void> => {
+    projectMetadataLoading.value = true;
+    try {
+      // Lazy import to avoid a circular when store.ts is consumed by api.ts.
+      const { api: apiClient } = await import('./api');
+      const metadata = await apiClient.getCurrentProject();
+      projectMetadata.value = metadata;
+      projectMetadataError.value = null;
+    } catch (err) {
+      projectMetadataError.value = err instanceof Error ? err.message : String(err);
+    } finally {
+      projectMetadataLoading.value = false;
+    }
+  };
+
+  void load();
+  window.addEventListener('focus', () => {
+    void load();
+  });
+}
 
 // ---------------------------------------------------------------------------
 // W18a mutators
