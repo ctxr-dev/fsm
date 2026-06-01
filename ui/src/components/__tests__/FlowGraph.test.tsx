@@ -172,8 +172,13 @@ describe('FlowGraph', () => {
     // instance FlowGraph builds: constructor option, edge count,
     // per-edge names.
     const dagreMod = await import('dagre');
-    const realGraph = dagreMod.default.graphlib.Graph;
-    const instances: InstanceType<typeof realGraph>[] = [];
+    // dagre.graphlib.Graph is a class; we treat it as an unknown
+    // constructor here so we can wrap it without fighting TS over
+    // its overloaded signature.
+    type GraphCtor = new (opts?: Record<string, unknown>) => unknown;
+    const graphlib = dagreMod.default.graphlib as unknown as { Graph: GraphCtor };
+    const realGraph = graphlib.Graph;
+    const instances: unknown[] = [];
     const ctorCalls: unknown[] = [];
     // Replace with a wrapper that constructs a real Graph and records
     // both the args and the instance. Using `function` (not arrow) so
@@ -181,11 +186,11 @@ describe('FlowGraph', () => {
     // gives us the genuine dagre behaviour for the rest of the layout.
     const Wrapped = function (opts?: Record<string, unknown>) {
       ctorCalls.push(opts);
-      const inst = new realGraph(opts as Parameters<typeof realGraph>[0]);
+      const inst = new realGraph(opts);
       instances.push(inst);
       return inst;
-    } as unknown as typeof realGraph;
-    (dagreMod.default.graphlib as { Graph: typeof realGraph }).Graph = Wrapped;
+    } as unknown as GraphCtor;
+    graphlib.Graph = Wrapped;
     try {
       const nodes: Node<FlowNodeData>[] = [
         { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
@@ -214,7 +219,7 @@ describe('FlowGraph', () => {
       const names = dagreEdges.map((e) => e.name).sort();
       expect(names).toEqual(['a-b-0', 'a-b-1']);
     } finally {
-      (dagreMod.default.graphlib as { Graph: typeof realGraph }).Graph = realGraph;
+      graphlib.Graph = realGraph;
     }
   });
 

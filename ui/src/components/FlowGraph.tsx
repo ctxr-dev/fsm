@@ -274,7 +274,7 @@ function decorateEdges(edges: readonly Edge[]): Edge[] {
       // a readable label badge.
       labelShowBg: true,
       labelBgStyle: {
-        fill: 'var(--xy-label-bg, #ffffff)',
+        fill: 'var(--xy-label-bg, #f8fafc)',
         fillOpacity: 0.92,
       },
       labelBgPadding: [6, 4] as [number, number],

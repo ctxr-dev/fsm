@@ -7,6 +7,10 @@
  * grammar contract (chevron-only expansion, label-click selects)
  * lives in the page-level e2e battery (W18k) where a real browser can
  * exercise it; here we assert our wrappers exist and dispatch.
+ *
+ * The theme-switch tests (last describe block) mock @uiw/react-json-view
+ * so we can capture the `style` prop our wrapper passes in (the W20
+ * fix) without depending on the library's own rendering.
  */
 
 import { afterEach, describe, expect, test, vi } from 'vitest';
@@ -17,6 +21,7 @@ import { JsonViewer } from '../JsonViewer';
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  document.documentElement.classList.remove('dark');
 });
 
 describe('JsonViewer toolbar', () => {
@@ -102,3 +107,4 @@ describe('JsonViewer toolbar', () => {
     expect(section.getAttribute('aria-label')).toBe('Test viewer');
   });
 });
+

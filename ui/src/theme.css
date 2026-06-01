@@ -123,12 +123,13 @@ body {
   margin: 0;
 }
 
-/* xyflow edge-label background colour (W20): light theme uses page
-   background; dark theme uses slate-800. FlowGraph passes
-   `fill: var(--xy-label-bg)` so the predicate-text badge stays
-   readable when an edge passes near another node. */
+/* xyflow edge-label background colour (W20): matches the app shell's
+   surface in each theme so the predicate-text badge blends with the
+   page rather than punching a brighter rectangle through it. Light
+   uses slate-50 (the body bg in app.tsx); dark uses slate-800.
+   FlowGraph passes `fill: var(--xy-label-bg)` per edge label. */
 :root {
-  --xy-label-bg: #ffffff;
+  --xy-label-bg: #f8fafc;
 }
 .dark {
   --xy-label-bg: #1e293b;
