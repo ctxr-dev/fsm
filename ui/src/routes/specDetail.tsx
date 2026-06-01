@@ -131,19 +131,17 @@ function StateInspectorBody({ state, isEntry }: StateInspectorBodyProps): JSX.El
   return (
     <div class="space-y-4 p-3">
       <KeyValueTable rows={rows} caption="State metadata" />
+      {/* Every section heading below is the LITERAL FSM library field
+          name (worker.prompt_template / worker.response_schema /
+          state.loop / state.transitions). No consumer-specific text:
+          the FSM UI is agnostic to which skill / agent system is
+          using the library, and labels its sections after the field
+          paths the Worker / State models actually expose. */}
       {worker?.prompt_template ? (
         <section>
-          <h4 class="text-xs uppercase tracking-wide text-slate-600 dark:text-slate-400 mb-1">
-            Prompt template
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            worker.prompt_template
           </h4>
-          {/* No language= hint: the FSM library treats prompt_template
-              as an opaque string. The consuming skill / agent
-              orchestrator owns the template's MIME type / language
-              convention (could be markdown, jinja, plain prose, json,
-              anything else). Rendering as plain text is the only
-              correct domain-agnostic default. If a future spec gains
-              a `prompt_template_language` (or similar) declared
-              field, plumb it through here. */}
           <CodeBlock
             text={String(worker.prompt_template)}
             maxInlineHeight="max-h-64"
@@ -153,8 +151,8 @@ function StateInspectorBody({ state, isEntry }: StateInspectorBodyProps): JSX.El
       ) : null}
       {worker?.response_schema ? (
         <section>
-          <h4 class="text-xs uppercase tracking-wide text-slate-600 dark:text-slate-400 mb-1">
-            response_schema
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            worker.response_schema
           </h4>
           <JsonViewer
             value={worker.response_schema}
@@ -166,16 +164,16 @@ function StateInspectorBody({ state, isEntry }: StateInspectorBodyProps): JSX.El
       ) : null}
       {loop ? (
         <section>
-          <h4 class="text-xs uppercase tracking-wide text-slate-600 dark:text-slate-400 mb-1">
-            loop
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            state.loop
           </h4>
           <JsonViewer value={loop} rootLabel="loop" mode="inline" maxInlineHeight="max-h-48" />
         </section>
       ) : null}
       {transitions.length > 0 ? (
         <section>
-          <h4 class="text-xs uppercase tracking-wide text-slate-600 dark:text-slate-400 mb-1">
-            Transitions out ({transitions.length})
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            state.transitions ({transitions.length})
           </h4>
           <ul class="divide-y divide-slate-100 dark:divide-slate-800 text-xs">
             {transitions.map((t, idx) => {
@@ -243,10 +241,13 @@ function TransitionInspectorBody({
         </code>
       </div>
       <KeyValueTable rows={rows} caption="Transition metadata" />
+      {/* Same convention as StateInspectorBody above: headings are
+          the FSM library's literal transition-shape paths so the
+          operator sees field names, not designer text. */}
       {predicate ? (
         <section>
-          <h4 class="text-xs uppercase tracking-wide text-slate-600 dark:text-slate-400 mb-1">
-            Predicate
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            transition.when
           </h4>
           <CodeBlock
             text={predicate}
@@ -258,8 +259,8 @@ function TransitionInspectorBody({
       ) : null}
       {transition ? (
         <section>
-          <h4 class="text-xs uppercase tracking-wide text-slate-600 dark:text-slate-400 mb-1">
-            Raw transition object
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            transition (raw)
           </h4>
           <JsonViewer
             value={transition}
