@@ -23,6 +23,7 @@ import type { JSX } from 'preact';
 import { useEffect, useMemo, useState } from 'preact/hooks';
 
 import {
+  Button,
   Card,
   EmptyState,
   Pill,
@@ -34,6 +35,7 @@ import {
 import {
   api,
   ApiError,
+  ApiResponseShapeError,
   walkAllPages,
   type RunSummary,
   type SpecSummary,
@@ -128,10 +130,17 @@ function navigateTo(path: string): void {
   window.dispatchEvent(new PopStateEvent('popstate'));
 }
 
+/** Discriminated error state — distinguishes a transient server failure
+ *  (renders a generic empty-state) from a wire-shape regression (renders
+ *  a Reload-page affordance with operator-facing recovery hint). */
+type LoadError =
+  | { kind: 'api'; message: string }
+  | { kind: 'shape'; message: string };
+
 export function SpecsRoute(): JSX.Element {
   const [specs, setSpecs] = useState<SpecSummary[] | null>(null);
   const [runs, setRuns] = useState<RunSummary[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<LoadError | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -150,7 +159,16 @@ export function SpecsRoute(): JSX.Element {
         setRuns(r);
       })
       .catch((err: unknown) => {
-        if (!cancelled) setError(err instanceof ApiError ? err.message : String(err));
+        if (cancelled) return;
+        // W23a: distinguish a wire-shape regression from a generic API
+        // failure so the operator gets an actionable "Reload page"
+        // affordance rather than the same "Failed to load" string they
+        // would see from any 5xx.
+        if (err instanceof ApiResponseShapeError) {
+          setError({ kind: 'shape', message: err.message });
+        } else {
+          setError({ kind: 'api', message: err instanceof ApiError ? err.message : String(err) });
+        }
       });
     return () => { cancelled = true; };
   }, []);
@@ -209,7 +227,32 @@ export function SpecsRoute(): JSX.Element {
 
   let body: JSX.Element;
   if (error) {
-    body = <EmptyState title="Failed to load specs" message={error} />;
+    // Wire-shape errors get an explicit reload affordance — the
+    // operator's recovery path is "refresh the page" (stale UI) or
+    // "restart the supervisor" (proxy mis-route). Generic API errors
+    // surface the server message as-is and rely on the operator to
+    // diagnose via Settings / doctor.
+    if (error.kind === 'shape') {
+      body = (
+        <EmptyState
+          title="UI / server out of sync"
+          message={error.message}
+          action={
+            <Button
+              variant="primary"
+              size="md"
+              onClick={() => {
+                if (typeof window !== 'undefined') window.location.reload();
+              }}
+            >
+              Reload page
+            </Button>
+          }
+        />
+      );
+    } else {
+      body = <EmptyState title="Failed to load specs" message={error.message} />;
+    }
   } else if (rows === null) {
     body = (
       <div class="flex items-center justify-center py-12">

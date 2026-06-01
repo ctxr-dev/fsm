@@ -449,6 +449,35 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Raised when a 2xx response from the API carries a payload shape the
+ * caller cannot use — wrong content-type (HTML instead of JSON), a JSON
+ * body that fails to parse, or a Page envelope missing required fields.
+ *
+ * Distinct from :class:`ApiError` so route-level UX can render an
+ * actionable "UI / server out of sync" affordance (Reload page) rather
+ * than the generic "Failed to load X" with the server's error message.
+ * The triggers are typically operator-facing rather than server-side
+ * bugs: a stale UI bundle, a dev-server proxy mis-route, a CDN edge
+ * cache returning HTML where JSON was expected.
+ *
+ * ``received`` carries the actual payload (the HTML body or the
+ * malformed envelope) so diagnostics can show the operator exactly
+ * what the server returned. ``hint`` is the human-readable guidance
+ * for recovery.
+ */
+export class ApiResponseShapeError extends Error {
+  readonly received: unknown;
+  readonly hint: string;
+
+  constructor(message: string, received: unknown, hint: string) {
+    super(`${message} — ${hint}`);
+    this.name = 'ApiResponseShapeError';
+    this.received = received;
+    this.hint = hint;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -584,6 +613,7 @@ export class ApiClient {
 
     const rawText = await response.text();
     let parsed: unknown = undefined;
+    let parseFailed = false;
     if (rawText.length > 0) {
       try {
         parsed = JSON.parse(rawText);
@@ -591,6 +621,7 @@ export class ApiClient {
         // Non-JSON body — keep ``parsed`` as undefined and surface the
         // raw text via the error path below if the response failed.
         parsed = rawText;
+        parseFailed = true;
       }
     }
 
@@ -604,6 +635,34 @@ export class ApiClient {
           ? `API ${method} ${path} failed (HTTP ${response.status}): ${detail}`
           : `API ${method} ${path} failed (HTTP ${response.status})`;
       throw new ApiError(response.status, detail, parsed, message);
+    }
+
+    // W23a Layer 2: a 2xx response with a non-JSON body is a wire
+    // violation — the most common trigger is the Vite dev-server SPA
+    // fallback serving ``index.html`` because the proxied API target
+    // isn't reachable on the configured port. Pre-W23a the code below
+    // silently returned the HTML string as if it were the response
+    // payload, which then crashed every downstream consumer that read
+    // ``.items`` / ``.id`` / etc. on a string. Surface it as a typed
+    // error instead so route-level code can render an actionable
+    // "UI / server out of sync" affordance.
+    const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
+    const looksJson = contentType.includes('application/json') || contentType.includes('+json');
+    if (rawText.length > 0 && !looksJson) {
+      const sniff = rawText.slice(0, 80).replace(/\s+/g, ' ');
+      throw new ApiResponseShapeError(
+        `Expected JSON from ${method} ${path}, got ${contentType || 'unknown content-type'}`,
+        rawText,
+        'Endpoint may be unregistered or the dev-server proxy may have fallen ' +
+          `back to the SPA shell. First 80 bytes: "${sniff}".`,
+      );
+    }
+    if (rawText.length > 0 && parseFailed) {
+      throw new ApiResponseShapeError(
+        `Body of ${method} ${path} was not valid JSON`,
+        rawText,
+        'Server returned a non-JSON 2xx body — likely an HTML error page or a misconfigured proxy.',
+      );
     }
 
     return parsed as T;
@@ -895,10 +954,45 @@ export async function walkAllPages<T, P extends PageParams>(
       page,
       page_size: MAX_PAGE_SIZE,
     } as P);
+    // W23a Layer 1: defensive envelope-shape check. If something
+    // upstream returned a non-Page<T> body the existing ``ApiClient``
+    // checks should have caught it (W23a Layer 2 — content-type +
+    // JSON-parse guards on every 2xx), but defence in depth catches
+    // the residual cases: a fetcher swap in tests that returned a
+    // raw array, a future endpoint that opted out of Page<T>, a
+    // genuinely missing ``items``/``has_next`` field after a partial
+    // wire-format rollback. Surfaces as ApiResponseShapeError so the
+    // calling route can render a "reload page" affordance rather
+    // than crashing with ``TypeError: env.items is not iterable``.
+    if (!isPageEnvelope<T>(env)) {
+      throw new ApiResponseShapeError(
+        'walkAllPages: fetcher returned a non-Page<T> envelope',
+        env,
+        'The UI bundle expects {items, page, has_next, ...} from this ' +
+          'endpoint. Common causes: (1) the API process is unreachable on ' +
+          'the dev-server proxy port (Vite served the SPA shell instead), ' +
+          '(2) the UI bundle is stale relative to the server. Refresh the ' +
+          'page; if it persists, restart the supervisor.',
+      );
+    }
     out.push(...env.items);
     if (!env.has_next) return out;
   }
   return out;
+}
+
+/**
+ * Type guard for a ``Page<T>`` envelope shape. Defensive predicate the
+ * helper functions use before spreading ``items`` so a wire-format
+ * regression surfaces as a typed error rather than a JS TypeError.
+ */
+export function isPageEnvelope<T>(v: unknown): v is Page<T> {
+  return (
+    typeof v === 'object' &&
+    v !== null &&
+    Array.isArray((v as { items?: unknown }).items) &&
+    typeof (v as { has_next?: unknown }).has_next === 'boolean'
+  );
 }
 
 /**
