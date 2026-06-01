@@ -674,12 +674,17 @@ export function Runs(): JSX.Element {
           </span>
         </div>
         {/* W22b5: four-tile glance card. Reloads in lockstep with
-            page / status changes so the count tiles match whatever
-            the table is showing right now. Clicking a tile re-applies
-            its status filter to the table (and resets the cursor to
-            page 1). */}
+            EVERY input that could shift the table's contents — page
+            AND status — so the count tiles match whatever the table
+            is showing right now. The composite key avoids a parent-
+            side reducer; the component re-runs its parallel
+            listRuns calls when any segment of the key changes.
+            Pre-fix the key was only ``page``, so a status change
+            without a page change (e.g. clicking a different status
+            chip while already on page 1) would have left stale
+            tile counts. */}
         <RunsSummaryStats
-          reloadKey={page}
+          reloadKey={`${page}:${status}`}
           onFilterPick={(nextStatus) => {
             setStatus(nextStatus ?? 'all');
             if (page !== 1) setPage(1);
