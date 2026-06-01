@@ -55,6 +55,62 @@ function looksLikeMarkdown(text: string): boolean {
   );
 }
 
+/** DOMPurify hook: strips any `<input>` that isn't a disabled
+ *  checkbox AND scrubs its attributes down to the exact GFM task-list
+ *  shape (type/disabled/checked only). We allow <input> only to
+ *  preserve marked.js task-list output (`<input type="checkbox"
+ *  disabled>`); ANY other input shape (text/submit/button/file/image/
+ *  autofocus/etc.) creates a phishing-friendly fake form field.
+ *
+ *  Per the W21 adversarial-verify workflow, even a properly disabled
+ *  checkbox can leak high-leverage attacker primitives via the
+ *  default attribute allow-list: style= for clickjacking overlays,
+ *  tabindex= for focus hijack, aria-label/role for screen-reader
+ *  spoofing, name/value/id for misleading DOM scaffolding. The fix
+ *  is to allowlist attribute NAMES on the surviving checkbox.
+ *
+ *  Registered with `addHook('uponSanitizeElement', ...)` so it runs
+ *  alongside DOMPurify's own attribute scrub on every element. */
+const ALLOWED_CHECKBOX_ATTRS = new Set(['type', 'disabled', 'checked']);
+
+// DOMPurify's 'uponSanitizeElement' hook signature is (node, data, config).
+// We only need `node`; data + config are unused. Typed as `Node` because
+// uponSanitizeElement runs on every visited node, not just Elements.
+function pruneNonCheckboxInput(node: Node): void {
+  if (node.nodeName !== 'INPUT') return;
+  const input = node as HTMLInputElement;
+  // marked.js emits `<input type="checkbox" disabled>` (and `checked`
+  // for `- [x]`). Reject anything else.
+  const type = (input.getAttribute('type') ?? '').toLowerCase();
+  const disabledAttr = input.getAttribute('disabled');
+  // disabled MUST be present. We accept any non-"false" value because
+  // HTML treats the attribute as presence-only boolean, but reject
+  // disabled="false" literally so the rendered DOM doesn't carry a
+  // misleading attribute value into the page.
+  const isDisabled =
+    disabledAttr !== null && disabledAttr.toLowerCase() !== 'false';
+  if (type !== 'checkbox' || !isDisabled) {
+    input.remove();
+    return;
+  }
+  // Strip every attribute that isn't in the canonical task-list shape.
+  // This kills style=overlay, tabindex=focus-hijack, aria-label/role
+  // spoofing, name/value/id scaffolding, autofocus, contenteditable,
+  // accesskey — every attacker primitive the workflow surfaced.
+  for (const attr of Array.from(input.attributes)) {
+    if (!ALLOWED_CHECKBOX_ATTRS.has(attr.name.toLowerCase())) {
+      input.removeAttribute(attr.name);
+    }
+  }
+}
+
+let _inputHookInstalled = false;
+function ensureInputHookInstalled(): void {
+  if (_inputHookInstalled) return;
+  DOMPurify.addHook('uponSanitizeElement', pruneNonCheckboxInput);
+  _inputHookInstalled = true;
+}
+
 /** Render markdown to a safe HTML string. Synchronous marked is fine
  *  for the prompt-template scale we're rendering; DOMPurify strips any
  *  script tags / event handlers / data: URIs / etc. that the upstream
@@ -66,10 +122,21 @@ function looksLikeMarkdown(text: string): boolean {
  *  URL the spec author chose. <svg> + <math> have large attack
  *  surfaces around foreignObject / use[href] / etc. <iframe>/<object>/
  *  <embed>/<form>/<link>/<meta>/<base>/<style>/<script> are the usual
- *  active-content vectors. The result is text-only HTML: headers,
- *  paragraphs, lists, tables, blockquotes, code, fences, inline
- *  emphasis, links (still allowed; the user clicks intentionally). */
+ *  active-content vectors.
+ *
+ *  <input> is preserved only when type=checkbox AND disabled (the
+ *  exact shape marked.js produces for GFM task-list checkboxes); any
+ *  other input shape is removed by the pruneNonCheckboxInput hook
+ *  installed below. Combined with FORBID_ATTR(src, srcset, ...) this
+ *  closes the `<input type="image" src="..." />` beacon vector AND
+ *  the `<input type="text" autofocus>` phishing vector.
+ *
+ *  The result is text-only HTML: headers, paragraphs, lists,
+ *  blockquotes, code, fences, inline emphasis, links, tables, GFM
+ *  task-list checkboxes (visual only, the checkboxes are disabled
+ *  so they can never be clicked into a state). */
 function renderMarkdown(text: string): string {
+  ensureInputHookInstalled();
   const raw = marked.parse(text, { async: false }) as string;
   // <input> is intentionally NOT forbidden: GFM task lists generate
   // `<input type="checkbox" disabled>` which is benign (read-only, no
@@ -103,18 +170,38 @@ function renderMarkdown(text: string): string {
       'meta',
       'base',
     ],
-    // Belt + braces on the network-fetch guarantee: the forbidden
-    // tags above can't render at all, but `<input>` is intentionally
-    // allowed (GFM task-list checkboxes), and `<input type="image"
-    // src="https://..."/>` would beacon on render via the still-
-    // allowed src attribute. Strip every attribute that fetches a
-    // remote resource on render — src / srcset (img-style inputs +
-    // any future tag we forget to forbid), poster (video; defensive
-    // even though video is forbidden today), background (legacy td
-    // attr that still fetches in some engines), formaction (button
-    // submit override). href stays allowed so anchor links work; the
-    // DOMPurify default rules still strip javascript:/data: URIs.
-    FORBID_ATTR: ['src', 'srcset', 'poster', 'background', 'formaction'],
+    // Two attribute groups, both load-bearing:
+    //
+    // Network fetch on render (privacy leak): src / srcset on the
+    // still-allowed <input> (e.g. type=image), poster (video, still
+    // defensive even though video tag is forbidden), background (td
+    // legacy attr that fetches in some engines), formaction (button
+    // submit URL override). href stays allowed so anchor links work;
+    // DOMPurify defaults strip javascript:/data: URIs.
+    //
+    // Attacker primitives on any allowed tag (clickjacking + focus
+    // hijack + spoofing) — these work on <p>/<a>/<div>/<span>/<td>
+    // not just <input>, so the per-element pruneNonCheckboxInput hook
+    // alone isn't enough:
+    //   - style: position:fixed inset:0 invisible overlay
+    //   - tabindex: focus-trap focusable element that shouldn't be
+    //   - autofocus: steals focus on render
+    //   - contenteditable: visible editable surface
+    //   - accesskey: keyboard shortcut hijack
+    // These attributes have no legitimate use on a non-interactive
+    // prompt-template render surface.
+    FORBID_ATTR: [
+      'src',
+      'srcset',
+      'poster',
+      'background',
+      'formaction',
+      'style',
+      'tabindex',
+      'autofocus',
+      'contenteditable',
+      'accesskey',
+    ],
   });
 }
 

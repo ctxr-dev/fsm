@@ -140,6 +140,72 @@ describe('CodeBlock', () => {
     expect((inputs[1] as HTMLInputElement).checked).toBe(true);
   });
 
+  test('rendered markdown strips style/tabindex/autofocus/contenteditable/accesskey on ANY tag (W21 adversarial-verify)', () => {
+    // Workflow finding B1+B2: these attributes work on <p>/<a>/etc.,
+    // not just <input>. Test the global FORBID_ATTR scope.
+    const dangerous = [
+      '# Title',
+      '',
+      '<p style="position:fixed;inset:0;width:100vw;height:100vh">overlay</p>',
+      '<p tabindex="0">focus hijack</p>',
+      '<a href="https://example.com" autofocus accesskey="x" contenteditable="true">spoof</a>',
+    ].join('\n');
+    const { container } = render(<CodeBlock text={dangerous} />);
+    const body = container.querySelector('.cb-markdown')!;
+    const html = body.innerHTML;
+    expect(html).not.toContain('style=');
+    expect(html).not.toContain('tabindex=');
+    expect(html).not.toContain('autofocus');
+    expect(html).not.toContain('contenteditable');
+    expect(html).not.toContain('accesskey=');
+    // Legit content + href stay.
+    expect(html).toContain('overlay');
+    expect(html).toContain('focus hijack');
+    expect(html).toContain('href="https://example.com"');
+  });
+
+  test('rendered markdown task-list checkbox accepts ONLY type/disabled/checked attrs (W21 adversarial-verify)', () => {
+    // Workflow finding B1-B4: even on the surviving disabled
+    // checkbox, attributes like style / tabindex / aria-label / role
+    // / name / value / id leak through DOMPurify's defaults. The
+    // pruneNonCheckboxInput hook now allowlists attr NAMES.
+    const dangerous = [
+      '- [ ] normal task',
+      '<input type="checkbox" disabled style="position:fixed;inset:0">',
+      '<input type="checkbox" disabled tabindex="0" aria-label="enter password" role="textbox">',
+      '<input type="checkbox" disabled name="csrf" value="leaked" id="phish">',
+      '<input type="checkbox" disabled="false">',
+    ].join('\n');
+    const { container } = render(<CodeBlock text={dangerous} />);
+    const body = container.querySelector('.cb-markdown')!;
+    const inputs = body.querySelectorAll('input');
+    for (const input of Array.from(inputs)) {
+      // EVERY attribute on every surviving input must be in the
+      // allowed set.
+      for (const attr of Array.from(input.attributes)) {
+        expect(['type', 'disabled', 'checked']).toContain(attr.name.toLowerCase());
+      }
+    }
+    // The disabled="false" variant should be REMOVED entirely (the
+    // tightened isDisabled check rejects it).
+    const html = body.innerHTML;
+    expect(html).not.toContain('disabled="false"');
+  });
+
+  test('rendered markdown still preserves canonical GFM checkbox shape (regression)', () => {
+    // Make sure the lockdown above hasn't accidentally broken the
+    // happy path: `- [ ]` and `- [x]` MUST still render a disabled
+    // checkbox with the right `checked` state.
+    const md = '- [ ] open\n- [x] done\n';
+    const { container } = render(<CodeBlock text={md} />);
+    const inputs = container.querySelectorAll('.cb-markdown input[type=checkbox]');
+    expect(inputs.length).toBe(2);
+    expect((inputs[0] as HTMLInputElement).disabled).toBe(true);
+    expect((inputs[0] as HTMLInputElement).checked).toBe(false);
+    expect((inputs[1] as HTMLInputElement).disabled).toBe(true);
+    expect((inputs[1] as HTMLInputElement).checked).toBe(true);
+  });
+
   test('rendered markdown strips src/srcset/poster/formaction even on allowed tags', () => {
     // <input> is allowed (for GFM task-list checkboxes) so a naive
     // FORBID_TAGS list would still permit
