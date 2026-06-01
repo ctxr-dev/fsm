@@ -25,23 +25,60 @@ Before any FSM-using skill or agent does ANYTHING else, follow the bootstrap pro
 
 **Before any work in a skill that depends on `ctxr-fsm`, run this once per session.** It is idempotent and fast (<500ms) when the project is already initialised and the supervisor is running.
 
-#### Step 1 — confirm the package is installed
+#### Step 1 — detect the package, then install ONCE if missing
+
+**Decision tree (no improvising):**
 
 ```bash
-uv run ctxr-fsm --version  # or: pipx run ctxr-fsm --version
+### Detect. Clear PACKAGE_MISSING first so a pre-set env var from the
+### parent shell can't force-install. Probe via `uv run` (without
+### --no-project so a project-installed ctxr-fsm IS picked up; the bare
+### `uv run` will fall back to a UV_PROJECT_ENVIRONMENT cache if no
+### workdir pyproject.toml exists). The `command -v` fallback catches
+### pipx / pip --user installs that don't live in a uv environment.
+unset PACKAGE_MISSING
+uv run --quiet ctxr-fsm --version 2>/dev/null \
+  || command -v ctxr-fsm >/dev/null \
+  || PACKAGE_MISSING=1
 ```
 
-If this prints a version, skip to Step 2. If it errors with "command not found":
+If `PACKAGE_MISSING` is set, follow this rule **exactly once**, in this order:
 
-```bash
-uv add ctxr-fsm                              # in a uv project
-pipx install ctxr-fsm                        # globally, isolated
-pip install --user ctxr-fsm                  # last resort
-```
+| Workdir state | Run THIS command (and only this command) |
+|---|---|
+| `pyproject.toml` exists at workdir root | `uv add 'ctxr-fsm[all]'` |
+| No `pyproject.toml`, `pipx` on `PATH` | `pipx install 'ctxr-fsm[all]'` |
+| Neither | Return `MissingRequirement` and ASK the user (Principle 1). Do not pick a third path on your own. |
 
-Then retry the version check. If it still fails, return `MissingRequirement` and STOP — do NOT improvise.
+After the install command completes, re-run the version check from the top of this step to confirm.
+
+**Hard rules to prevent the common LLM failure modes:**
+
+- **Resolve "this workdir" BEFORE installing.** Walk up from `cwd` looking for `pyproject.toml`; if none, treat `cwd` as the workdir. Run the install command from that directory and nowhere else. An install in the wrong directory lands in the wrong project venv and the next session sees a "missing" package again.
+- **Do not run a second installer in a different directory.** One per workdir, ever. If the first command fails, surface the error to the user, do not silently try the next row.
+- **Do not try the three installers in sequence "just in case".** Each one targets a different install scope (project venv vs user-isolated vs system); chaining them creates multiple installs that drift and confuse the next session.
+- **Concurrency:** if `.ctxr-fsm/install.lock/` exists, another session is mid-install. Wait or back off; do not run the install command. **The CALLER (you, the skill or agent following this doc) wraps the install in the lock — `uv add` / `pipx install` do NOT manage it themselves.** The contract is `mkdir .ctxr-fsm/install.lock` BEFORE the install command, `rmdir .ctxr-fsm/install.lock` AFTER (success or failure), using `mkdir` so the directory-create acts as the atomic lock acquisition. On a crash that leaves the lock dangling, the operator unwedges with `rmdir .ctxr-fsm/install.lock`.
+
+If the install fails for any reason (permission, network, version pin), return `MissingRequirement` to the caller with the captured stderr and STOP. Do not improvise.
 
 #### Step 2 — bootstrap the project (`ctxr-fsm ensure`)
+
+**Probe first to short-circuit on a warm project.** `ensure --check` is the read-only probe; if it reports `ready`, you are done and MUST skip the rest of this file:
+
+```bash
+uv run ctxr-fsm ensure --check --json
+```
+
+Routing rule (no improvising):
+
+| `--check` JSON `status` | Action |
+|---|---|
+| `ready` | **DONE. Skip every other step in this file** and proceed to your skill's actual work. The project is fully bootstrapped. |
+| `missing_init` / `missing_supervisor` / `missing_mcp_config` / `missing_memory` | Run the full `ensure` command below to apply the missing axis. |
+| `degraded` / `failed` | Run the full `ensure` command; if it still doesn't reach `ready`, return `MissingRequirement` to the caller. |
+| Exit non-zero AND no JSON on stdout | The package itself isn't installed in this workdir — go back to Step 1. |
+
+When you need to apply changes (anything other than `ready`):
 
 ```bash
 uv run ctxr-fsm ensure --json
