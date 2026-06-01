@@ -498,38 +498,55 @@ async def list_events(
 ) -> Page[Event]:
     """Return a page of events for ``run_id``, ordered per ``params.sort``.
 
-    Wraps :meth:`EventsRepo.by_run` which is an iterator; we
-    materialise the filtered set in memory and slice via
-    :func:`paginate_sequence` so the response carries an honest
-    ``total``. The cursor (``since_seq``) is client-held — callers
-    track the last ``seq`` they received and pass it back on the
-    next call. Unlike the SSE stream, no delivery rows are touched:
-    this is a pure read.
+    Delegates to :meth:`EventsRepo.by_run_paged`, which runs a single
+    SQL statement (filtered WHERE + ``COUNT(*) OVER ()``) so the
+    handler never materialises the full journal just to slice off
+    one page. The pre-W22b2-iter draft pre-loaded every matching
+    row via the iterator-based :meth:`by_run` — fine for a small
+    fixture, a DoS vector for a long-lived run with hundreds of
+    thousands of events. Removing the cap from the wire while
+    keeping the in-memory drain would be strictly worse than the
+    pre-pagination ``limit`` parameter; the paged repo method
+    avoids the trap entirely.
+
+    The cursor (``since_seq``) is client-held — callers track the
+    last ``seq`` they received and pass it back on the next call.
+    Unlike the SSE stream, no delivery rows are touched: this is
+    a pure read.
     """
     normalised_kinds = _normalise_kinds(kinds)
     run_id_str = str(run_id)
 
-    def _read() -> list[Event]:
-        """Sync read body — invoked in the threadpool."""
-        collected: list[Event] = []
+    def _read() -> tuple[list[Event], int]:
+        """Sync read body — invoked in the threadpool.
+
+        :meth:`EventsRepo.by_run_paged` returns the bus-side
+        :class:`ctxr.fsm.sqlite.repos_events.Event` while the
+        handler's response_model is the lifecycle-side
+        :class:`ctxr.fsm.sqlite.repos_core.Event` (re-exported by
+        :mod:`ctxr.fsm.sqlite`). The two classes have field-
+        identical shapes — see the explanatory note in
+        ``ctxr/fsm/sqlite/__init__.py`` — but mypy treats them as
+        distinct. We bridge via ``model_dump()`` + ``model_validate``;
+        the cost is one dict round-trip per row (cheap relative to
+        the SQL query) and the upside is that the OpenAPI schema
+        stays consistent with the lifecycle ``Event`` definition.
+        """
         with project.session_factory() as session:
-            iterator = project.events.by_run(
+            bus_items, total = project.events.by_run_paged(
                 session,
                 run_id=run_id_str,
                 since_seq=since_seq,
                 kinds=normalised_kinds,
+                sort_axis=params.sort,
+                offset=params.offset,
+                limit=params.page_size,
             )
-            for event in iterator:
-                collected.append(event)
-        # The repo yields rows in ``seq`` ASC order (per-run monotonic
-        # counter); flip in-process when the caller asks for DESC so
-        # the wire-format ``sort`` matches the actual ordering.
-        if params.sort == "seq_desc":
-            collected.reverse()
-        return collected
+        items = [Event.model_validate(e.model_dump()) for e in bus_items]
+        return items, total
 
-    events = await run_in_threadpool(_read)
-    return paginate_sequence(events, params=params)
+    items, total = await run_in_threadpool(_read)
+    return Page[Event].from_items_and_total(items, total, params=params)
 
 
 # ── Producers / consumers registry dumps ──────────────────────────────

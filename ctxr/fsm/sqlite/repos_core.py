@@ -42,7 +42,7 @@ from typing import Any
 
 import uuid_utils
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import func, over, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -659,6 +659,143 @@ class RunsRepo:
         """Return the run with the given PK, or ``None``."""
         row = session.get(RunTable, run_id)
         return _run_from_row(row) if row is not None else None
+
+    # ------------------------------------------------------------------
+    # W22b2 paginated variants — native SQL pagination with a window-
+    # function count, so :class:`Page.total` is honest even on databases
+    # with millions of runs. The non-paginated ``latest`` /
+    # ``incomplete`` / ``resumable`` / ``by_status`` methods below are
+    # kept for callers (CLI, engine, tests) that already operate on the
+    # full result set and don't want a slice. Route handlers should
+    # call :meth:`list_paged` instead.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def list_paged(
+        session: Session,
+        *,
+        status_filter: str | None,
+        sort_axis: str,
+        offset: int,
+        limit: int,
+    ) -> tuple[list[RunSummary], int]:
+        """Return a paginated, sorted slice + total count.
+
+        ``status_filter`` selects the WHERE-clause family:
+
+        * ``None`` -> no filter ("latest" semantics, every run).
+        * ``"incomplete"`` -> ``status IN _INCOMPLETE_STATUSES``.
+        * ``"resumable"`` -> ``status IN _RESUMABLE_STATUSES``.
+        * any other string -> exact ``status = value`` (matches the
+          previous ``by_status`` behaviour).
+
+        ``sort_axis`` selects ORDER BY:
+
+        * ``"last_update_at_desc"`` (the historical default ordering).
+        * ``"started_at_desc"`` / ``"started_at_asc"``.
+
+        ``total`` is computed in the SAME round-trip via
+        ``COUNT(*) OVER ()`` so concurrent writes cannot decorrelate
+        the row slice from the population count (which would happen
+        if we issued two separate queries).
+
+        Returns ``(items, total)``. ``items`` is the page slice;
+        ``total`` is the FULL population size matching ``status_filter``
+        (pre-slice).
+        """
+        if limit < 1:
+            return [], 0
+
+        stmt = select(RunTable)
+        if status_filter is None:
+            pass
+        elif status_filter == "incomplete":
+            stmt = stmt.where(RunTable.status.in_(_INCOMPLETE_STATUSES))
+        elif status_filter == "resumable":
+            stmt = stmt.where(RunTable.status.in_(_RESUMABLE_STATUSES))
+        else:
+            stmt = stmt.where(RunTable.status == status_filter)
+
+        if sort_axis == "started_at_desc":
+            order_col = RunTable.started_at.desc()
+        elif sort_axis == "started_at_asc":
+            order_col = RunTable.started_at.asc()
+        else:
+            order_col = RunTable.last_update_at.desc()
+        stmt = stmt.order_by(order_col)
+
+        # Append the window-function count as a second selected column
+        # so the page slice and the population total fall out of one
+        # SQL statement. The label is internal — never exposed past this
+        # method.
+        count_col = over(func.count()).label("__page_total__")
+        paged = stmt.add_columns(count_col).offset(offset).limit(limit)
+
+        rows = list(session.execute(paged))
+        if not rows:
+            # Empty page either because the filter matches zero rows
+            # OR the offset is past the last page. Recover the true
+            # total via a separate COUNT so ``Page.total`` stays
+            # honest in that off-the-end case (without the recovery
+            # query, the caller would see total=0 even when many rows
+            # exist before the requested offset).
+            count_stmt = select(func.count()).select_from(stmt.subquery())
+            total = int(session.execute(count_stmt).scalar_one())
+            return [], total
+
+        total = int(rows[0]._mapping["__page_total__"])
+        items = [_run_summary_from_row(row[0]) for row in rows]
+        return items, total
+
+    @staticmethod
+    def events_paged(
+        session: Session,
+        run_id: str,
+        *,
+        since_seq: int | None,
+        kinds: list[str] | None,
+        sort_axis: str,
+        offset: int,
+        limit: int,
+    ) -> tuple[list[Event], int]:
+        """Paginated per-run event slice + true total.
+
+        Mirrors :meth:`events` (the iterator-based variant) but with
+        native SQL pagination + a window-function count, so callers
+        don't have to materialise the entire journal to serve a single
+        page. Filters (``since_seq``, ``kinds``) are applied in the
+        WHERE clause and counted into ``total``.
+
+        ``sort_axis`` accepts ``"seq_asc"`` (the canonical chronological
+        replay order) or ``"seq_desc"`` (most-recent event first, used
+        when an operator scrolls a long journal from the tail backwards).
+        """
+        if limit < 1:
+            return [], 0
+
+        stmt = select(EventTable).where(EventTable.run_id == run_id)
+        if since_seq is not None:
+            stmt = stmt.where(EventTable.seq > since_seq)
+        if kinds is not None:
+            stmt = stmt.where(EventTable.kind.in_(kinds))
+
+        if sort_axis == "seq_desc":
+            stmt = stmt.order_by(EventTable.seq.desc(), EventTable.created_at.desc())
+        else:
+            stmt = stmt.order_by(EventTable.seq.asc(), EventTable.created_at.asc())
+
+        count_col = over(func.count()).label("__page_total__")
+        paged = stmt.add_columns(count_col).offset(offset).limit(limit)
+
+        rows = list(session.execute(paged))
+        if not rows:
+            count_stmt = select(func.count()).select_from(stmt.subquery())
+            total = int(session.execute(count_stmt).scalar_one())
+            return [], total
+
+        total = int(rows[0]._mapping["__page_total__"])
+        items = [_event_from_row(row[0]) for row in rows]
+        return items, total
 
     @staticmethod
     def latest(session: Session, limit: int = 20) -> list[RunSummary]:

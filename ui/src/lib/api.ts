@@ -798,6 +798,60 @@ export class ApiClient {
 }
 
 /**
+ * Maximum page size the server accepts in a single request. Mirrors
+ * ``MAX_PAGE_SIZE`` in ``ctxr/fsm/api/_pagination.py`` (200). Exposed so
+ * routes that legitimately need to enumerate the full population
+ * (e.g. spec catalog grouping, drift dashboard seeding) can request
+ * the largest page in one round trip.
+ */
+export const MAX_PAGE_SIZE = 200;
+
+/**
+ * Walk every page of a paginated endpoint and return the flattened
+ * row list.
+ *
+ * The post-W22b2 wire format paginates every list endpoint, but a few
+ * UI surfaces still need the FULL population (derivative aggregations
+ * like "count runs per spec slug", sibling tree expansion, drift
+ * dashboard seeding). Rather than each route re-implementing the same
+ * "loop with ``has_next`` + safety stop" pattern, this helper owns it.
+ *
+ * Pages are fetched serially so the server's paginator sees a stable
+ * cursor / sort across requests. ``page_size`` is fixed at
+ * :const:`MAX_PAGE_SIZE` so we minimise the round-trip count.
+ * ``maxPages`` (default 50 = 10,000 rows at max page size) is a
+ * safety stop that catches runaway loops if a future server bug
+ * returns ``has_next: true`` indefinitely; callers that legitimately
+ * need more can raise it explicitly.
+ *
+ * Example:
+ *
+ * ```ts
+ * const allSpecs = await walkAllPages(
+ *   (p) => api.listSpecs(p),
+ *   {},
+ * );
+ * ```
+ */
+export async function walkAllPages<T, P extends PageParams>(
+  fetcher: (params: P) => Promise<Page<T>>,
+  baseParams: Omit<P, 'page' | 'page_size'>,
+  maxPages = 50,
+): Promise<T[]> {
+  const out: T[] = [];
+  for (let page = 1; page <= maxPages; page += 1) {
+    const env = await fetcher({
+      ...(baseParams as P),
+      page,
+      page_size: MAX_PAGE_SIZE,
+    } as P);
+    out.push(...env.items);
+    if (!env.has_next) return out;
+  }
+  return out;
+}
+
+/**
  * Process-wide :class:`ApiClient` instance with the dev-server defaults.
  *
  * Components that just need to call the API import this directly:

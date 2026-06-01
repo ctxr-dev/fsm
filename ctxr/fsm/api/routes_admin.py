@@ -56,12 +56,10 @@ from starlette.concurrency import run_in_threadpool
 
 from ctxr.fsm.api._deps import ProjectDep, require_auth
 from ctxr.fsm.api._pagination import (
-    MAX_PAGE_SIZE,
     Page,
     PageParams,
     make_page_params,
     paginate_sa_select,
-    paginate_sequence,
 )
 from ctxr.fsm.api._paths import looks_like_filesystem_db_path, project_root_and_relative
 from ctxr.fsm.core.models import JournalStatus
@@ -356,24 +354,28 @@ def _select_tool_calls_page(
 ) -> Page[ToolCall]:
     """Return a page of tool calls for ``run_id``.
 
-    Delegates to :meth:`ToolCallsRepo.by_run` which already sorts
-    ``created_at DESC``; we then either keep that order (default sort
-    ``created_at_desc``) or reverse the list for ``created_at_asc``,
-    and finally slice into a :class:`Page` via
-    :func:`paginate_sequence`. The repo is pulled with
-    ``limit=MAX_PAGE_SIZE`` so deep pagination beyond a single page of
-    the wire-format default works; rows past that bound are silently
-    truncated until the repo method gets a native paginated cousin
-    (see :mod:`ctxr.fsm.sqlite.repos_enforcement.ToolCallsRepo`).
+    Delegates to :meth:`ToolCallsRepo.by_run_paged`, which runs a
+    single SQL statement (filtered WHERE + ``COUNT(*) OVER ()``) so
+    ``Page.total`` reflects the true population count even when a
+    run has more tool calls than the page-size cap. The pre-W22b2-
+    iter draft used the cap-bounded :meth:`by_run` then sliced in
+    memory; that path silently truncated ``total`` to
+    ``MAX_PAGE_SIZE`` for any run with more tool calls — making the
+    envelope's count lie, and rendering pages past the cap
+    unreachable.
     """
     from ctxr.fsm.sqlite.repos_enforcement import ToolCallsRepo
 
     repo = ToolCallsRepo()
     with session_factory() as session:
-        rows = repo.by_run(session, run_id, limit=MAX_PAGE_SIZE)
-    if params.sort == "created_at_asc":
-        rows = list(reversed(rows))
-    return paginate_sequence(rows, params=params)
+        items, total = repo.by_run_paged(
+            session,
+            run_id,
+            sort_axis=params.sort,
+            offset=params.offset,
+            limit=params.page_size,
+        )
+    return Page[ToolCall].from_items_and_total(items, total, params=params)
 
 
 def _select_drift_signals_with_score(

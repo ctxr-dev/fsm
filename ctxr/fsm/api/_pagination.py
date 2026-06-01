@@ -62,9 +62,9 @@ silently falling back.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Annotated, Any, Self
+from typing import Any, Self
 
-from fastapi import Depends, HTTPException, Query, status
+from fastapi import HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Select, func, over
 from sqlalchemy.engine import Connection
@@ -75,7 +75,6 @@ __all__ = [
     "MAX_PAGE_SIZE",
     "Page",
     "PageParams",
-    "PageParamsDep",
     "make_page_params",
     "paginate_sa_select",
     "paginate_sequence",
@@ -140,6 +139,36 @@ class Page[T](BaseModel):
             total=0,
             has_next=False,
             sort=sort,
+        )
+
+    @classmethod
+    def from_items_and_total(
+        cls,
+        items: list[T],
+        total: int,
+        *,
+        params: PageParams,
+    ) -> Page[T]:
+        """Build a page envelope from a ``(items, total)`` repo result.
+
+        The canonical post-W22b2 path: repository methods that compute
+        ``total`` via ``COUNT(*) OVER ()`` return a tuple, and the
+        route handler wraps it via this classmethod. ``has_next`` is
+        derived from the same population size, so the wire envelope
+        stays internally consistent.
+
+        Use this in preference to :func:`paginate_sequence` whenever
+        the underlying repo exposes a paginated variant — the latter
+        is the legacy compat path that pre-loads the full filtered
+        result set into memory.
+        """
+        return cls(
+            items=items,
+            page=params.page,
+            page_size=params.page_size,
+            total=total,
+            has_next=params.page * params.page_size < total,
+            sort=params.sort,
         )
 
 
@@ -252,15 +281,6 @@ def make_page_params(
     _factory.default_sort = default_sort  # type: ignore[attr-defined]
     _factory.allowed_sorts = allowed_sorts  # type: ignore[attr-defined]
     return _factory  # type: ignore[return-value]
-
-
-# Type alias for the rare cases where a route can accept ANY sort
-# (e.g. a future search endpoint). Most routes use ``make_page_params``
-# above; this alias is here for completeness, not as the primary path.
-PageParamsDep = Annotated[PageParams, Depends(make_page_params(
-    default_sort="id_asc",
-    allowed_sorts=("id_asc", "id_desc"),
-))]
 
 
 # --- helpers --------------------------------------------------------------

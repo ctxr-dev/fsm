@@ -37,34 +37,11 @@ import {
 import {
   api,
   ApiError,
-  type Page,
-  type PageParams,
+  walkAllPages,
   type RunSummary,
   type SpecDetail,
   type SpecSummary,
 } from '../lib/api';
-
-/**
- * Walk a paginated endpoint until ``has_next`` is false (or the safety
- * stop trips at ``maxPages``). Used here for derivative aggregations —
- * counting runs across sibling versions for the header badge and
- * enumerating the SpecSiblings tree — none of which surface a
- * user-facing paged list. Pages are fetched serially with
- * ``page_size`` fixed at the wire MAX_PAGE_SIZE of 200.
- */
-async function walkAllPages<T, P extends PageParams>(
-  fetcher: (params: P) => Promise<Page<T>>,
-  baseParams: Omit<P, 'page' | 'page_size'>,
-  maxPages = 50,
-): Promise<T[]> {
-  const out: T[] = [];
-  for (let page = 1; page <= maxPages; page += 1) {
-    const env = await fetcher({ ...(baseParams as P), page, page_size: 200 } as P);
-    out.push(...env.items);
-    if (!env.has_next) return out;
-  }
-  return out;
-}
 import { canonicalJson } from '../lib/canonicalJson';
 import { specToGraph, transitionKind } from '../lib/specGraph';
 import { openSheet } from '../lib/store';

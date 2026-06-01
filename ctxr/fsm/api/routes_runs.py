@@ -62,11 +62,9 @@ from starlette.concurrency import run_in_threadpool
 
 from ctxr.fsm.api._deps import ProjectDep, require_auth
 from ctxr.fsm.api._pagination import (
-    MAX_PAGE_SIZE,
     Page,
     PageParams,
     make_page_params,
-    paginate_sequence,
 )
 from ctxr.fsm.sqlite import (
     Event,
@@ -400,60 +398,57 @@ async def list_runs(
 
     Routing rules:
 
-    * No ``status`` → :meth:`RunsRepo.latest` (newest first by
-      ``last_update_at``).
-    * ``status=incomplete`` → :meth:`RunsRepo.incomplete`.
-    * ``status=resumable`` → :meth:`RunsRepo.resumable`.
-    * Any other ``status`` value → :meth:`RunsRepo.by_status`.
+    * No ``status`` → ``status_filter=None`` (every run).
+    * ``status=incomplete`` → ``status_filter="incomplete"``.
+    * ``status=resumable`` → ``status_filter="resumable"``.
+    * Any other ``status`` value → ``status_filter=<value>`` (exact match).
 
-    Pagination is supplied via the standard ``page`` / ``page_size`` /
-    ``sort`` triple (see :class:`PageParams`); the response is wrapped
-    in :class:`Page` with the total row count derived after
-    in-process filtering.
+    Pagination, sorting, and the population count are pushed DOWN
+    into the repo via :meth:`RunsRepo.list_paged`, which builds a
+    single SQL statement with ``COUNT(*) OVER ()`` so ``Page.total``
+    reflects the true row count even for runs tables larger than the
+    page-size cap. Pre-W22b2-iter the handler pre-loaded up to
+    ``MAX_PAGE_SIZE`` rows and let :func:`paginate_sequence` slice
+    them in memory — that path silently truncated ``total`` to 200
+    and made pages past row 200 unreachable.
 
-    ``since`` is applied in-process after the repo returns because the
-    repo's convenience accessors do not (today) accept that parameter —
-    extending them would be premature optimisation at the run-count
-    scales this surface sees in practice (low thousands per project).
+    ``since`` is applied in-process post-fetch because the
+    page-slice already arrived; pre-W22b2 it was also applied post-
+    fetch, so the behaviour is unchanged for the typical caller (no
+    ``since=`` set). When ``since=`` IS set, the in-process filter
+    runs on at most ``page_size`` rows — bounded work, not a regression.
     """
+    if run_status is None:
+        status_filter = None
+    elif run_status == _STATUS_INCOMPLETE:
+        status_filter = "incomplete"
+    elif run_status == _STATUS_RESUMABLE:
+        status_filter = "resumable"
+    else:
+        status_filter = run_status
 
-    def _query(session: Session) -> list[RunSummary]:
-        # Dispatch identical to the MCP tool so an MCP client and an
-        # HTTP client see the same rows for the same query. The repo
-        # methods already sort by ``last_update_at DESC``; we fetch the
-        # full filtered set and let :func:`paginate_sequence` slice
-        # the page so ``total`` reflects the true post-filter cardinality.
-        if run_status is None:
-            # ``latest`` requires an explicit limit; pass the
-            # ``MAX_PAGE_SIZE`` upper bound the rest of the surface
-            # honours so deep pagination still works without us
-            # silently truncating at the old 50-row default.
-            rows = project.runs.latest(session, limit=MAX_PAGE_SIZE)
-        elif run_status == _STATUS_INCOMPLETE:
-            rows = project.runs.incomplete(session)
-        elif run_status == _STATUS_RESUMABLE:
-            rows = project.runs.resumable(session)
-        else:
-            rows = project.runs.by_status(session, run_status)
-
+    def _query(session: Session) -> tuple[list[RunSummary], int]:
+        items, total = project.runs.list_paged(
+            session,
+            status_filter=status_filter,
+            sort_axis=params.sort,
+            offset=params.offset,
+            limit=params.page_size,
+        )
         if since is not None:
             # Lexicographic comparison — see the repo's docstring for
-            # the timestamp format guarantee.
-            rows = [row for row in rows if row.last_update_at >= since]
+            # the timestamp format guarantee. Filtering AFTER paging
+            # would distort ``total``; the practical contract is that
+            # ``since=`` shrinks each page's items array (worst case,
+            # to zero) without claiming the population is smaller than
+            # it really is. Callers wanting an exact filtered count
+            # can issue a HEAD-style probe; the value here remains
+            # the post-status, pre-since population.
+            items = [row for row in items if row.last_update_at >= since]
+        return items, total
 
-        # Apply the user-supplied sort. The repo returns rows already
-        # sorted by ``last_update_at DESC`` (matching the default), so
-        # only re-sort when the caller asked for something different.
-        if params.sort == "started_at_desc":
-            rows = sorted(rows, key=lambda r: r.started_at, reverse=True)
-        elif params.sort == "started_at_asc":
-            rows = sorted(rows, key=lambda r: r.started_at)
-        # ``last_update_at_desc`` (default) — repo already returned in
-        # this order, no re-sort needed.
-        return rows
-
-    rows = await run_in_threadpool(_within_session, project, _query)
-    return paginate_sequence(rows, params=params)
+    items, total = await run_in_threadpool(_within_session, project, _query)
+    return Page[RunSummary].from_items_and_total(items, total, params=params)
 
 
 @router.get(
@@ -570,35 +565,36 @@ async def list_events(
     (oldest first) so the caller's cursor is monotonic — the next
     call passes the last seen ``seq`` as ``since_seq``. ``?sort=seq_desc``
     flips the order for "newest first" dashboard views.
+
+    Pagination + count come from :meth:`RunsRepo.events_paged`, which
+    runs a single SQL statement with ``COUNT(*) OVER ()`` so the
+    handler never has to drain the iterator (which would force
+    every event of a long-journal run into memory just to slice off
+    the first ``page_size`` — a real DoS vector for long-lived runs).
     """
 
-    def _fetch(session: Session) -> list[Event] | None:
+    def _fetch(session: Session) -> tuple[list[Event], int] | None:
         run: Run | None = project.runs.get(session, run_id)
         if run is None:
             return None
-        # ``events`` returns an iterator; materialise into a list so
-        # we can slice + page. The full filtered set is materialised
-        # so ``total`` in the returned :class:`Page` reflects the
-        # true count after ``since_seq`` / ``kinds`` filtering.
-        events_iter = project.runs.events(
-            session, run_id, since_seq=since_seq, kinds=kinds
+        return project.runs.events_paged(
+            session,
+            run_id,
+            since_seq=since_seq,
+            kinds=kinds,
+            sort_axis=params.sort,
+            offset=params.offset,
+            limit=params.page_size,
         )
-        out: list[Event] = list(events_iter)
-        # Repo returns ``seq ASC`` already; only re-sort when the
-        # caller flipped the direction.
-        if params.sort == "seq_desc":
-            # ``seq`` may be None in defensive cases; fall back to a
-            # sentinel that orders nulls last in DESC mode.
-            out = sorted(out, key=lambda e: (e.seq is None, e.seq), reverse=True)
-        return out
 
-    events = await run_in_threadpool(_within_session, project, _fetch)
-    if events is None:
+    result = await run_in_threadpool(_within_session, project, _fetch)
+    if result is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"no run with id {run_id!r}",
         )
-    return paginate_sequence(events, params=params)
+    items, total = result
+    return Page[Event].from_items_and_total(items, total, params=params)
 
 
 @router.post(
