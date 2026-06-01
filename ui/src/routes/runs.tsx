@@ -35,6 +35,7 @@ import {
   EmptyState,
   Pagination,
   Pill,
+  RunsSummaryStats,
   Spinner,
   Table,
   type PillVariant,
@@ -131,6 +132,29 @@ function formatTimestamp(value: string | null): string {
     minute: '2-digit',
     second: '2-digit',
   });
+}
+
+/**
+ * Render a duration in human-friendly compact form: ``45s``, ``3m 12s``,
+ * ``1h 04m``. ``end`` defaults to "now" for in-flight runs. Returns
+ * ``—`` when the start timestamp is missing / unparseable. Uses
+ * integer-only display past 60 seconds to keep the column tabular-
+ * aligned without sub-second jitter on live SSE updates.
+ */
+function formatDuration(start: string | null, end: string | null): string {
+  if (!start) return '—';
+  const t0 = new Date(start).getTime();
+  if (Number.isNaN(t0)) return '—';
+  const t1 = end ? new Date(end).getTime() : Date.now();
+  if (Number.isNaN(t1) || t1 < t0) return '—';
+  const sec = Math.floor((t1 - t0) / 1000);
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (min < 60) return `${min}m ${s.toString().padStart(2, '0')}s`;
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return `${h}h ${m.toString().padStart(2, '0')}m`;
 }
 
 /**
@@ -529,6 +553,23 @@ export function Runs(): JSX.Element {
           </span>
         ),
       },
+      {
+        // W22b5: duration column. In-flight runs (``ended_at == null``)
+        // compute the elapsed time against ``Date.now()`` at render
+        // time, so the cell ticks forward on every refresh. Pre-W22b5
+        // an operator wanting "how long has this been running" had to
+        // mental-math the gap between Started and Last update — now
+        // it's tabular.
+        key: 'duration',
+        label: 'Duration',
+        width: '7rem',
+        align: 'right' as const,
+        render: (r) => (
+          <span class="text-xs tabular-nums text-slate-700 dark:text-slate-300">
+            {formatDuration(r.started_at, r.ended_at)}
+          </span>
+        ),
+      },
     ],
     // W19: re-create columns when the spec resolver populates so the
     // Spec column re-renders from `019e80be-ebe…` → `code-reviewer v1`.
@@ -623,8 +664,8 @@ export function Runs(): JSX.Element {
         onRefresh={onRefresh}
         searchInputRef={searchInputRef}
       />
-      <main class="p-4">
-        <div class="mb-3 flex items-baseline justify-between">
+      <main class="p-4 space-y-4">
+        <div class="flex items-baseline justify-between">
           <h1 class="text-2xl font-semibold text-slate-900 dark:text-slate-100">
             Runs
           </h1>
@@ -632,6 +673,18 @@ export function Runs(): JSX.Element {
             {loading ? 'Refreshing…' : `${visibleRuns.length} shown`}
           </span>
         </div>
+        {/* W22b5: four-tile glance card. Reloads in lockstep with
+            page / status changes so the count tiles match whatever
+            the table is showing right now. Clicking a tile re-applies
+            its status filter to the table (and resets the cursor to
+            page 1). */}
+        <RunsSummaryStats
+          reloadKey={page}
+          onFilterPick={(nextStatus) => {
+            setStatus(nextStatus ?? 'all');
+            if (page !== 1) setPage(1);
+          }}
+        />
         {body}
       </main>
     </div>
