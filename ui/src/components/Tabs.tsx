@@ -104,7 +104,7 @@ export function Tabs({
               type="button"
               role="tab"
               id={`${baseId}-tab-${tab.id}`}
-              aria-selected={isActive}
+              aria-selected={isActive ? 'true' : 'false'}
               aria-controls={`${baseId}-panel-${tab.id}`}
               tabIndex={isActive ? 0 : -1}
               disabled={tab.disabled}
@@ -114,7 +114,7 @@ export function Tabs({
                 'focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded-sm',
                 isActive
                   ? 'border-emerald-500 text-slate-900 dark:text-slate-100 font-medium'
-                  : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200',
+                  : 'border-transparent text-slate-700 dark:text-slate-300 hover:text-slate-900 dark:hover:text-slate-100',
                 tab.disabled ? 'opacity-40 cursor-not-allowed' : '',
               ].join(' ')}
             >

@@ -123,16 +123,16 @@ function formatTimestamp(value: string | null): string {
 }
 
 /**
- * Compose the ``spec`` column cell — ``slug:version`` if both are
- * derivable, otherwise the raw ``fsm_spec_id``.
- *
- * The API currently exposes only ``fsm_spec_id`` on :class:`RunSummary`
- * (no embedded slug). We display the id directly; a future server-side
- * enrichment will swap this for a real slug:version pair without
- * touching the callsite.
+ * Map a run's `fsm_spec_id` to a human-readable label using the
+ * resolver populated by a one-shot `api.listSpecs()` call. Falls
+ * back to the raw UUID when the spec isn't in the cache (a race or
+ * a stale resolver after the run was created from a freshly
+ * registered spec).
  */
-function specCell(run: RunSummary): string {
-  return run.fsm_spec_id;
+function specCell(run: RunSummary, resolver: Map<string, { slug: string; version: number }>): string {
+  const entry = resolver.get(run.fsm_spec_id);
+  if (entry) return `${entry.slug} v${entry.version}`;
+  return run.fsm_spec_id.slice(0, 12) + '…';
 }
 
 /**
@@ -402,6 +402,29 @@ export function Runs(): JSX.Element {
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [cursor, setCursor] = useState<number>(0);
+  const [specResolver, setSpecResolver] = useState<Map<string, { slug: string; version: number }>>(
+    new Map(),
+  );
+
+  // Fetch the spec list once on mount + build a resolver map so the
+  // Spec column on each row can render slug + version instead of a
+  // raw UUID. Best-effort: a failure leaves the resolver empty so the
+  // fallback ("12-char prefix...") still works.
+  useEffect(() => {
+    let cancelled = false;
+    api.listSpecs()
+      .then((specs) => {
+        if (cancelled) return;
+        const m = new Map<string, { slug: string; version: number }>();
+        for (const s of specs) m.set(s.id, { slug: s.slug, version: s.version });
+        setSpecResolver(m);
+      })
+      .catch(() => {
+        // Silent — the resolver stays empty and rows render with the
+        // UUID-prefix fallback.
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   // Track which event we've already reacted to so the SSE refetch
   // fires once per new event, not on every signal subscriber tick.
@@ -549,9 +572,14 @@ export function Runs(): JSX.Element {
         key: 'spec',
         label: 'Spec',
         render: (r) => (
-          <span class="text-sm text-slate-800 dark:text-slate-200">
-            {specCell(r)}
-          </span>
+          <a
+            href={`/specs/${encodeURIComponent(r.fsm_spec_id)}`}
+            class="text-sm text-slate-800 dark:text-slate-200 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded-sm"
+            title="Open spec"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {specCell(r, specResolver)}
+          </a>
         ),
       },
       {
@@ -585,7 +613,10 @@ export function Runs(): JSX.Element {
         ),
       },
     ],
-    [],
+    // W19: re-create columns when the spec resolver populates so the
+    // Spec column re-renders from `019e80be-ebe…` → `code-reviewer v1`.
+    // Without `specResolver` here the empty initial Map is captured.
+    [specResolver],
   );
 
   // --- Body content ---------------------------------------------------------

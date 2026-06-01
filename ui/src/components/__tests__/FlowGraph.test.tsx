@@ -24,6 +24,8 @@ vi.mock('@xyflow/react', () => ({
   Controls: () => <div data-testid="controls" />,
   MiniMap: () => <div data-testid="minimap" />,
   Position: { Left: 'left', Right: 'right', Top: 'top', Bottom: 'bottom' },
+  BackgroundVariant: { Dots: 'dots', Lines: 'lines', Cross: 'cross' },
+  MarkerType: { ArrowClosed: 'arrowclosed', Arrow: 'arrow' },
 }));
 vi.mock('@xyflow/react/dist/style.css', () => ({}));
 

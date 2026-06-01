@@ -27,9 +27,12 @@ import { useMemo } from 'preact/hooks';
 import type { JSX } from 'preact';
 import dagre from 'dagre';
 import {
+  BackgroundVariant,
   ReactFlow,
   Background,
   Controls,
+  Handle,
+  MarkerType,
   MiniMap,
   Position,
   type Edge,
@@ -87,8 +90,14 @@ const NODE_KIND_CLASSES: Record<FlowNodeKind, string> = {
     'border-cyan-500 bg-cyan-50 dark:bg-cyan-900/30 text-cyan-900 dark:text-cyan-100',
 };
 
-function FsmNode({ data, selected }: NodeProps<Node<FlowNodeData>>): JSX.Element {
+function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<Node<FlowNodeData>>): JSX.Element {
   const kind = data.kind;
+  // Handles are the connection anchors xyflow draws edges into.
+  // Without these, no edge has anywhere to land and the connection
+  // lines render zero-length / invisible. Position defaults match
+  // the dagre layout's direction (LR: source=right, target=left).
+  const sp = sourcePosition ?? Position.Right;
+  const tp = targetPosition ?? Position.Left;
   // The pixel dimensions are constants matched against the dagre
   // layout numbers; staying inline keeps the two values in literal
   // sync. Suppress the no-inline-styles lint for this single case.
@@ -96,12 +105,17 @@ function FsmNode({ data, selected }: NodeProps<Node<FlowNodeData>>): JSX.Element
   return (
     <div
       class={[
-        'fsm-node rounded-md border-2 shadow-sm px-3 py-2 text-xs',
+        'fsm-node relative rounded-md border-2 shadow-sm px-3 py-2 text-xs',
         NODE_KIND_CLASSES[kind],
         selected ? 'ring-2 ring-emerald-400 ring-offset-1' : '',
       ].join(' ')}
       style={{ width: `${NODE_WIDTH}px`, minHeight: `${NODE_HEIGHT}px` }}
     >
+      <Handle
+        type="target"
+        position={tp}
+        style={{ background: 'currentColor', width: 8, height: 8, border: 'none' }}
+      />
       <div class="flex items-center justify-between gap-1">
         <span class="font-semibold truncate" title={data.label}>
           {data.label}
@@ -113,6 +127,11 @@ function FsmNode({ data, selected }: NodeProps<Node<FlowNodeData>>): JSX.Element
           {data.sublabel}
         </div>
       ) : null}
+      <Handle
+        type="source"
+        position={sp}
+        style={{ background: 'currentColor', width: 8, height: 8, border: 'none' }}
+      />
     </div>
   );
 }
@@ -146,6 +165,33 @@ function applyDagreLayout(
       type: 'fsmNode',
     };
   });
+}
+
+// Decorate edges so they render visibly in both themes: stroke via
+// currentColor (the outer container sets text-color per theme), arrow
+// markers so direction is unambiguous, labels with a themed fill.
+function decorateEdges(edges: readonly Edge[]): Edge[] {
+  return edges.map((e) => ({
+    ...e,
+    type: e.type ?? 'default',
+    animated: e.animated ?? false,
+    style: {
+      strokeWidth: 1.5,
+      stroke: 'currentColor',
+      ...(e.style ?? {}),
+    },
+    markerEnd: e.markerEnd ?? {
+      type: MarkerType.ArrowClosed,
+      width: 18,
+      height: 18,
+      color: 'currentColor',
+    },
+    labelStyle: {
+      fontSize: 10,
+      fill: 'currentColor',
+      ...(e.labelStyle ?? {}),
+    },
+  }));
 }
 
 export function FlowGraph({
@@ -194,22 +240,78 @@ export function FlowGraph({
   // doesn't supply an explicit height. h-full + w-full make sure
   // xyflow's renderer has a measurable box when the parent DOES set
   // a height (e.g. the Specs route's h-[60vh] tab panel).
+  //
+  // The wrapper's `text-slate-400 dark:text-slate-600` drives edge
+  // stroke colour via currentColor (see decorateEdges). The fitView
+  // padding adds breathing room so dagre's wide LR layout doesn't
+  // clip nodes at the viewport edges.
+  const decoratedEdges = useMemo(() => decorateEdges(edges), [edges]);
   return (
     <div
-      class={['flow-graph relative h-full w-full min-h-[320px]', className ?? ''].join(' ')}
+      class={[
+        'flow-graph relative h-full w-full min-h-[320px]',
+        'text-slate-400 dark:text-slate-500',
+        className ?? '',
+      ].join(' ')}
     >
       <ReactFlow
         nodes={decoratedNodes}
-        edges={[...edges]}
+        edges={decoratedEdges}
         nodeTypes={NODE_TYPES}
         fitView
+        fitViewOptions={{ padding: 0.2, includeHiddenNodes: false }}
         proOptions={{ hideAttribution: true }}
+        defaultEdgeOptions={{
+          style: { stroke: 'currentColor', strokeWidth: 1.5 },
+          markerEnd: {
+            type: MarkerType.ArrowClosed,
+            width: 18,
+            height: 18,
+            color: 'currentColor',
+          },
+        }}
         onNodeClick={(_e, node) => onNodeClick?.(node.id, node.data as FlowNodeData)}
         onEdgeClick={(_e, edge) => onEdgeClick?.(edge.id)}
       >
-        {background ? <Background gap={16} /> : null}
-        {controls ? <Controls position="bottom-right" showInteractive={false} /> : null}
-        {showMiniMap ? <MiniMap pannable zoomable position="top-right" /> : null}
+        {background ? (
+          <Background
+            gap={16}
+            // Subtle dot pattern; the CSS sets dot colour based on
+            // current text colour so both themes render visibly.
+            color="currentColor"
+            variant={BackgroundVariant.Dots}
+          />
+        ) : null}
+        {controls ? (
+          <Controls
+            position="bottom-right"
+            showInteractive={false}
+            // Override default white background; let xyflow inherit
+            // surface colours from theme tokens via Tailwind.
+            className="!bg-white dark:!bg-slate-800 !border !border-slate-200 dark:!border-slate-700 !rounded-md !overflow-hidden [&_button]:!bg-white [&_button]:dark:!bg-slate-800 [&_button]:!text-slate-700 [&_button]:dark:!text-slate-200 [&_button]:!border-slate-200 [&_button]:dark:!border-slate-700 [&_button:hover]:!bg-slate-100 [&_button:hover]:dark:!bg-slate-700"
+          />
+        ) : null}
+        {showMiniMap ? (
+          <MiniMap
+            pannable
+            zoomable
+            position="top-right"
+            // Theme-aware mini-map: dim background, themed node colour.
+            maskColor="rgba(15, 23, 42, 0.05)"
+            nodeColor={(n) => {
+              const k = (n.data as FlowNodeData | undefined)?.kind;
+              switch (k) {
+                case 'worker': return '#0ea5e9';
+                case 'inline': return '#8b5cf6';
+                case 'terminal': return '#64748b';
+                case 'producer': return '#f59e0b';
+                case 'consumer': return '#06b6d4';
+                default: return '#10b981';
+              }
+            }}
+            className="!bg-white/80 dark:!bg-slate-800/80 !border !border-slate-200 dark:!border-slate-700 !rounded-md"
+          />
+        ) : null}
       </ReactFlow>
     </div>
   );

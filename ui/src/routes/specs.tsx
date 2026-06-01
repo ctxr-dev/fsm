@@ -1,12 +1,22 @@
 /**
- * /specs v2 — master / detail with FSM graph + version timeline.
+ * /specs — spec catalog (W19 spec-first IA landing page).
  *
- * Layout: 40/60 split (stacks on mobile). Master = master list of
- * specs grouped by slug; detail = selected spec rendered as a
- * tabbed view (Graph / Schemas / Definition / Versions). The graph
- * uses the W18b FlowGraph primitive to render the state diagram
- * (n8n/Dify-style nodes + edges with predicate labels) so a non-
- * trivial spec is comprehensible at a glance.
+ * Lists every registered spec, GROUPED BY SLUG, ordered by most-
+ * recently-active first (last_update_at of any run of that slug). Each
+ * row surfaces:
+ *
+ *   - slug + latest version pill
+ *   - total runs across all versions
+ *   - newest run's status pill + when it last updated
+ *   - number of registered versions
+ *
+ * Clicking a row navigates to /specs/:specId (the W19 spec-scoped
+ * dashboard with Graph / Runs / Schemas / Definition / Versions
+ * tabs). This page replaces the previous master/detail split — the
+ * detail view is now its own URL.
+ *
+ * If no specs are registered, the empty state hints at the CLI
+ * command users typically run to register one.
  */
 
 import type { JSX } from 'preact';
@@ -14,401 +24,218 @@ import { useEffect, useMemo, useState } from 'preact/hooks';
 
 import {
   Card,
-  Diff,
   EmptyState,
-  FlowGraph,
-  JsonViewer,
   Pill,
   Spinner,
-  Tabs,
-  type TabSpec,
+  Table,
+  type PillVariant,
+  type TableColumn,
 } from '../components';
-import { api, ApiError, type SpecDetail, type SpecSummary } from '../lib/api';
-import { canonicalJson } from '../lib/canonicalJson';
-import { specToGraph } from '../lib/specGraph';
+import {
+  api,
+  ApiError,
+  type RunSummary,
+  type SpecSummary,
+} from '../lib/api';
 
 const shortHash = (h: string): string => (h.length > 12 ? h.slice(0, 12) : h);
 
-function formatTimestamp(iso: string): string {
+function formatTimestamp(iso: string | null | undefined): string {
+  if (!iso) return '—';
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
 }
 
-// ---------------------------------------------------------------------------
-// Master list grouped by slug
-// ---------------------------------------------------------------------------
-
-interface SpecGroup {
-  slug: string;
-  rows: SpecSummary[]; // sorted by version desc
+function statusVariant(status: string): PillVariant {
+  switch (status) {
+    case 'completed': return 'success';
+    case 'in_progress': return 'info';
+    case 'paused': return 'warning';
+    case 'faulted':
+    case 'aborted':
+    case 'drift_paused': return 'danger';
+    default: return 'neutral';
+  }
 }
 
-function groupBySlug(specs: readonly SpecSummary[]): SpecGroup[] {
-  const map = new Map<string, SpecSummary[]>();
+interface SpecGroupRow {
+  /** The latest registered SpecSummary for this slug (used for the navigation target). */
+  latest: SpecSummary;
+  /** Number of registered versions of this slug. */
+  versionCount: number;
+  /** Number of runs across all versions of this slug. */
+  runCount: number;
+  /** Newest run for this slug (any version), or null if none. */
+  newestRun: RunSummary | null;
+}
+
+/**
+ * Build the per-slug rows: group specs by slug, take the latest
+ * version as the navigation target, count runs across all versions,
+ * and pick the most-recently-updated run for the status pill.
+ */
+function buildRows(specs: readonly SpecSummary[], runs: readonly RunSummary[]): SpecGroupRow[] {
+  // Map slug -> sorted-desc-by-version list of SpecSummary.
+  const bySlug = new Map<string, SpecSummary[]>();
   for (const s of specs) {
-    if (!map.has(s.slug)) map.set(s.slug, []);
-    map.get(s.slug)!.push(s);
+    if (!bySlug.has(s.slug)) bySlug.set(s.slug, []);
+    bySlug.get(s.slug)!.push(s);
   }
-  const groups: SpecGroup[] = [];
-  for (const [slug, rows] of map.entries()) {
-    rows.sort((a, b) => b.version - a.version);
-    groups.push({ slug, rows });
+  for (const list of bySlug.values()) list.sort((a, b) => b.version - a.version);
+
+  // Map fsm_spec_id -> slug (so we can attribute each run to its slug).
+  const idToSlug = new Map<string, string>();
+  for (const s of specs) idToSlug.set(s.id, s.slug);
+
+  // Map slug -> { runs[] }; pick newest by last_update_at descending.
+  const slugRuns = new Map<string, RunSummary[]>();
+  for (const r of runs) {
+    const slug = idToSlug.get(r.fsm_spec_id);
+    if (!slug) continue;
+    if (!slugRuns.has(slug)) slugRuns.set(slug, []);
+    slugRuns.get(slug)!.push(r);
   }
-  groups.sort((a, b) => a.slug.localeCompare(b.slug));
-  return groups;
-}
 
-interface MasterListProps {
-  groups: readonly SpecGroup[];
-  selectedId: string | null;
-  onSelect: (id: string) => void;
-}
-
-function MasterList({ groups, selectedId, onSelect }: MasterListProps): JSX.Element {
-  const [expandedSlugs, setExpandedSlugs] = useState<Set<string>>(new Set());
-  const toggle = (slug: string) =>
-    setExpandedSlugs((prev) => {
-      const next = new Set(prev);
-      if (next.has(slug)) next.delete(slug);
-      else next.add(slug);
-      return next;
+  const rows: SpecGroupRow[] = [];
+  for (const [slug, vList] of bySlug.entries()) {
+    const runsForSlug = slugRuns.get(slug) ?? [];
+    runsForSlug.sort((a, b) => (b.last_update_at ?? '').localeCompare(a.last_update_at ?? ''));
+    rows.push({
+      latest: vList[0],
+      versionCount: vList.length,
+      runCount: runsForSlug.length,
+      newestRun: runsForSlug[0] ?? null,
     });
-
-  if (groups.length === 0) {
-    return (
-      <EmptyState
-        title="No specs registered"
-        message="Register an FSM spec via POST /api/v1/specs."
-      />
-    );
   }
-  return (
-    <ul class="divide-y divide-slate-200 dark:divide-slate-700" aria-label="Registered FSM specs">
-      {groups.map((g) => {
-        const latest = g.rows[0];
-        const expanded = expandedSlugs.has(g.slug);
-        return (
-          <li key={g.slug}>
-            <div class="flex items-center gap-1 py-2 px-3">
-              <button
-                type="button"
-                onClick={() => toggle(g.slug)}
-                aria-label={expanded ? `Collapse ${g.slug}` : `Expand ${g.slug}`}
-                aria-expanded={expanded}
-                class="inline-flex w-4 h-4 items-center justify-center text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded-sm"
-              >
-                <svg
-                  viewBox="0 0 20 20"
-                  fill="currentColor"
-                  class={['w-3 h-3 transition-transform', expanded ? 'rotate-90' : ''].join(' ')}
-                  aria-hidden="true"
-                >
-                  <path
-                    fill-rule="evenodd"
-                    d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z"
-                    clip-rule="evenodd"
-                  />
-                </svg>
-              </button>
-              <button
-                type="button"
-                onClick={() => onSelect(latest.id)}
-                class={[
-                  'flex-1 text-left flex items-center gap-2 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded-sm',
-                  selectedId === latest.id
-                    ? 'font-semibold text-slate-900 dark:text-slate-100'
-                    : 'text-slate-700 dark:text-slate-300',
-                ].join(' ')}
-              >
-                <span class="truncate">{g.slug}</span>
-                <Pill variant="info" size="sm">v{latest.version}</Pill>
-                <span class="text-[10px] text-slate-500 ml-auto">
-                  {g.rows.length} version{g.rows.length === 1 ? '' : 's'}
-                </span>
-              </button>
-            </div>
-            {expanded ? (
-              <ul class="ml-7 mb-2 space-y-0.5">
-                {g.rows.map((r) => (
-                  <li key={r.id}>
-                    <button
-                      type="button"
-                      onClick={() => onSelect(r.id)}
-                      class={[
-                        'block w-full text-left text-xs py-1 px-2 rounded-sm font-mono',
-                        selectedId === r.id
-                          ? 'bg-emerald-50 dark:bg-emerald-900/30 text-slate-900 dark:text-slate-100'
-                          : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/50',
-                      ].join(' ')}
-                    >
-                      v{r.version} · {shortHash(r.hash)} · {formatTimestamp(r.created_at)}
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            ) : null}
-          </li>
-        );
-      })}
-    </ul>
-  );
+  // Most-recently-active first: order by newest run's last_update_at
+  // descending, with specs that have never been run falling to the
+  // bottom but still sorted by latest-version registered_at.
+  rows.sort((a, b) => {
+    const aT = a.newestRun?.last_update_at ?? '';
+    const bT = b.newestRun?.last_update_at ?? '';
+    if (aT && !bT) return -1;
+    if (bT && !aT) return 1;
+    if (aT && bT) return bT.localeCompare(aT);
+    return (b.latest.created_at ?? '').localeCompare(a.latest.created_at ?? '');
+  });
+  return rows;
 }
 
-// ---------------------------------------------------------------------------
-// Detail pane (tabs: Graph / Schemas / Definition / Versions)
-// ---------------------------------------------------------------------------
-
-interface DetailPaneProps {
-  detail: SpecDetail | null;
-  detailError: string | null;
-  /** All versions of the selected slug (for the Versions tab). */
-  siblings: SpecSummary[];
+function navigateTo(path: string): void {
+  if (typeof window === 'undefined') return;
+  window.history.pushState(null, '', path);
+  window.dispatchEvent(new PopStateEvent('popstate'));
 }
-
-function DetailPane({ detail, detailError, siblings }: DetailPaneProps): JSX.Element {
-  const [activeTab, setActiveTab] = useState('graph');
-  const [compareWith, setCompareWith] = useState<string | null>(null);
-  const [compareDetail, setCompareDetail] = useState<SpecDetail | null>(null);
-
-  // Reset the diff target when the detail itself changes.
-  useEffect(() => {
-    setCompareWith(null);
-    setCompareDetail(null);
-  }, [detail?.id]);
-
-  useEffect(() => {
-    if (!compareWith) return;
-    let cancelled = false;
-    api.getSpec(compareWith)
-      .then((d) => { if (!cancelled) setCompareDetail(d); })
-      .catch(() => { if (!cancelled) setCompareDetail(null); });
-    return () => { cancelled = true; };
-  }, [compareWith]);
-
-  if (detailError) {
-    return <EmptyState title="Failed to load spec" message={detailError} />;
-  }
-  if (!detail) {
-    return (
-      <div class="flex items-center justify-center py-16">
-        <Spinner label="Pick a spec on the left" />
-      </div>
-    );
-  }
-
-  const graph = specToGraph(detail.definition);
-
-  const schemasPanel = (() => {
-    const def = (detail.definition as Record<string, unknown>) ?? {};
-    const states = Array.isArray(def.states) ? def.states : [];
-    const withSchemas = (states as Record<string, unknown>[]).filter((s) => {
-      const w = s.worker as Record<string, unknown> | undefined;
-      return w && w.response_schema;
-    });
-    if (withSchemas.length === 0) {
-      return <EmptyState title="No worker schemas" message="This spec has no worker response schemas declared." />;
-    }
-    return (
-      <div class="space-y-4">
-        {withSchemas.map((s) => {
-          const sid = String(s.id);
-          const worker = s.worker as Record<string, unknown>;
-          return (
-            <div key={sid}>
-              <h4 class="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">
-                {sid}
-              </h4>
-              <JsonViewer
-                value={worker.response_schema}
-                rootLabel="response_schema"
-                mode="inline"
-                maxInlineHeight="max-h-48"
-              />
-            </div>
-          );
-        })}
-      </div>
-    );
-  })();
-
-  const versionsPanel = (() => {
-    if (siblings.length <= 1) {
-      return (
-        <p class="text-sm text-slate-500 py-2">
-          Only one version registered for this slug.
-        </p>
-      );
-    }
-    return (
-      <div class="space-y-3">
-        <div class="text-xs text-slate-500">
-          Compare definitions between any two versions of this slug.
-        </div>
-        <div class="flex items-center gap-2 text-sm">
-          <label for="spec-diff-target">Diff against:</label>
-          <select
-            id="spec-diff-target"
-            aria-label="Pick a version to diff against"
-            value={compareWith ?? ''}
-            onChange={(e) => setCompareWith((e.target as HTMLSelectElement).value || null)}
-            class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-md px-2 py-1 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
-          >
-            <option value="">— pick a version —</option>
-            {siblings.filter((s) => s.id !== detail.id).map((s) => (
-              <option value={s.id} key={s.id}>v{s.version} ({shortHash(s.hash)})</option>
-            ))}
-          </select>
-        </div>
-        {compareDetail ? (
-          <Diff
-            before={canonicalJson(compareDetail.definition)}
-            after={canonicalJson(detail.definition)}
-            label={`v${compareDetail.version} → v${detail.version}`}
-          />
-        ) : compareWith ? (
-          <div class="flex items-center gap-2 text-xs text-slate-500">
-            <Spinner size="sm" /> Loading...
-          </div>
-        ) : null}
-      </div>
-    );
-  })();
-
-  const definitionPanel = (
-    <JsonViewer
-      value={detail.definition}
-      rootLabel="definition"
-      mode="expanded"
-      defaultExpandDepth={3}
-      downloadFilename={`spec-${detail.slug}-v${detail.version}.json`}
-    />
-  );
-
-  const tabs: TabSpec[] = [
-    { id: 'graph', label: 'Graph', badge: <Pill variant="neutral" size="sm">{graph.nodes.length}</Pill> },
-    { id: 'schemas', label: 'Schemas' },
-    { id: 'definition', label: 'Definition' },
-    { id: 'versions', label: 'Versions', badge: <Pill variant="neutral" size="sm">{siblings.length}</Pill> },
-  ];
-
-  return (
-    <div class="flex flex-col h-full min-h-0">
-      <header class="px-3 pt-3 pb-2 border-b border-slate-200 dark:border-slate-700">
-        <div class="flex items-baseline gap-2">
-          <h2 class="text-base font-semibold">{detail.slug}</h2>
-          <Pill variant="info">v{detail.version}</Pill>
-          <code class="text-xs font-mono text-slate-500" title={detail.hash}>
-            {shortHash(detail.hash)}
-          </code>
-          <span class="ml-auto text-xs text-slate-500">
-            Registered {formatTimestamp(detail.registered_at)}
-          </span>
-        </div>
-      </header>
-      <div class="flex-1 min-h-0">
-        <Tabs
-          tabs={tabs}
-          activeTab={activeTab}
-          onChange={setActiveTab}
-          panels={{
-            graph: (
-              <div class="h-[60vh] p-3">
-                <FlowGraph
-                  nodes={graph.nodes}
-                  edges={graph.edges}
-                  autoLayout={true}
-                  direction="LR"
-                />
-              </div>
-            ),
-            schemas: <div class="p-3">{schemasPanel}</div>,
-            definition: <div class="p-3">{definitionPanel}</div>,
-            versions: <div class="p-3">{versionsPanel}</div>,
-          }}
-        />
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Page
-// ---------------------------------------------------------------------------
 
 export function SpecsRoute(): JSX.Element {
   const [specs, setSpecs] = useState<SpecSummary[] | null>(null);
+  const [runs, setRuns] = useState<RunSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [detail, setDetail] = useState<SpecDetail | null>(null);
-  const [detailError, setDetailError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    api.listSpecs()
-      .then((rows) => {
-        if (!cancelled) {
-          setSpecs(rows);
-          // Auto-select the latest version of the first slug for a
-          // populated initial paint instead of an empty right pane.
-          if (rows.length > 0 && selectedId == null) {
-            const first = groupBySlug(rows)[0];
-            if (first) setSelectedId(first.rows[0].id);
-          }
-        }
+    Promise.all([api.listSpecs(), api.listRuns({ limit: 500 })])
+      .then(([s, r]) => {
+        if (cancelled) return;
+        setSpecs(s);
+        setRuns(r);
       })
       .catch((err: unknown) => {
         if (!cancelled) setError(err instanceof ApiError ? err.message : String(err));
       });
     return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
-    if (!selectedId) { setDetail(null); setDetailError(null); return; }
-    let cancelled = false;
-    setDetail(null); setDetailError(null);
-    api.getSpec(selectedId)
-      .then((d) => { if (!cancelled) setDetail(d); })
-      .catch((err: unknown) => {
-        if (!cancelled) setDetailError(err instanceof ApiError ? err.message : String(err));
-      });
-    return () => { cancelled = true; };
-  }, [selectedId]);
+  const rows = useMemo(() => {
+    if (!specs || !runs) return null;
+    return buildRows(specs, runs);
+  }, [specs, runs]);
 
-  const groups = useMemo(() => (specs ? groupBySlug(specs) : []), [specs]);
+  const cols: TableColumn<SpecGroupRow>[] = [
+    {
+      key: 'slug', label: 'Spec',
+      render: (r) => (
+        <div class="flex items-baseline gap-2">
+          <span class="text-sm font-medium text-slate-900 dark:text-slate-100">{r.latest.slug}</span>
+          <Pill variant="info" size="sm">v{r.latest.version}</Pill>
+          {r.versionCount > 1 ? (
+            <span class="text-[10px] text-slate-500 dark:text-slate-400">
+              · {r.versionCount} versions
+            </span>
+          ) : null}
+        </div>
+      ),
+    },
+    {
+      key: 'runs', label: 'Runs', align: 'right' as const, width: '5rem',
+      render: (r) => (
+        <span class="font-mono text-xs text-slate-700 dark:text-slate-300">{r.runCount}</span>
+      ),
+    },
+    {
+      key: 'status', label: 'Last run', width: '9rem',
+      render: (r) => r.newestRun ? (
+        <Pill variant={statusVariant(r.newestRun.status)} size="sm">{r.newestRun.status}</Pill>
+      ) : (
+        <span class="text-[10px] text-slate-500 dark:text-slate-400">no runs yet</span>
+      ),
+    },
+    {
+      key: 'lastUpdate', label: 'Last activity', width: '14rem',
+      render: (r) => (
+        <span class="text-xs text-slate-600 dark:text-slate-400">
+          {formatTimestamp(r.newestRun?.last_update_at ?? r.latest.created_at)}
+        </span>
+      ),
+    },
+    {
+      key: 'hash', label: 'Hash', width: '12rem',
+      render: (r) => (
+        <code class="font-mono text-xs text-slate-600 dark:text-slate-400" title={r.latest.hash}>
+          {shortHash(r.latest.hash)}
+        </code>
+      ),
+    },
+  ];
 
-  // Siblings = all versions of the currently-selected slug.
-  const siblings = useMemo(() => {
-    if (!detail || !specs) return [];
-    return specs.filter((s) => s.slug === detail.slug).sort((a, b) => b.version - a.version);
-  }, [detail, specs]);
+  let body: JSX.Element;
+  if (error) {
+    body = <EmptyState title="Failed to load specs" message={error} />;
+  } else if (rows === null) {
+    body = (
+      <div class="flex items-center justify-center py-12">
+        <Spinner label="Loading specs and runs" />
+      </div>
+    );
+  } else if (rows.length === 0) {
+    body = (
+      <EmptyState
+        title="No specs registered"
+        message="Register a spec via `ctxr-fsm spec register <module:attr>` then refresh."
+      />
+    );
+  } else {
+    body = (
+      <Table<SpecGroupRow>
+        columns={cols}
+        rows={rows}
+        rowKey={(r) => r.latest.slug}
+        onRowClick={(r) => navigateTo(`/specs/${encodeURIComponent(r.latest.id)}`)}
+        caption="Registered FSM specs, ordered by most recent activity"
+      />
+    );
+  }
 
   return (
-    <div class="p-4 md:p-6 space-y-4 flex flex-col h-full min-h-0">
+    <div class="p-4 md:p-6 space-y-4">
       <header>
-        <h1 class="text-2xl font-semibold">Specs</h1>
+        <h1 class="text-2xl font-semibold text-slate-900 dark:text-slate-100">Specs</h1>
         <p class="text-sm text-slate-600 dark:text-slate-400">
-          Registered FSM definitions. Pick a spec to view its graph, schemas, full definition, and version diffs.
+          The spec catalog is the entry point. Pick one to see its graph, runs, schemas, and version history.
+          Ordered by most-recently-active first.
         </p>
       </header>
-      {error ? (
-        <Card>
-          <EmptyState title="Failed to load specs" message={error} />
-        </Card>
-      ) : specs == null ? (
-        <Card>
-          <div class="flex items-center justify-center py-12"><Spinner label="Loading specs" /></div>
-        </Card>
-      ) : (
-        <div class="grid gap-4 lg:grid-cols-[24rem_1fr] flex-1 min-h-0">
-          <Card className="p-0 overflow-auto">
-            <MasterList groups={groups} selectedId={selectedId} onSelect={setSelectedId} />
-          </Card>
-          <Card className="p-0">
-            <DetailPane detail={detail} detailError={detailError} siblings={siblings} />
-          </Card>
-        </div>
-      )}
+      <Card className="p-0">{body}</Card>
     </div>
   );
 }
