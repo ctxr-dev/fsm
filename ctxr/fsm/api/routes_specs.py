@@ -51,7 +51,7 @@ Design notes
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -59,6 +59,12 @@ from sqlalchemy import select
 from starlette.concurrency import run_in_threadpool
 
 from ctxr.fsm.api._deps import ProjectDep, require_auth
+from ctxr.fsm.api._pagination import (
+    Page,
+    PageParams,
+    make_page_params,
+    paginate_sa_select,
+)
 from ctxr.fsm.core.models import FsmSpec
 from ctxr.fsm.core.spec import validate_fsm_spec
 from ctxr.fsm.sqlite.models_core import FsmSpecTable, ProjectTable
@@ -212,99 +218,184 @@ router = APIRouter(
 
 
 # ---------------------------------------------------------------------------
+# Per-route pagination factories
+# ---------------------------------------------------------------------------
+# Bound at module scope so FastAPI's ``Depends`` machinery can resolve
+# them once at import time. Each factory owns its allow-list so an
+# unknown ``?sort=`` value triggers a clear 422 at the edge instead of
+# a silent fall-back to the default.
+
+SpecsPageParams = make_page_params(
+    default_sort="slug_asc",
+    allowed_sorts=("slug_asc", "registered_at_desc", "registered_at_asc"),
+)
+
+# Pre-W22b2 versions endpoint defaulted to ``version`` ascending. The
+# user's explicit requirement is "most-recent down to least-recent" so
+# the post-W22b2 default flips to ``version_desc`` — a wire-visible
+# behaviour change called out in the notes for downstream consumers.
+SpecVersionsPageParams = make_page_params(
+    default_sort="version_desc",
+    allowed_sorts=("version_desc", "version_asc"),
+)
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
 
-def _list_specs_sync(project: Any) -> list[SpecSummary]:
+def _specs_base_select(sort: str) -> Any:
+    """Build the ordered base ``select()`` for ``GET /api/v1/specs``.
+
+    Extracted from the previous ``_list_specs_sync`` so
+    :func:`paginate_sa_select` can wrap the select (it requires the
+    ordering to be applied to the base statement before the window-
+    function count is bolted on). The join on ``projects`` keeps the
+    response one round-trip (vs. N+1 lookups per spec).
+
+    The legacy default ordering was ``(project_slug, slug, version)``
+    asc, retained here for ``sort="slug_asc"`` so unchanged callers
+    see the same wire order. The two ``registered_at`` variants give
+    operators a recency view of the spec registry without having to
+    pull every page client-side.
+    """
+    base = select(
+        FsmSpecTable.id,
+        FsmSpecTable.project_id,
+        ProjectTable.slug.label("project_slug"),
+        FsmSpecTable.slug,
+        FsmSpecTable.version,
+        FsmSpecTable.hash,
+        FsmSpecTable.created_at,
+    ).join(ProjectTable, FsmSpecTable.project_id == ProjectTable.id)
+    if sort == "slug_asc":
+        return base.order_by(
+            ProjectTable.slug.asc(),
+            FsmSpecTable.slug.asc(),
+            FsmSpecTable.version.asc(),
+        )
+    if sort == "registered_at_desc":
+        return base.order_by(FsmSpecTable.created_at.desc(), FsmSpecTable.id.desc())
+    if sort == "registered_at_asc":
+        return base.order_by(FsmSpecTable.created_at.asc(), FsmSpecTable.id.asc())
+    # The factory's allow-list already validates ``sort`` so any value
+    # reaching this point is a programming error, not a client one.
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={"error": "unhandled_sort", "supplied": sort},
+    )
+
+
+def _spec_summary_row_factory(mapping: Any) -> SpecSummary:
+    """Translate a result-set row mapping into a :class:`SpecSummary`."""
+    return SpecSummary(
+        id=mapping["id"],
+        project_id=mapping["project_id"],
+        project_slug=mapping["project_slug"],
+        slug=mapping["slug"],
+        version=mapping["version"],
+        hash=mapping["hash"],
+        created_at=mapping["created_at"],
+    )
+
+
+def _list_specs_sync(project: Any, params: PageParams) -> Page[SpecSummary]:
     """Synchronous body of ``GET /api/v1/specs``.
 
     Pulled out so the async handler can hand it to
-    :func:`run_in_threadpool` cleanly. The join on ``projects``
-    keeps the response one round-trip (vs. N+1 lookups per spec).
-    Ordered by ``(project_slug, slug, version)`` so the wire shape
-    is deterministic for clients building UI lists.
+    :func:`run_in_threadpool` cleanly. Builds the ordered base select
+    via :func:`_specs_base_select`, then defers slicing + counting to
+    :func:`paginate_sa_select` so the wire envelope (``total``,
+    ``has_next``) is filled from a single round-trip with the page
+    fetch.
     """
-    stmt = (
+    base = _specs_base_select(params.sort)
+    with project.session_factory() as session:
+        return paginate_sa_select(
+            session.connection(),
+            base,
+            params=params,
+            row_factory=_spec_summary_row_factory,
+        )
+
+
+def _versions_base_select(sort: str, project_id: str, slug: str) -> Any:
+    """Build the ordered base ``select()`` for the versions endpoint.
+
+    Mirrors :func:`_specs_base_select` for the per-slug versions
+    history. The post-W22b2 default of ``version_desc`` matches the
+    user's "most recent first" directive — the previous handler
+    returned ``version_asc``, so this is a wire-visible behaviour
+    change for clients that depended on the implicit ordering.
+    """
+    base = (
         select(
             FsmSpecTable.id,
             FsmSpecTable.project_id,
-            ProjectTable.slug.label("project_slug"),
             FsmSpecTable.slug,
             FsmSpecTable.version,
             FsmSpecTable.hash,
             FsmSpecTable.created_at,
         )
-        .join(ProjectTable, FsmSpecTable.project_id == ProjectTable.id)
-        .order_by(
-            ProjectTable.slug.asc(),
-            FsmSpecTable.slug.asc(),
-            FsmSpecTable.version.asc(),
+        .where(
+            FsmSpecTable.project_id == project_id,
+            FsmSpecTable.slug == slug,
         )
     )
-    with project.session_factory() as session:
-        rows = session.execute(stmt).all()
-    return [
-        SpecSummary(
-            id=row.id,
-            project_id=row.project_id,
-            project_slug=row.project_slug,
-            slug=row.slug,
-            version=row.version,
-            hash=row.hash,
-            created_at=row.created_at,
-        )
-        for row in rows
-    ]
+    if sort == "version_desc":
+        return base.order_by(FsmSpecTable.version.desc())
+    if sort == "version_asc":
+        return base.order_by(FsmSpecTable.version.asc())
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={"error": "unhandled_sort", "supplied": sort},
+    )
 
 
 def _list_versions_sync(
     project: Any,
     slug: str,
     project_slug: str,
-) -> list[SpecVersion]:
+    params: PageParams,
+) -> Page[SpecVersion]:
     """Synchronous body of ``GET /api/v1/specs/{slug}/versions``.
 
     Resolves ``project_slug`` to the owning project row first, then
-    pulls every version row for ``(project.id, slug)`` ordered by
-    ``version`` ascending. Returning an empty list when the project
-    is unknown matches the "no versions registered" outcome — the
-    caller's UI handles both identically.
+    pulls a single paginated page of versions for ``(project.id,
+    slug)``. Returning an empty :class:`Page` envelope when the
+    project is unknown matches the "no versions registered" outcome
+    — the caller's UI handles both identically.
     """
     with project.session_factory() as session:
         project_row = session.execute(
             select(ProjectTable).where(ProjectTable.slug == project_slug)
         ).scalar_one_or_none()
         if project_row is None:
-            return []
-        stmt = (
-            select(
-                FsmSpecTable.id,
-                FsmSpecTable.project_id,
-                FsmSpecTable.slug,
-                FsmSpecTable.version,
-                FsmSpecTable.hash,
-                FsmSpecTable.created_at,
+            return Page[SpecVersion].empty(
+                page=params.page,
+                page_size=params.page_size,
+                sort=params.sort,
             )
-            .where(
-                FsmSpecTable.project_id == project_row.id,
-                FsmSpecTable.slug == slug,
+        base = _versions_base_select(params.sort, project_row.id, slug)
+
+        def _row_factory(mapping: Any) -> SpecVersion:
+            return SpecVersion(
+                id=mapping["id"],
+                project_id=mapping["project_id"],
+                project_slug=project_slug,
+                slug=mapping["slug"],
+                version=mapping["version"],
+                hash=mapping["hash"],
+                created_at=mapping["created_at"],
             )
-            .order_by(FsmSpecTable.version.asc())
+
+        return paginate_sa_select(
+            session.connection(),
+            base,
+            params=params,
+            row_factory=_row_factory,
         )
-        rows = session.execute(stmt).all()
-    return [
-        SpecVersion(
-            id=row.id,
-            project_id=row.project_id,
-            project_slug=project_slug,
-            slug=row.slug,
-            version=row.version,
-            hash=row.hash,
-            created_at=row.created_at,
-        )
-        for row in rows
-    ]
 
 
 def _get_spec_sync(project: Any, spec_id: str) -> SpecDetail | None:
@@ -439,38 +530,46 @@ def _register_spec_sync(
 
 @router.get(
     "/specs",
-    response_model=list[SpecSummary],
+    response_model=Page[SpecSummary],
     summary="List every registered FSM spec",
     description=(
-        "Returns a flat list of spec summaries across every project, "
-        "ordered by (project_slug, slug, version). The full `definition` "
-        "body is omitted; fetch it via `GET /api/v1/specs/{spec_id}`."
+        "Returns a paginated page of spec summaries across every project. "
+        "Default sort is `slug_asc` (preserves the pre-W22b2 ordering of "
+        "(project_slug, slug, version) ascending); pass `?sort=registered_at_desc` "
+        "for a recency-first view. The full `definition` body is omitted; "
+        "fetch it via `GET /api/v1/specs/{spec_id}`."
     ),
 )
-async def list_specs(project: ProjectDep) -> list[SpecSummary]:
+async def list_specs(
+    params: Annotated[PageParams, Depends(SpecsPageParams)],
+    project: ProjectDep,
+) -> Page[SpecSummary]:
     """List every registered spec across every project."""
-    return await run_in_threadpool(_list_specs_sync, project)
+    return await run_in_threadpool(_list_specs_sync, project, params)
 
 
 @router.get(
     "/specs/{slug}/versions",
-    response_model=list[SpecVersion],
+    response_model=Page[SpecVersion],
     summary="List every version registered under a given FSM slug",
     description=(
-        "Returns every registered version for the FSM whose natural id "
-        "is `slug`, scoped to `project_slug` (default `'default'`), "
-        "ordered by `version` ascending. An empty list means no "
-        "versions are registered for that (project, slug) pair."
+        "Returns a paginated page of versions for the FSM whose natural id "
+        "is `slug`, scoped to `project_slug` (default `'default'`). Default "
+        "sort is `version_desc` (most-recent version first); pass "
+        "`?sort=version_asc` for chronological order. An empty page "
+        "(`items=[]`, `total=0`) means no versions are registered for that "
+        "(project, slug) pair."
     ),
 )
 async def list_spec_versions(
     slug: str,
+    params: Annotated[PageParams, Depends(SpecVersionsPageParams)],
     project: ProjectDep,
     project_slug: str = "default",
-) -> list[SpecVersion]:
+) -> Page[SpecVersion]:
     """List every registered version for ``(project_slug, slug)``."""
     return await run_in_threadpool(
-        _list_versions_sync, project, slug, project_slug
+        _list_versions_sync, project, slug, project_slug, params
     )
 
 

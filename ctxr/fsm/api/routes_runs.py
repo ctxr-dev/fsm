@@ -53,7 +53,7 @@ even when the database is under load. The threadpool overhead is
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -61,6 +61,13 @@ from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from ctxr.fsm.api._deps import ProjectDep, require_auth
+from ctxr.fsm.api._pagination import (
+    MAX_PAGE_SIZE,
+    Page,
+    PageParams,
+    make_page_params,
+    paginate_sequence,
+)
 from ctxr.fsm.sqlite import (
     Event,
     JournalTxn,
@@ -116,6 +123,25 @@ router: APIRouter = APIRouter(
 # status is supplied at all).
 _STATUS_INCOMPLETE: str = "incomplete"
 _STATUS_RESUMABLE: str = "resumable"
+
+
+# ── Per-route pagination factories ──────────────────────────────────
+# Each list endpoint binds its own ``PageParams`` factory at module
+# scope. The factory captures the default + allowed sort keys so the
+# OpenAPI schema documents them and unknown keys 422 at the edge.
+RunsPageParams = make_page_params(
+    default_sort="last_update_at_desc",
+    allowed_sorts=(
+        "last_update_at_desc",
+        "started_at_desc",
+        "started_at_asc",
+    ),
+)
+
+EventsPageParams = make_page_params(
+    default_sort="seq_asc",
+    allowed_sorts=("seq_asc", "seq_desc"),
+)
 
 
 # ── Pydantic response / request models ─────────────────────────────
@@ -346,11 +372,12 @@ def _within_session(project: Project, fn: Callable[[Session], Any]) -> Any:
 
 @router.get(
     "/runs",
-    response_model=list[RunSummary],
+    response_model=Page[RunSummary],
     summary="List runs, optionally filtered.",
 )
 async def list_runs(
     project: ProjectDep,
+    params: Annotated[PageParams, Depends(RunsPageParams)],
     run_status: str | None = Query(
         default=None,
         alias="status",
@@ -368,18 +395,7 @@ async def list_runs(
             "timestamps in a stable lexicographic format."
         ),
     ),
-    limit: int = Query(
-        default=50,
-        ge=1,
-        le=500,
-        description="Maximum number of rows to return.",
-    ),
-    offset: int = Query(
-        default=0,
-        ge=0,
-        description="Number of rows to skip (post-filter, post-sort).",
-    ),
-) -> list[RunSummary]:
+) -> Page[RunSummary]:
     """List runs with the same dispatch as the MCP ``fsm.list_runs`` tool.
 
     Routing rules:
@@ -390,18 +406,29 @@ async def list_runs(
     * ``status=resumable`` → :meth:`RunsRepo.resumable`.
     * Any other ``status`` value → :meth:`RunsRepo.by_status`.
 
-    ``since`` and ``offset`` are applied in-process after the repo
-    returns because the repo's convenience accessors do not (today)
-    accept those parameters — extending them would be premature
-    optimisation at the run-count scales this surface sees in
-    practice (low thousands per project).
+    Pagination is supplied via the standard ``page`` / ``page_size`` /
+    ``sort`` triple (see :class:`PageParams`); the response is wrapped
+    in :class:`Page` with the total row count derived after
+    in-process filtering.
+
+    ``since`` is applied in-process after the repo returns because the
+    repo's convenience accessors do not (today) accept that parameter —
+    extending them would be premature optimisation at the run-count
+    scales this surface sees in practice (low thousands per project).
     """
 
     def _query(session: Session) -> list[RunSummary]:
         # Dispatch identical to the MCP tool so an MCP client and an
-        # HTTP client see the same rows for the same query.
+        # HTTP client see the same rows for the same query. The repo
+        # methods already sort by ``last_update_at DESC``; we fetch the
+        # full filtered set and let :func:`paginate_sequence` slice
+        # the page so ``total`` reflects the true post-filter cardinality.
         if run_status is None:
-            rows = project.runs.latest(session, limit=limit + offset)
+            # ``latest`` requires an explicit limit; pass the
+            # ``MAX_PAGE_SIZE`` upper bound the rest of the surface
+            # honours so deep pagination still works without us
+            # silently truncating at the old 50-row default.
+            rows = project.runs.latest(session, limit=MAX_PAGE_SIZE)
         elif run_status == _STATUS_INCOMPLETE:
             rows = project.runs.incomplete(session)
         elif run_status == _STATUS_RESUMABLE:
@@ -414,13 +441,19 @@ async def list_runs(
             # the timestamp format guarantee.
             rows = [row for row in rows if row.last_update_at >= since]
 
-        # Apply offset + limit in-process. The ``latest`` branch
-        # already passes ``limit + offset`` so the slice does not
-        # truncate a too-short result; the other branches return the
-        # full filtered set (typically small).
-        return rows[offset : offset + limit]
+        # Apply the user-supplied sort. The repo returns rows already
+        # sorted by ``last_update_at DESC`` (matching the default), so
+        # only re-sort when the caller asked for something different.
+        if params.sort == "started_at_desc":
+            rows = sorted(rows, key=lambda r: r.started_at, reverse=True)
+        elif params.sort == "started_at_asc":
+            rows = sorted(rows, key=lambda r: r.started_at)
+        # ``last_update_at_desc`` (default) — repo already returned in
+        # this order, no re-sort needed.
+        return rows
 
-    return await run_in_threadpool(_within_session, project, _query)
+    rows = await run_in_threadpool(_within_session, project, _query)
+    return paginate_sequence(rows, params=params)
 
 
 @router.get(
@@ -505,12 +538,13 @@ async def get_state_tree(run_id: str, project: ProjectDep) -> StateNode:
 
 @router.get(
     "/runs/{run_id}/events",
-    response_model=list[Event],
+    response_model=Page[Event],
     summary="Return events recorded against the run.",
 )
 async def list_events(
     run_id: str,
     project: ProjectDep,
+    params: Annotated[PageParams, Depends(EventsPageParams)],
     since_seq: int | None = Query(
         default=None,
         ge=0,
@@ -527,38 +561,35 @@ async def list_events(
             "&kinds=state_entered``)."
         ),
     ),
-    limit: int = Query(
-        default=200,
-        ge=1,
-        le=2000,
-        description="Maximum number of events to return.",
-    ),
-) -> list[Event]:
+) -> Page[Event]:
     """Return a slice of the run's event journal.
 
     404 when the run does not exist. ``since_seq`` is exclusive
     (matches the repo's semantics); ``kinds`` is a whitelist filter
-    applied at the SQL level; ``limit`` is applied after the filter.
-    The ordering is ``seq ASC`` (oldest first) so the caller's
-    cursor is monotonic — the next call passes the last seen
-    ``seq`` as ``since_seq``.
+    applied at the SQL level. The default ordering is ``seq ASC``
+    (oldest first) so the caller's cursor is monotonic — the next
+    call passes the last seen ``seq`` as ``since_seq``. ``?sort=seq_desc``
+    flips the order for "newest first" dashboard views.
     """
 
     def _fetch(session: Session) -> list[Event] | None:
         run: Run | None = project.runs.get(session, run_id)
         if run is None:
             return None
-        # ``events`` returns an iterator; materialise into a list
-        # so we can slice. The ``limit`` cap above bounds the
-        # memory cost.
+        # ``events`` returns an iterator; materialise into a list so
+        # we can slice + page. The full filtered set is materialised
+        # so ``total`` in the returned :class:`Page` reflects the
+        # true count after ``since_seq`` / ``kinds`` filtering.
         events_iter = project.runs.events(
             session, run_id, since_seq=since_seq, kinds=kinds
         )
-        out: list[Event] = []
-        for event in events_iter:
-            out.append(event)
-            if len(out) >= limit:
-                break
+        out: list[Event] = list(events_iter)
+        # Repo returns ``seq ASC`` already; only re-sort when the
+        # caller flipped the direction.
+        if params.sort == "seq_desc":
+            # ``seq`` may be None in defensive cases; fall back to a
+            # sentinel that orders nulls last in DESC mode.
+            out = sorted(out, key=lambda e: (e.seq is None, e.seq), reverse=True)
         return out
 
     events = await run_in_threadpool(_within_session, project, _fetch)
@@ -567,7 +598,7 @@ async def list_events(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"no run with id {run_id!r}",
         )
-    return events
+    return paginate_sequence(events, params=params)
 
 
 @router.post(

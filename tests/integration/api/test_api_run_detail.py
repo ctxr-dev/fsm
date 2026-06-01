@@ -599,18 +599,39 @@ def test_get_events_returns_journal_in_seq_order(
     """
     _, client, run_id = project_and_client
 
-    response = client.get(f"/api/v1/runs/{run_id}/events")
+    # ``page_size=200`` (the documented MAX_PAGE_SIZE) so the seeded
+    # journal — which is comfortably under the cap — comes back in a
+    # single page and the seq-contiguity assertion below sees the
+    # full sequence rather than just the first 50-default slice.
+    response = client.get(
+        f"/api/v1/runs/{run_id}/events", params={"page_size": 200}
+    )
 
     assert response.status_code == 200, (
         f"expected 200 from /api/v1/runs/{run_id}/events, got "
         f"{response.status_code}; body={response.text!r}"
     )
-    events = response.json()
+    page = response.json()
 
+    assert isinstance(page, dict), (
+        f"events endpoint must return a Page envelope dict, got "
+        f"{type(page).__name__}"
+    )
+    events = page["items"]
     assert isinstance(events, list), (
-        f"events endpoint must return a JSON array, got {type(events).__name__}"
+        f"Page.items must be a list, got {type(events).__name__}"
     )
     assert len(events) > 0, "seeded run has events; got an empty list"
+    # Envelope sanity: the full population fit on the first page so
+    # ``total`` matches the items length and ``has_next`` is False.
+    assert page["total"] == len(events), (
+        f"Page.total {page['total']!r} != len(items) {len(events)!r}"
+    )
+    assert page["page"] == 1
+    assert page["has_next"] is False, (
+        f"seeded journal must fit on one page at page_size=200; "
+        f"got has_next=True with total={page['total']}"
+    )
 
     # Every event must belong to the run we asked about.
     for event in events:
@@ -654,30 +675,45 @@ def test_get_events_supports_since_seq_cursor(
     """
     _, client, run_id = project_and_client
 
-    full = client.get(f"/api/v1/runs/{run_id}/events").json()
+    # Pull the full journal first; ``page_size=200`` ensures the
+    # seeded events all land on a single page so we can index into
+    # ``items[0]`` reliably and compute the expected cursored count
+    # off the same population.
+    full_resp = client.get(
+        f"/api/v1/runs/{run_id}/events", params={"page_size": 200}
+    ).json()
+    full = full_resp["items"]
     assert len(full) >= 2, (
         f"need at least 2 events to test the cursor; got {len(full)}"
     )
 
     cursor = full[0]["seq"]
     cursored = client.get(
-        f"/api/v1/runs/{run_id}/events", params={"since_seq": cursor}
+        f"/api/v1/runs/{run_id}/events",
+        params={"since_seq": cursor, "page_size": 200},
     )
 
     assert cursored.status_code == 200, (
         f"expected 200 with since_seq, got {cursored.status_code}; "
         f"body={cursored.text!r}"
     )
-    rows = cursored.json()
+    cursored_page = cursored.json()
+    rows = cursored_page["items"]
     # All returned rows must have seq strictly greater than the cursor.
     assert all(row["seq"] > cursor for row in rows), (
         f"since_seq={cursor} returned a row with seq<={cursor}: {rows!r}"
     )
     # And the count must drop by exactly one — we pinned the cursor at
-    # the very first event.
+    # the very first event. ``total`` on the envelope must agree with
+    # the items length since the cursored slice still fits in one page.
     assert len(rows) == len(full) - 1, (
         f"expected len(full) - 1 = {len(full) - 1} cursored rows, got "
         f"{len(rows)} (full={len(full)})"
+    )
+    assert cursored_page["total"] == len(full) - 1, (
+        f"Page.total must agree with cursored item count; got "
+        f"total={cursored_page['total']}, items={len(rows)}, "
+        f"full={len(full)}"
     )
 
 
@@ -696,16 +732,25 @@ def test_get_events_supports_kinds_whitelist(
 
     response = client.get(
         f"/api/v1/runs/{run_id}/events",
-        params={"kinds": EventKind.state_entered.value},
+        params={
+            "kinds": EventKind.state_entered.value,
+            "page_size": 200,
+        },
     )
 
     assert response.status_code == 200, (
         f"expected 200 with kinds filter, got {response.status_code}; "
         f"body={response.text!r}"
     )
-    rows = response.json()
+    page = response.json()
+    rows = page["items"]
     assert len(rows) == 2, (
         f"seeded run has two state_entered events; got {len(rows)}: {rows!r}"
+    )
+    # ``total`` reflects the count *after* the SQL-level filter so it
+    # must match the item count when the slice fits on one page.
+    assert page["total"] == 2, (
+        f"Page.total must reflect post-filter count; got {page['total']!r}"
     )
     for row in rows:
         assert row["kind"] == EventKind.state_entered.value, (

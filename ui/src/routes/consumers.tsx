@@ -42,9 +42,9 @@ export function ConsumersRoute(): JSX.Element {
   useEffect(() => {
     let cancelled = false;
     api
-      .listConsumers()
-      .then((rows) => {
-        if (!cancelled) setConsumers(rows);
+      .listConsumers({ page_size: 200 })
+      .then((page) => {
+        if (!cancelled) setConsumers(page.items);
       })
       .catch((err: unknown) => {
         if (cancelled) return;

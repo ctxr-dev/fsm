@@ -34,9 +34,34 @@ import {
 import {
   api,
   ApiError,
+  type Page,
+  type PageParams,
   type RunSummary,
   type SpecSummary,
 } from '../lib/api';
+
+/**
+ * Walk a paginated endpoint until ``has_next`` is false (or the safety
+ * stop trips at ``maxPages``). Used by routes that need to enumerate
+ * the full population for derivative aggregations — e.g. the spec
+ * catalog's per-slug run count or sibling tree. Returns the flattened
+ * items list. Pages are fetched serially to keep the server's
+ * paginator's cursor / sort stable; ``page_size`` is fixed at the
+ * wire MAX_PAGE_SIZE of 200 to minimise round trips.
+ */
+async function walkAllPages<T, P extends PageParams>(
+  fetcher: (params: P) => Promise<Page<T>>,
+  baseParams: Omit<P, 'page' | 'page_size'>,
+  maxPages = 50,
+): Promise<T[]> {
+  const out: T[] = [];
+  for (let page = 1; page <= maxPages; page += 1) {
+    const env = await fetcher({ ...(baseParams as P), page, page_size: 200 } as P);
+    out.push(...env.items);
+    if (!env.has_next) return out;
+  }
+  return out;
+}
 
 const shortHash = (h: string): string => (h.length > 12 ? h.slice(0, 12) : h);
 
@@ -134,7 +159,15 @@ export function SpecsRoute(): JSX.Element {
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([api.listSpecs(), api.listRuns({ limit: 500 })])
+    // The spec catalog needs to enumerate EVERY spec and EVERY run to
+    // group + count per slug — derivative aggregations, not a
+    // user-facing paged list — so we walk pages until ``has_next`` is
+    // false (with a 50-page safety stop) instead of wiring a
+    // <Pagination> control here.
+    Promise.all([
+      walkAllPages((p) => api.listSpecs(p), {}),
+      walkAllPages((p) => api.listRuns(p), {}),
+    ])
       .then(([s, r]) => {
         if (cancelled) return;
         setSpecs(s);

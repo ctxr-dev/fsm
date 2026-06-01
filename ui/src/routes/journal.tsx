@@ -16,6 +16,7 @@ import {
   Dialog,
   EmptyState,
   JsonViewer,
+  Pagination,
   Pill,
   Spinner,
   Timeline,
@@ -23,7 +24,9 @@ import {
   type PillVariant,
   type TimelineItem,
 } from '../components';
-import { api, ApiError, type JournalTxn } from '../lib/api';
+import { api, ApiError, type JournalTxn, type Page } from '../lib/api';
+
+const DEFAULT_PAGE_SIZE = 200;
 
 function fmt(iso: string | null | undefined): string {
   if (!iso) return '—';
@@ -47,7 +50,9 @@ interface Pending {
 }
 
 export function JournalRoute(): JSX.Element {
-  const [txns, setTxns] = useState<JournalTxn[] | null>(null);
+  const [txnsPage, setTxnsPage] = useState<Page<JournalTxn> | null>(null);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState<Pending | null>(null);
   const [busy, setBusy] = useState(false);
@@ -55,24 +60,26 @@ export function JournalRoute(): JSX.Element {
 
   const reload = useCallback(() => {
     let cancelled = false;
-    setTxns(null);
-    api.listJournalTxns({ limit: 500 })
-      .then((rows) => {
+    setTxnsPage(null);
+    api.listJournalTxns({ page, page_size: pageSize })
+      .then((resp) => {
         if (!cancelled) {
-          // Sort recent first by started_at.
-          const sorted = [...rows].sort((a, b) =>
+          // Sort recent first by started_at within the page.
+          const sortedItems = [...resp.items].sort((a, b) =>
             (b.started_at ?? '').localeCompare(a.started_at ?? ''),
           );
-          setTxns(sorted);
+          setTxnsPage({ ...resp, items: sortedItems });
         }
       })
       .catch((err: unknown) => {
         if (!cancelled) setError(err instanceof ApiError ? err.message : String(err));
       });
     return () => { cancelled = true; };
-  }, []);
+  }, [page, pageSize]);
 
   useEffect(reload, [reload]);
+
+  const txns = txnsPage?.items ?? null;
 
   const grouped = useMemo(() => {
     if (!txns) return [];
@@ -169,7 +176,7 @@ export function JournalRoute(): JSX.Element {
         <Button variant="ghost" size="sm" onClick={reload}>Refresh</Button>
       </header>
       <Card>
-        {txns === null ? (
+        {txnsPage === null ? (
           <div class="flex items-center justify-center py-12"><Spinner label="Loading journal" /></div>
         ) : grouped.length === 0 ? (
           <EmptyState title="No pending txns" message="Every journal txn across every run is finalised." />
@@ -192,6 +199,14 @@ export function JournalRoute(): JSX.Element {
           </div>
         )}
       </Card>
+      {txnsPage !== null && txnsPage.total > 0 ? (
+        <Pagination
+          page={txnsPage}
+          onPageChange={(p) => setPage(p)}
+          onPageSizeChange={(sz) => { setPageSize(sz); setPage(1); }}
+          itemLabel="journal txns"
+        />
+      ) : null}
       <Dialog
         open={pending !== null}
         onClose={() => setPending(null)}
