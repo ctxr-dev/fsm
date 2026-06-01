@@ -89,12 +89,21 @@ export function RunProgressGraph({
 
   // Spec fetch — once per (run, spec_id) tuple. The spec is immutable
   // post-registration so we never need to re-fetch unless the run
-  // changes underneath us.
+  // changes underneath us. Stale-state contract: when ``specId``
+  // changes (e.g. operator navigated to a different run via the
+  // sidebar), we CLEAR the previous spec immediately so the component
+  // re-renders the Spinner instead of briefly showing run B's
+  // topology overlaid on run A's spec. The fetch then resolves into
+  // the freshly-cleared state. The pre-fix draft kept the previous
+  // spec in state during the fetch, producing a wrong-run flash.
   useEffect(() => {
     if (specId === null) return;
     if (spec?.spec_id === specId) return;
     let cancelled = false;
     setError(null);
+    // Clear any spec that belongs to a different run BEFORE the
+    // network call so the next render falls into the Spinner branch.
+    setSpec(null);
     api
       .getSpec(specId)
       .then((detail) => {

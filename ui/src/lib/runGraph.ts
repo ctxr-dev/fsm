@@ -52,9 +52,18 @@ export interface RunOverlay {
   faultedStateId: string | null;
 }
 
-/** Flatten the state tree into a chronological list (DFS pre-order
- *  matches engine entry order because the tree is built by appending
- *  children at the bottom). */
+/** Flatten the state tree into a CHRONOLOGICAL list.
+ *
+ *  StateNode already carries ``entry_seq`` (the engine's monotonic
+ *  per-run counter, the same field the rest of the UI uses to order
+ *  events). We walk the tree to collect every node then sort by
+ *  ``entry_seq`` ascending — this is correct for branching trees
+ *  (where a single state entry can have multiple children written in
+ *  whatever order the engine produced them) and idempotent regardless
+ *  of how the parent traversed children. DFS pre-order, which the
+ *  pre-fix draft used, only matched entry order when the tree was a
+ *  linear chain.
+ */
 function flattenEntries(root: StateNode | null): StateNode[] {
   if (!root) return [];
   const out: StateNode[] = [];
@@ -63,7 +72,27 @@ function flattenEntries(root: StateNode | null): StateNode[] {
     for (const child of node.children) walk(child);
   };
   walk(root);
+  out.sort((a, b) => a.entry_seq - b.entry_seq);
   return out;
+}
+
+/** Walk the tree and emit every parent -> child pair as a transition.
+ *
+ *  The state tree's parent/child relation IS the transition graph
+ *  the engine took: an entry's children are precisely the states it
+ *  transitioned into. This is more accurate than the
+ *  adjacency-on-the-flattened-list approach, which conflated
+ *  branches at a fork point (two children of the same parent) with
+ *  an actual sibling-to-sibling transition that never happened.
+ */
+function emitTreeTransitions(root: StateNode | null, out: Set<string>): void {
+  if (!root) return;
+  for (const child of root.children) {
+    if (root.state_id !== child.state_id) {
+      out.add(`${root.state_id}::${child.state_id}`);
+    }
+    emitTreeTransitions(child, out);
+  }
 }
 
 /** Promote ``a`` over ``b`` per the status hierarchy. */
@@ -107,23 +136,22 @@ export function buildRunOverlay(
     statusByStateId.set(stateId, strongerStatus(prev, status));
   }
 
-  // Compute taken transitions by walking the chronological entry list
-  // and recording each parent -> child pair. The engine inserts a new
-  // entry whenever a state is entered, so adjacent entries in DFS
-  // pre-order correspond to actually-taken transitions in the run's
-  // history.
+  // Compute taken transitions from the state tree's parent/child
+  // relation — every (parent.state_id, child.state_id) edge in the
+  // tree is by definition a transition the engine took. The pre-fix
+  // adjacency-on-the-flattened-list approach was wrong for branching
+  // trees: two children of the same parent are not adjacent
+  // transitions of each other, they're two outbound transitions from
+  // the same fork point.
   const takenTransitions = new Set<string>();
-  for (let i = 0; i < entries.length - 1; i++) {
-    const from = entries[i].state_id;
-    const to = entries[i + 1].state_id;
-    if (from !== to) takenTransitions.add(`${from}::${to}`);
-  }
+  emitTreeTransitions(stateTree, takenTransitions);
   // ``events`` is reserved for a future refinement where the
   // ``transition_taken`` event would carry an explicit
-  // ``from``/``to`` pair (more accurate than DFS adjacency for loops
-  // that revisit a state). Today the engine doesn't surface those
-  // fields on the event, so we use the state-tree adjacency. Leaving
-  // the parameter here keeps the call site stable when that lands.
+  // ``from``/``to`` pair (the most accurate signal for loops that
+  // revisit a state via a non-tree edge). Today the engine doesn't
+  // surface those fields on the event, so we use the tree-derived
+  // adjacency. Leaving the parameter in the signature keeps the call
+  // site stable when that wire-format upgrade lands.
   void events;
 
   return {
@@ -178,26 +206,34 @@ export function overlayRunOnSpecGraph(
     const colours = STATUS_COLOURS[status];
     const isCurrent = overlay.currentStateId === stateId;
 
+    // Compose the per-status badge prefix INTO ``data.label`` rather
+    // than into a parallel ``labelPrefix`` field. FlowGraph renders
+    // ``data.label`` verbatim and has no labelPrefix concept, so the
+    // pre-fix draft's prefix never reached the DOM. The badge needs
+    // to land in the actual label string for the colour-coded view
+    // to also read correctly under reduced-motion / desaturated
+    // dark-mode tweaks where the background tint may be subtle.
+    const badge =
+      status === 'faulted'
+        ? '⚠ '
+        : status === 'entered'
+        ? '▸ '
+        : status === 'exited'
+        ? '✓ '
+        : '';
+    // Preserve the original spec label unmodified so re-applying the
+    // overlay multiple times doesn't stack prefixes (idempotent).
+    const originalLabel =
+      typeof node.data.label === 'string' ? node.data.label : '';
+    const decoratedLabel = badge ? `${badge}${originalLabel}` : originalLabel;
     return {
       ...node,
       data: {
         ...node.data,
-        // Decorate the node label with a per-status badge prefix so
-        // the colour-coded view also reads correctly under reduced-
-        // motion / dark-mode mode tweaks where the background may
-        // be desaturated.
-        labelPrefix:
-          status === 'faulted'
-            ? '⚠ '
-            : status === 'entered'
-            ? '▸ '
-            : status === 'exited'
-            ? '✓ '
-            : '',
+        label: decoratedLabel,
         runStatus: status,
         isCurrent,
       } as FlowNodeData & {
-        labelPrefix?: string;
         runStatus?: RunNodeStatus;
         isCurrent?: boolean;
       },
