@@ -32,7 +32,12 @@ interface SpecStateShape {
   kind?: string;
   purpose?: string;
   worker?: { role?: string; prompt_template?: string };
-  loop?: { max_iterations?: number; done_field?: string } | unknown;
+  /** Loop config. We type the structured keys we KNOW about
+   *  (`max_iterations`, `done_field`) and accept extra keys via the
+   *  index signature so the type doesn't collapse to `unknown` (which
+   *  is what `{ ... } | unknown` would have done — a union with
+   *  `unknown` loses all structure). */
+  loop?: { max_iterations?: number; done_field?: string; [k: string]: unknown };
   inline?: {
     handler_id?: string;
     purpose?: string;
@@ -209,17 +214,26 @@ export function specToGraph(definition: unknown): SpecGraph {
     };
   });
 
-  // Mark the entry state visually with a sublabel hint.
+  // Mark the entry state visually with a sublabel hint. The `entry ·`
+  // prefix composes onto whatever sublabel we already chose (canonical
+  // worker:/inline: line OR the structural-summary demotion from the
+  // W22 mirror guard). fullSublabel composes onto the CANONICAL line
+  // (not the demoted visible one) so hover + inspector still see the
+  // un-demoted form — losing it here would defeat the redundancy-
+  // guard's whole point.
   if (def.entry) {
     const entry = nodes.find((n) => n.id === def.entry);
     if (entry) {
-      const newSub = entry.data.sublabel
+      const visibleSub = entry.data.sublabel
         ? `entry · ${entry.data.sublabel}`
         : 'entry';
+      const fullSub = entry.data.fullSublabel
+        ? `entry · ${entry.data.fullSublabel}`
+        : visibleSub;
       entry.data = {
         ...entry.data,
-        sublabel: newSub,
-        fullSublabel: newSub,
+        sublabel: visibleSub,
+        fullSublabel: fullSub,
       };
     }
   }

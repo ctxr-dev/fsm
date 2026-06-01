@@ -226,8 +226,9 @@ class ProjectMetadata(BaseModel):
         description=(
             "Absolute path of the project root that hosts ``.ctxr-fsm/``."
             " Computed by walking up from the resolved DB path; falls"
-            " back to the DB's parent.parent when no ``.ctxr-fsm/`` is"
-            " found (operator passed a non-canonical ``--db``)."
+            " back to the DB's parent directory when no ``.ctxr-fsm/``"
+            " ancestor is found (operator passed a non-canonical"
+            " ``--db``)."
         ),
     )
     db_path_relative: str = Field(
@@ -236,7 +237,7 @@ class ProjectMetadata(BaseModel):
             "Path of the open DB relative to ``project_root``. For the"
             " canonical layout this is ``.ctxr-fsm/fsm.db``. UI surfaces"
             " prefer this over ``db_path`` so the value stays portable"
-            " across machines + commitable to shared configs."
+            " across machines and committable to shared configs."
         ),
     )
 

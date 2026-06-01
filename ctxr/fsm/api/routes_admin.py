@@ -137,8 +137,11 @@ class DoctorReport(BaseModel):
         ...,
         description=(
             "Absolute path of the project root that hosts ``.ctxr-fsm/``."
-            " UI surfaces use it as the anchor for portable, relative"
-            " display of the DB path."
+            " Computed by walking up from the resolved DB path; falls"
+            " back to the DB's parent directory when no ``.ctxr-fsm/``"
+            " ancestor is found (operator passed a non-canonical"
+            " ``--db``). UI surfaces use this as the anchor for"
+            " portable, relative display of the DB path."
         ),
     )
     db_path_relative: str = Field(
