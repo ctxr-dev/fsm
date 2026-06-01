@@ -87,8 +87,12 @@ function predicateLabel(t: SpecTransitionShape): string {
  *  judgement) from the various `when` shapes the FSM library emits.
  *  The Transition model does NOT carry a top-level `kind` field — it
  *  lives inside `when` (or is the bare string "always"/"otherwise").
- *  Returns undefined when the shape isn't recognised. */
-function transitionKind(t: SpecTransitionShape): string | undefined {
+ *  Returns undefined when the shape isn't recognised.
+ *
+ *  Exported so other inspector surfaces (the transitions list in
+ *  StateInspectorBody, etc.) can derive the kind the same way as the
+ *  graph edge, instead of duplicating the logic and drifting. */
+export function transitionKind(t: { when?: unknown }): string | undefined {
   if (typeof t.when === 'string') {
     if (t.when === 'always' || t.when === 'otherwise') return t.when;
     // A bare predicate-string (anything else) lifts to deterministic

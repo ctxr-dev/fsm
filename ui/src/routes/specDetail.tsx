@@ -42,7 +42,7 @@ import {
   type SpecSummary,
 } from '../lib/api';
 import { canonicalJson } from '../lib/canonicalJson';
-import { specToGraph } from '../lib/specGraph';
+import { specToGraph, transitionKind } from '../lib/specGraph';
 import { openSheet } from '../lib/store';
 
 const shortHash = (h: string): string => (h.length > 12 ? h.slice(0, 12) : h);
@@ -193,7 +193,12 @@ function StateInspectorBody({ state, isEntry }: StateInspectorBodyProps): JSX.El
           <ul class="divide-y divide-slate-100 dark:divide-slate-800 text-xs">
             {transitions.map((t, idx) => {
               const target = typeof t.to === 'string' ? t.to : '(unknown)';
-              const tKind = typeof t.kind === 'string' ? t.kind : undefined;
+              // Derive the kind from the `when` payload via the shared
+              // helper — the FSM library's Transition model has no
+              // top-level `kind` field, so reading t.kind would always
+              // be undefined for spec-authored data. Mirrors how the
+              // graph edge data.kind is computed.
+              const tKind = transitionKind(t);
               // Mirror specGraph.predicateLabel(): a `when` dict can
               // encode the human-readable guard text under any of
               // `.predicate` (bare Predicate dump), `.expression`

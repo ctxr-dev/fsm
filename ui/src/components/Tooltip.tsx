@@ -310,7 +310,13 @@ export function Tooltip(props: TooltipProps): JSX.Element {
     if (!open) return undefined;
     const onKey = (e: KeyboardEvent): void => {
       if (e.key === 'Escape') {
-        e.stopPropagation();
+        // Deliberately NOT calling stopPropagation: when a Tooltip is
+        // open inside a Sheet / Dialog, Esc should also reach the
+        // enclosing modal's handler so the user can dismiss both with
+        // one keystroke. (And on document-level peer listeners
+        // stopPropagation is a no-op anyway — only
+        // stopImmediatePropagation would block them, which would be
+        // wrong here.)
         closeNow();
         warmUntil = 0;
       }
