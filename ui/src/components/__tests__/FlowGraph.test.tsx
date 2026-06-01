@@ -72,13 +72,27 @@ describe('FlowGraph', () => {
     expect(positioned.every((n) => n.type === 'fsmNode')).toBe(true);
   });
 
-  test('autoLayout=false passes nodes through untouched', () => {
+  test('autoLayout=false preserves caller positions but stamps direction-aware handle sides', () => {
     const nodes: Node<FlowNodeData>[] = [
       { id: 'a', position: { x: 100, y: 200 }, data: { kind: 'state', label: 'a' } },
     ];
-    render(<FlowGraph nodes={nodes} edges={[]} autoLayout={false} />);
-    const passed = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
-    expect(passed[0].position).toEqual({ x: 100, y: 200 });
+    render(<FlowGraph nodes={nodes} edges={[]} autoLayout={false} direction="TB" />);
+    const passedTB = lastReactFlowProps!.nodes as Array<
+      Node<FlowNodeData> & { sourcePosition?: string; targetPosition?: string; type?: string }
+    >;
+    expect(passedTB[0].position).toEqual({ x: 100, y: 200 });
+    // TB: edges attach to bottom of source, top of target.
+    expect(passedTB[0].sourcePosition).toBe('bottom');
+    expect(passedTB[0].targetPosition).toBe('top');
+    expect(passedTB[0].type).toBe('fsmNode');
+
+    // Same nodes but LR direction → handles flip to right/left.
+    render(<FlowGraph nodes={nodes} edges={[]} autoLayout={false} direction="LR" />);
+    const passedLR = lastReactFlowProps!.nodes as Array<
+      Node<FlowNodeData> & { sourcePosition?: string; targetPosition?: string }
+    >;
+    expect(passedLR[0].sourcePosition).toBe('right');
+    expect(passedLR[0].targetPosition).toBe('left');
   });
 
   test('selectedNodeId decorates the matching node with selected=true', () => {
@@ -116,5 +130,124 @@ describe('FlowGraph', () => {
     );
     expect(queryByTestId('bg')).toBeNull();
     expect(queryByTestId('controls')).toBeNull();
+  });
+
+  test('decorateEdges truncates labels longer than LABEL_MAX_CHARS', () => {
+    const nodes: Node<FlowNodeData>[] = [
+      { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+      { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
+    ];
+    const longLabel =
+      "tier == 'trivial' AND len(risk_signals) == 0 AND NOT scope_overrides_present";
+    const edges: Edge[] = [{ id: 'a-b', source: 'a', target: 'b', label: longLabel }];
+    render(<FlowGraph nodes={nodes} edges={edges} autoLayout={false} />);
+    const decorated = lastReactFlowProps!.edges as Edge[];
+    const lbl = decorated[0].label as string;
+    expect(lbl.length).toBeLessThanOrEqual(28);
+    expect(lbl.endsWith('…')).toBe(true);
+    expect(longLabel.startsWith(lbl.slice(0, -1))).toBe(true);
+  });
+
+  test('decorateEdges leaves short labels untouched', () => {
+    const nodes: Node<FlowNodeData>[] = [
+      { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+      { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
+    ];
+    const edges: Edge[] = [{ id: 'a-b', source: 'a', target: 'b', label: 'always' }];
+    render(<FlowGraph nodes={nodes} edges={edges} autoLayout={false} />);
+    const decorated = lastReactFlowProps!.edges as Edge[];
+    expect(decorated[0].label).toBe('always');
+  });
+
+  test('decorateEdges enables themed label background badge', () => {
+    const nodes: Node<FlowNodeData>[] = [
+      { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+      { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
+    ];
+    const edges: Edge[] = [{ id: 'a-b', source: 'a', target: 'b', label: 'always' }];
+    render(<FlowGraph nodes={nodes} edges={edges} autoLayout={false} />);
+    const decorated = lastReactFlowProps!.edges as Array<
+      Edge & {
+        labelShowBg?: boolean;
+        labelBgStyle?: { fill?: string };
+      }
+    >;
+    expect(decorated[0].labelShowBg).toBe(true);
+    expect(decorated[0].labelBgStyle?.fill).toContain('--xy-label-bg');
+  });
+
+  test('parallel edges between the same nodes are added to dagre as a multigraph', async () => {
+    // specToGraph emits two transitions between the same (source, target):
+    // a deterministic predicate and an `otherwise` fallback. A non-
+    // multigraph dagre Graph would collapse them under setEdge(v, w, ...)
+    // and lose one label's layout slack. To verify the FIX (not just
+    // that React Flow forwards both edges, which it always would), we
+    // wrap dagre.graphlib.Graph so we can inspect the actual Graph
+    // instance FlowGraph builds: constructor option, edge count,
+    // per-edge names.
+    const dagreMod = await import('dagre');
+    // dagre.graphlib.Graph is a class; we treat it as an unknown
+    // constructor here so we can wrap it without fighting TS over
+    // its overloaded signature.
+    type GraphCtor = new (opts?: Record<string, unknown>) => unknown;
+    const graphlib = dagreMod.default.graphlib as unknown as { Graph: GraphCtor };
+    const realGraph = graphlib.Graph;
+    const instances: unknown[] = [];
+    const ctorCalls: unknown[] = [];
+    // Replace with a wrapper that constructs a real Graph and records
+    // both the args and the instance. Using `function` (not arrow) so
+    // `new`-call semantics work; the inner `new realGraph(opts)` still
+    // gives us the genuine dagre behaviour for the rest of the layout.
+    const Wrapped = function (opts?: Record<string, unknown>) {
+      ctorCalls.push(opts);
+      const inst = new realGraph(opts);
+      instances.push(inst);
+      return inst;
+    } as unknown as GraphCtor;
+    graphlib.Graph = Wrapped;
+    try {
+      const nodes: Node<FlowNodeData>[] = [
+        { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+        { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
+      ];
+      const edges: Edge[] = [
+        { id: 'a-b-0', source: 'a', target: 'b', label: 'predicate' },
+        { id: 'a-b-1', source: 'a', target: 'b', label: 'otherwise' },
+      ];
+      render(<FlowGraph nodes={nodes} edges={edges} autoLayout={true} direction="TB" />);
+
+      // 1. Graph constructor was called with multigraph: true.
+      expect(ctorCalls).toEqual([{ multigraph: true }]);
+
+      // 2. The live Graph instance built by FlowGraph has BOTH edges as
+      //    distinct dagre entries (edgeCount() reflects multigraph state).
+      expect(instances).toHaveLength(1);
+      const instance = instances[0] as unknown as {
+        edgeCount: () => number;
+        edges: () => Array<{ v: string; w: string; name?: string }>;
+      };
+      expect(instance.edgeCount()).toBe(2);
+      const dagreEdges = instance.edges();
+      // 3. Each parallel edge carries a distinct name (the React Flow edge id),
+      //    which is what makes multigraph mode actually disambiguate them.
+      const names = dagreEdges.map((e) => e.name).sort();
+      expect(names).toEqual(['a-b-0', 'a-b-1']);
+    } finally {
+      graphlib.Graph = realGraph;
+    }
+  });
+
+  test('default direction is TB (top-to-bottom) when not specified', () => {
+    const nodes: Node<FlowNodeData>[] = [
+      { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+      { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
+    ];
+    const edges: Edge[] = [{ id: 'a-b', source: 'a', target: 'b' }];
+    // No direction prop. With TB, dagre stacks ranks vertically, so the
+    // y coordinates differ but the x coordinates align.
+    render(<FlowGraph nodes={nodes} edges={edges} autoLayout={true} />);
+    const positioned = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
+    const ys = positioned.map((n) => n.position.y);
+    expect(new Set(ys).size).toBe(2);
   });
 });

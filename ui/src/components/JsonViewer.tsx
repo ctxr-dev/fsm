@@ -18,7 +18,7 @@
  * itself inside `<div>`-based content; safe to embed anywhere.
  */
 
-import { useCallback, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
 import JsonView from '@uiw/react-json-view';
 
@@ -26,6 +26,100 @@ import { copyText } from '../lib/clipboard';
 import { canonicalJson } from '../lib/canonicalJson';
 import { pointerForPath, type JsonPointer } from '../lib/jsonPointer';
 import { Sheet } from './Sheet';
+
+// ---------------------------------------------------------------------------
+// Theme-aware CSS variable maps for @uiw/react-json-view
+// ---------------------------------------------------------------------------
+//
+// The library exposes a `style` prop that accepts CSS variables driving
+// every per-token colour. Defaults are TOO LOW CONTRAST for our slate
+// dark theme: the bundled `dark` theme hard-codes a near-black
+// background and a low-saturation key colour that washes out against
+// our `slate-800` body. W20 fix: pass these explicit maps tuned to
+// match the rest of the dashboard's contrast targets in BOTH themes.
+//
+// Tested: `code-reviewer` event payloads at runDetail.tsx render with
+// readable keys + string values + number values + null markers, plus
+// the panel chrome blends with the surrounding Tailwind dark surface.
+
+const JSON_VIEW_LIGHT: Record<string, string> = {
+  '--w-rjv-font-family': 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+  '--w-rjv-color': '#1e293b',                       // slate-800 base text
+  '--w-rjv-key-string': '#0f172a',                  // slate-900 keys (high contrast)
+  '--w-rjv-background-color': 'transparent',         // sit on parent surface
+  '--w-rjv-line-color': '#cbd5e1',                  // slate-300 connection lines
+  '--w-rjv-arrow-color': '#64748b',                 // slate-500 chevrons
+  '--w-rjv-info-color': '#94a3b8',                  // slate-400 size badges
+  '--w-rjv-update-color': '#b45309',
+  '--w-rjv-copied-color': '#047857',
+  '--w-rjv-copied-success-color': '#10b981',
+  '--w-rjv-curlybraces-color': '#64748b',
+  '--w-rjv-colon-color': '#475569',
+  '--w-rjv-brackets-color': '#64748b',
+  '--w-rjv-quotes-color': '#0f172a',
+  '--w-rjv-quotes-string-color': '#15803d',
+  '--w-rjv-type-string-color': '#15803d',           // emerald-700 strings
+  '--w-rjv-type-int-color': '#1d4ed8',              // blue-700 numbers
+  '--w-rjv-type-float-color': '#1d4ed8',
+  '--w-rjv-type-bigint-color': '#1d4ed8',
+  '--w-rjv-type-boolean-color': '#7c3aed',          // violet-600 booleans
+  '--w-rjv-type-date-color': '#7c3aed',
+  '--w-rjv-type-url-color': '#0ea5e9',
+  '--w-rjv-type-null-color': '#dc2626',             // red-600 null/undefined
+  '--w-rjv-type-nan-color': '#dc2626',
+  '--w-rjv-type-undefined-color': '#dc2626',
+};
+
+const JSON_VIEW_DARK: Record<string, string> = {
+  '--w-rjv-font-family': 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+  '--w-rjv-color': '#e2e8f0',                       // slate-200 base text
+  '--w-rjv-key-string': '#f1f5f9',                  // slate-100 keys (max contrast)
+  '--w-rjv-background-color': 'transparent',
+  '--w-rjv-line-color': '#334155',                  // slate-700 connection lines
+  '--w-rjv-arrow-color': '#94a3b8',                 // slate-400 chevrons
+  '--w-rjv-info-color': '#94a3b8',
+  '--w-rjv-update-color': '#fbbf24',
+  '--w-rjv-copied-color': '#34d399',
+  '--w-rjv-copied-success-color': '#10b981',
+  '--w-rjv-curlybraces-color': '#94a3b8',
+  '--w-rjv-colon-color': '#cbd5e1',
+  '--w-rjv-brackets-color': '#94a3b8',
+  '--w-rjv-quotes-color': '#f1f5f9',
+  '--w-rjv-quotes-string-color': '#86efac',
+  '--w-rjv-type-string-color': '#86efac',           // emerald-300 strings
+  '--w-rjv-type-int-color': '#93c5fd',              // blue-300 numbers
+  '--w-rjv-type-float-color': '#93c5fd',
+  '--w-rjv-type-bigint-color': '#93c5fd',
+  '--w-rjv-type-boolean-color': '#c4b5fd',          // violet-300 booleans
+  '--w-rjv-type-date-color': '#c4b5fd',
+  '--w-rjv-type-url-color': '#7dd3fc',
+  '--w-rjv-type-null-color': '#fca5a5',             // red-300 null/undefined
+  '--w-rjv-type-nan-color': '#fca5a5',
+  '--w-rjv-type-undefined-color': '#fca5a5',
+};
+
+/**
+ * Detect dark mode by reading the `.dark` class on `<html>`, which the
+ * W18c `ThemeApplier` keeps in sync with the user's theme preference
+ * (and with prefers-color-scheme when theme=auto). Updates live via a
+ * `MutationObserver` so cycling theme in the topbar re-renders the
+ * viewer without a page reload.
+ */
+function useIsDark(): boolean {
+  const compute = (): boolean => {
+    if (typeof document === 'undefined') return false;
+    return document.documentElement.classList.contains('dark');
+  };
+  const [isDark, setIsDark] = useState<boolean>(compute);
+  useEffect(() => {
+    if (typeof document === 'undefined') return undefined;
+    const root = document.documentElement;
+    const observer = new MutationObserver(() => setIsDark(compute()));
+    observer.observe(root, { attributes: true, attributeFilter: ['class'] });
+    return () => observer.disconnect();
+  }, []);
+  return isDark;
+}
 
 export type JsonViewerMode = 'inline' | 'expanded';
 
@@ -139,6 +233,15 @@ export function JsonViewer({
   // on the outer container to intercept clicks on keys (their library
   // renders keys as `<span class="w-rjv-object-key">`).
   const treeRef = useRef<HTMLDivElement | null>(null);
+
+  // Theme-aware CSS variable bundle for the library. See module-top
+  // JSON_VIEW_LIGHT / JSON_VIEW_DARK definitions. Re-resolves when the
+  // user cycles the theme via the W18c topbar.
+  const isDark = useIsDark();
+  const jsonViewStyle = useMemo(
+    () => (isDark ? JSON_VIEW_DARK : JSON_VIEW_LIGHT) as JSX.CSSProperties,
+    [isDark],
+  );
 
   const onTreeClick = useCallback(
     (e: MouseEvent) => {
@@ -260,6 +363,7 @@ export function JsonViewer({
           enableClipboard={false}
           highlightUpdates={false}
           shortenTextAfterLength={search ? 0 : 80}
+          style={jsonViewStyle}
         />
       </div>
       <Sheet
@@ -274,6 +378,7 @@ export function JsonViewer({
           displayDataTypes={false}
           enableClipboard={true}
           shortenTextAfterLength={0}
+          style={jsonViewStyle}
         />
       </Sheet>
     </section>

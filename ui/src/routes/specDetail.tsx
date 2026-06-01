@@ -86,12 +86,12 @@ function siblingsOf(detail: SpecDetail, all: SpecSummary[]): SpecSummary[] {
 function GraphPanel({ detail }: { detail: SpecDetail }): JSX.Element {
   const graph = useMemo(() => specToGraph(detail.definition), [detail.definition]);
   return (
-    <div class="h-[60vh] p-3">
+    <div class="h-[70vh] p-3">
       <FlowGraph
         nodes={graph.nodes}
         edges={graph.edges}
         autoLayout={true}
-        direction="LR"
+        direction="TB"
       />
     </div>
   );
