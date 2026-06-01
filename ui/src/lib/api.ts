@@ -279,9 +279,11 @@ export interface CommitSignatureRecord {
 /** Admin: doctor-report payload (mirrors ``ctxr-fsm doctor``). */
 export interface DoctorReport {
   /** Absolute filesystem path of the open DB file when filesystem-
-   *  backed. For non-file backends (`:memory:`, `file:`-URI variants,
-   *  future remote backends) this is the rendered SQLAlchemy URL
-   *  string instead. Distinguish the two cases by checking whether
+   *  backed. For non-file backends (`:memory:`, `file:`-URI variants)
+   *  this is the raw `engine.url.database` segment (e.g. `:memory:`
+   *  or `file:test.db`). When the URL has no `database` component
+   *  (`sqlite://`), falls back to the rendered `str(engine.url)`.
+   *  Distinguish a real path from a sentinel by checking whether
    *  `project_root` / `db_path_relative` are non-null. */
   db_path: string;
   /** Absolute path of the project root that hosts ``.ctxr-fsm/``.

@@ -32,11 +32,16 @@ def looks_like_filesystem_db_path(db_url_database: str | None) -> TypeGuard[str]
       ``mode=ro|rw|rwc|memory`` URI. SQLAlchemy's URL parser
       strips the query string into ``url.query`` so the bare
       ``file:test.db`` value lands in ``url.database`` — looking
-      like a relative filename, but it's not: real filesystem
-      paths cannot start with ``file:`` because POSIX / Windows
-      would need a separator before that token. Anything with the
-      prefix needs URI-aware decoding (which is outside the scope
-      of a display helper) so we treat it as non-filesystem.
+      like a relative filename. We CONSERVATIVELY treat the
+      ``file:`` prefix as the SQLite URI-filename sentinel rather
+      than try to parse the URI here (which would need to honour
+      query args, escape sequences, vfs= overrides, etc.). On
+      POSIX a literal filename ``file:test.db`` IS technically
+      legal (colon is a valid filename character); the very-rare
+      false-positive cost (the operator's ``file:test.db`` on disk
+      doesn't get a portable relative path in the inspector) is
+      acceptable next to the very-common true-positive value (no
+      ``Path(':memory:').resolve()`` on the wire).
 
     Future remote backends (postgresql, mysql, mssql) will populate
     ``url.database`` with a DSN component, not a path — those would

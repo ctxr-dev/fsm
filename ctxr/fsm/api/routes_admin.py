@@ -144,10 +144,13 @@ class DoctorReport(BaseModel):
             "Absolute filesystem path of the open DB file when"
             " filesystem-backed (normalised via :meth:`Path.resolve`)."
             " For non-file backends (``:memory:``, ``file:``-URI"
-            " variants, future remote backends) this is the rendered"
-            " SQLAlchemy URL string instead — clients distinguish the"
-            " two cases by ``project_root`` / ``db_path_relative``"
-            " being ``None``."
+            " variants), this is the raw ``engine.url.database``"
+            " segment — ``:memory:`` or ``file:test.db`` —"
+            " surfacing what SQLAlchemy resolved from the URL. When"
+            " the URL has no ``database`` component (``sqlite://``),"
+            " falls back to the rendered ``str(engine.url)``. Clients"
+            " distinguish a real path from a sentinel by checking"
+            " ``project_root`` / ``db_path_relative`` for ``None``."
         ),
     )
     project_root: str | None = Field(

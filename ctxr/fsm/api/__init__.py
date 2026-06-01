@@ -231,11 +231,14 @@ class ProjectMetadata(BaseModel):
             " filesystem-backed (normalised via :meth:`Path.resolve` so"
             " the value is uniform across hosts regardless of how the"
             " engine was opened). For non-file backends (``:memory:``,"
-            " ``file:``-URI variants, future remote backends) this is"
-            " the rendered SQLAlchemy URL string instead — UI clients"
-            " should treat the value as opaque + paired with the"
-            " ``project_root`` / ``db_path_relative`` nullability to"
-            " tell the two cases apart."
+            " ``file:``-URI variants), this is the raw"
+            " ``engine.url.database`` segment — e.g. ``:memory:`` or"
+            " ``file:test.db`` — so the operator sees exactly what"
+            " SQLAlchemy resolved from the URL. When the URL has no"
+            " ``database`` component at all (``sqlite://``), this"
+            " falls back to the rendered ``str(engine.url)``. Clients"
+            " distinguish a real path from a sentinel by checking"
+            " ``project_root`` / ``db_path_relative`` for ``None``."
         ),
     )
     project_root: str | None = Field(
