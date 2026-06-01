@@ -71,6 +71,14 @@ function looksLikeMarkdown(text: string): boolean {
  *  emphasis, links (still allowed; the user clicks intentionally). */
 function renderMarkdown(text: string): string {
   const raw = marked.parse(text, { async: false }) as string;
+  // <input> is intentionally NOT forbidden: GFM task lists generate
+  // `<input type="checkbox" disabled>` which is benign (read-only, no
+  // outbound effect) and stripping it would render `- [x] done` as a
+  // bullet with no checkbox at all — a visible regression from the
+  // GFM contract callers expect. DOMPurify's default attribute
+  // sanitiser still drops onclick / onerror / etc. The other form
+  // controls stay forbidden because they invite spec authors to
+  // simulate input forms inside a viewer surface.
   return DOMPurify.sanitize(raw, {
     USE_PROFILES: { html: true },
     FORBID_TAGS: [
@@ -88,7 +96,6 @@ function renderMarkdown(text: string): string {
       'svg',
       'math',
       'form',
-      'input',
       'button',
       'select',
       'textarea',

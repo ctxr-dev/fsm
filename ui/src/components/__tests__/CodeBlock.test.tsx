@@ -126,6 +126,20 @@ describe('CodeBlock', () => {
     expect(queryByText('Rendered')).toBeNull();
   });
 
+  test('rendered markdown preserves GFM task-list checkboxes (disabled inputs)', () => {
+    // Comment in CodeBlock claims GFM features render; verify the
+    // task-list path actually does — the sanitiser must NOT strip
+    // the disabled checkbox markup marked.js generates for `- [ ]`
+    // and `- [x]` items.
+    const md = '- [ ] open task\n- [x] done task\n';
+    const { container } = render(<CodeBlock text={md} />);
+    const inputs = container.querySelectorAll('.cb-markdown input[type=checkbox]');
+    expect(inputs.length).toBe(2);
+    expect((inputs[0] as HTMLInputElement).disabled).toBe(true);
+    expect((inputs[1] as HTMLInputElement).disabled).toBe(true);
+    expect((inputs[1] as HTMLInputElement).checked).toBe(true);
+  });
+
   test('rendered markdown forbids img / svg / iframe / script for security', () => {
     const dangerous = [
       '# Safe',
