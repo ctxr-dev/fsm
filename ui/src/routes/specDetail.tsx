@@ -37,6 +37,7 @@ import {
 import {
   api,
   ApiError,
+  walkAllPages,
   type RunSummary,
   type SpecDetail,
   type SpecSummary,
@@ -401,7 +402,12 @@ function RunsPanel({ spec, navigate }: RunsPanelProps): JSX.Element {
 
   useEffect(() => {
     let cancelled = false;
-    api.listRuns({ limit: 500 })
+    // Need every run of every sibling version to filter client-side
+    // by ``matchIds`` — walk the paginated listRuns until exhausted
+    // rather than rendering a per-spec <Pagination>. (This panel
+    // could be converted to a server-side filter in a follow-up if
+    // the population grows past the 50-page safety stop.)
+    walkAllPages((p) => api.listRuns(p), {})
       .then((all) => {
         if (cancelled) return;
         setRuns(all.filter((r) => matchIds.has(r.fsm_spec_id)));
@@ -635,18 +641,25 @@ export function SpecDetailRoute(): JSX.Element {
 
   useEffect(() => {
     let cancelled = false;
-    api.listSpecs()
+    // The SpecSiblings tree needs every registered spec to find
+    // sibling versions of the current slug, so walk the paginated
+    // listSpecs to enumerate the full population.
+    walkAllPages((p) => api.listSpecs(p), {})
       .then((all) => { if (!cancelled) setAllSpecs(all); })
       .catch(() => { if (!cancelled) setAllSpecs([]); });
     return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
-    // Compute run count across all sibling versions for the header badge.
+    // Compute run count across all sibling versions for the header
+    // badge. We still need the run rows themselves (not just the
+    // listRuns page envelope's ``total``) because the count is
+    // filtered client-side by ``matchIds`` — the wire endpoint
+    // doesn't currently expose a multi-spec filter.
     if (!detail || !allSpecs) return;
     let cancelled = false;
     const matchIds = new Set(allSpecs.filter((s) => s.slug === detail.slug).map((s) => s.id));
-    api.listRuns({ limit: 500 })
+    walkAllPages((p) => api.listRuns(p), {})
       .then((rs) => { if (!cancelled) setRunCount(rs.filter((r) => matchIds.has(r.fsm_spec_id)).length); })
       .catch(() => { if (!cancelled) setRunCount(null); });
     return () => { cancelled = true; };

@@ -59,3 +59,6 @@ export type { FlowGraphProps, FlowNodeData, FlowNodeKind } from './FlowGraph';
 
 export { Tooltip } from './Tooltip';
 export type { TooltipProps, TooltipPlacement } from './Tooltip';
+
+export { Pagination } from './Pagination';
+export type { PaginationPage, PaginationProps } from './Pagination';

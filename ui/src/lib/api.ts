@@ -307,19 +307,50 @@ export interface DoctorReport {
 // Request parameter shapes
 // ---------------------------------------------------------------------------
 
+/**
+ * Generic page envelope returned by every list endpoint.
+ *
+ * Mirrors :class:`Page` on the Python side (ctxr/fsm/api/_pagination.py)
+ * verbatim — ``items`` is the slice, ``total`` is the population size,
+ * ``has_next`` is derived (kept on the wire so a client that lost the
+ * ``page`` / ``page_size`` can still chain). The post-W22b2 wire shape
+ * for every list endpoint is ``Page<T>``; the only legacy raw-array
+ * endpoints left are the ones that don't paginate (``getStateTree``,
+ * ``getRun``, etc., which return a single document).
+ */
+export interface Page<T> {
+  items: T[];
+  page: number;
+  page_size: number;
+  total: number;
+  has_next: boolean;
+  sort: string;
+}
+
+/** Common pagination params used by every paginated list endpoint. */
+export interface PageParams {
+  page?: number;
+  page_size?: number;
+  sort?: string;
+}
+
 /** Query parameters for ``GET /runs``. */
-export interface ListRunsParams {
+export interface ListRunsParams extends PageParams {
   status?: string;
   since?: string;
-  limit?: number;
-  offset?: number;
 }
 
 /** Query parameters for ``GET /runs/{id}/events``. */
-export interface GetEventsParams {
+export interface GetEventsParams extends PageParams {
   since_seq?: number;
   kinds?: string[];
-  limit?: number;
+}
+
+/** Query parameters for ``GET /events``. */
+export interface ListEventsParams extends PageParams {
+  run_id: string;
+  since_seq?: number;
+  kinds?: string[];
 }
 
 /** Body of ``POST /runs/{run_id}/resume``. */
@@ -340,15 +371,18 @@ export interface RegisterSpecBody {
 }
 
 /** Query parameters for ``GET /admin/journal_txns``. */
-export interface ListJournalTxnsParams {
+export interface ListJournalTxnsParams extends PageParams {
   status?: 'pending' | 'ready_to_finalise' | 'finalised';
-  limit?: number;
 }
 
 /** Query parameters for ``GET /admin/tool_calls``. */
-export interface ListToolCallsParams {
+export interface ListToolCallsParams extends PageParams {
   run_id: string;
-  limit?: number;
+}
+
+/** Query parameters for ``GET /specs/{slug}/versions``. */
+export interface ListSpecVersionsParams extends PageParams {
+  project_slug?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -544,12 +578,13 @@ export class ApiClient {
   // -------------------------------------------------------------------------
 
   /** ``GET /runs`` — list runs with optional filters. */
-  listRuns(params: ListRunsParams = {}): Promise<RunSummary[]> {
-    return this.request<RunSummary[]>('GET', '/runs', {
+  listRuns(params: ListRunsParams = {}): Promise<Page<RunSummary>> {
+    return this.request<Page<RunSummary>>('GET', '/runs', {
       status: params.status,
       since: params.since,
-      limit: params.limit,
-      offset: params.offset,
+      page: params.page,
+      page_size: params.page_size,
+      sort: params.sort,
     });
   }
 
@@ -567,14 +602,16 @@ export class ApiClient {
   }
 
   /** ``GET /runs/{id}/events`` — slice of the run's event journal. */
-  getEvents(id: string, params: GetEventsParams = {}): Promise<Event[]> {
-    return this.request<Event[]>(
+  getEvents(id: string, params: GetEventsParams = {}): Promise<Page<Event>> {
+    return this.request<Page<Event>>(
       'GET',
       `/runs/${encodeURIComponent(id)}/events`,
       {
         since_seq: params.since_seq,
         kinds: params.kinds,
-        limit: params.limit,
+        page: params.page,
+        page_size: params.page_size,
+        sort: params.sort,
       },
     );
   }
@@ -615,19 +652,28 @@ export class ApiClient {
   // -------------------------------------------------------------------------
 
   /** ``GET /specs`` — every registered spec across every project. */
-  listSpecs(): Promise<SpecSummary[]> {
-    return this.request<SpecSummary[]>('GET', '/specs');
+  listSpecs(params: PageParams = {}): Promise<Page<SpecSummary>> {
+    return this.request<Page<SpecSummary>>('GET', '/specs', {
+      page: params.page,
+      page_size: params.page_size,
+      sort: params.sort,
+    });
   }
 
   /** ``GET /specs/{slug}/versions`` — version history for one FSM slug. */
   getSpecVersions(
     slug: string,
-    projectSlug?: string,
-  ): Promise<SpecVersion[]> {
-    return this.request<SpecVersion[]>(
+    params: ListSpecVersionsParams = {},
+  ): Promise<Page<SpecVersion>> {
+    return this.request<Page<SpecVersion>>(
       'GET',
       `/specs/${encodeURIComponent(slug)}/versions`,
-      projectSlug ? { project_slug: projectSlug } : undefined,
+      {
+        project_slug: params.project_slug,
+        page: params.page,
+        page_size: params.page_size,
+        sort: params.sort,
+      },
     );
   }
 
@@ -657,13 +703,21 @@ export class ApiClient {
   // -------------------------------------------------------------------------
 
   /** ``GET /producers`` — bus topology, producer side. */
-  listProducers(): Promise<Producer[]> {
-    return this.request<Producer[]>('GET', '/producers');
+  listProducers(params: PageParams = {}): Promise<Page<Producer>> {
+    return this.request<Page<Producer>>('GET', '/producers', {
+      page: params.page,
+      page_size: params.page_size,
+      sort: params.sort,
+    });
   }
 
   /** ``GET /consumers`` — bus topology, consumer side. */
-  listConsumers(): Promise<Consumer[]> {
-    return this.request<Consumer[]>('GET', '/consumers');
+  listConsumers(params: PageParams = {}): Promise<Page<Consumer>> {
+    return this.request<Page<Consumer>>('GET', '/consumers', {
+      page: params.page,
+      page_size: params.page_size,
+      sort: params.sort,
+    });
   }
 
   /** ``POST /consumers/{id}/ack`` — acknowledge a batch of events. */
@@ -683,23 +737,31 @@ export class ApiClient {
   /** ``GET /admin/journal_txns`` — journal-txn ledger across runs. */
   listJournalTxns(
     params: ListJournalTxnsParams = {},
-  ): Promise<JournalTxn[]> {
-    return this.request<JournalTxn[]>('GET', '/admin/journal_txns', {
+  ): Promise<Page<JournalTxn>> {
+    return this.request<Page<JournalTxn>>('GET', '/admin/journal_txns', {
       status: params.status,
-      limit: params.limit,
+      page: params.page,
+      page_size: params.page_size,
+      sort: params.sort,
     });
   }
 
   /** ``GET /admin/locks`` — every currently-held lock row. */
-  listLocks(): Promise<Lock[]> {
-    return this.request<Lock[]>('GET', '/admin/locks');
+  listLocks(params: PageParams = {}): Promise<Page<Lock>> {
+    return this.request<Page<Lock>>('GET', '/admin/locks', {
+      page: params.page,
+      page_size: params.page_size,
+      sort: params.sort,
+    });
   }
 
   /** ``GET /admin/tool_calls`` — tool-call audit log for a run. */
-  listToolCalls(params: ListToolCallsParams): Promise<ToolCall[]> {
-    return this.request<ToolCall[]>('GET', '/admin/tool_calls', {
+  listToolCalls(params: ListToolCallsParams): Promise<Page<ToolCall>> {
+    return this.request<Page<ToolCall>>('GET', '/admin/tool_calls', {
       run_id: params.run_id,
-      limit: params.limit,
+      page: params.page,
+      page_size: params.page_size,
+      sort: params.sort,
     });
   }
 
@@ -713,11 +775,19 @@ export class ApiClient {
   }
 
   /** ``GET /admin/commit_signatures`` — commit-signature timeline. */
-  listCommitSignatures(runId: string): Promise<CommitSignatureRecord[]> {
-    return this.request<CommitSignatureRecord[]>(
+  listCommitSignatures(
+    runId: string,
+    params: PageParams = {},
+  ): Promise<Page<CommitSignatureRecord>> {
+    return this.request<Page<CommitSignatureRecord>>(
       'GET',
       '/admin/commit_signatures',
-      { run_id: runId },
+      {
+        run_id: runId,
+        page: params.page,
+        page_size: params.page_size,
+        sort: params.sort,
+      },
     );
   }
 
@@ -725,6 +795,60 @@ export class ApiClient {
   doctor(): Promise<DoctorReport> {
     return this.request<DoctorReport>('POST', '/admin/db/doctor');
   }
+}
+
+/**
+ * Maximum page size the server accepts in a single request. Mirrors
+ * ``MAX_PAGE_SIZE`` in ``ctxr/fsm/api/_pagination.py`` (200). Exposed so
+ * routes that legitimately need to enumerate the full population
+ * (e.g. spec catalog grouping, drift dashboard seeding) can request
+ * the largest page in one round trip.
+ */
+export const MAX_PAGE_SIZE = 200;
+
+/**
+ * Walk every page of a paginated endpoint and return the flattened
+ * row list.
+ *
+ * The post-W22b2 wire format paginates every list endpoint, but a few
+ * UI surfaces still need the FULL population (derivative aggregations
+ * like "count runs per spec slug", sibling tree expansion, drift
+ * dashboard seeding). Rather than each route re-implementing the same
+ * "loop with ``has_next`` + safety stop" pattern, this helper owns it.
+ *
+ * Pages are fetched serially so the server's paginator sees a stable
+ * cursor / sort across requests. ``page_size`` is fixed at
+ * :const:`MAX_PAGE_SIZE` so we minimise the round-trip count.
+ * ``maxPages`` (default 50 = 10,000 rows at max page size) is a
+ * safety stop that catches runaway loops if a future server bug
+ * returns ``has_next: true`` indefinitely; callers that legitimately
+ * need more can raise it explicitly.
+ *
+ * Example:
+ *
+ * ```ts
+ * const allSpecs = await walkAllPages(
+ *   (p) => api.listSpecs(p),
+ *   {},
+ * );
+ * ```
+ */
+export async function walkAllPages<T, P extends PageParams>(
+  fetcher: (params: P) => Promise<Page<T>>,
+  baseParams: Omit<P, 'page' | 'page_size'>,
+  maxPages = 50,
+): Promise<T[]> {
+  const out: T[] = [];
+  for (let page = 1; page <= maxPages; page += 1) {
+    const env = await fetcher({
+      ...(baseParams as P),
+      page,
+      page_size: MAX_PAGE_SIZE,
+    } as P);
+    out.push(...env.items);
+    if (!env.has_next) return out;
+  }
+  return out;
 }
 
 /**

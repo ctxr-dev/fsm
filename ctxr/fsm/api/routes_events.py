@@ -81,6 +81,12 @@ from sse_starlette.sse import EventSourceResponse
 from starlette.concurrency import run_in_threadpool
 
 from ctxr.fsm.api._deps import ProjectDep, require_auth
+from ctxr.fsm.api._pagination import (
+    Page,
+    PageParams,
+    make_page_params,
+    paginate_sequence,
+)
 from ctxr.fsm.sqlite import Consumer, Event, Producer
 
 __all__ = [
@@ -127,6 +133,36 @@ _SSE_CONSUMER_KIND: str = "http_sse_subscriber"
 # same rationale as MCP's ``_MAX_EVENTS_HARD_CAP`` — a misconfigured
 # client should not be able to pull a million rows in one request.
 _POLL_HARD_CAP: int = 1000
+
+
+# ── Pagination factories ──────────────────────────────────────────────
+# Each list endpoint binds its own ``PageParams`` factory at module
+# scope so the allow-list of sort keys is endpoint-specific (an
+# unknown ``?sort=`` returns 422 with the allowed values rather than
+# silently falling back). The defaults below match each endpoint's
+# pre-W22b2 implicit ordering.
+#
+# ``events.seq`` is the per-run monotonic counter, so the previous
+# "natural insertion order" is equivalent to ``seq ASC``; we expose
+# both directions for symmetry with the rest of the API.
+EventsPageParams = make_page_params(
+    default_sort="seq_asc",
+    allowed_sorts=("seq_asc", "seq_desc"),
+)
+
+# Producers / consumers were previously ordered by ``id`` (UUIDv7,
+# which is time-ordered) but the operator wants most-recent first by
+# the human-readable ``created_at`` column. ``id_asc`` is preserved
+# as an opt-in because tooling that already keys off insertion order
+# should still be able to ask for it.
+ProducersPageParams = make_page_params(
+    default_sort="created_at_desc",
+    allowed_sorts=("created_at_desc", "created_at_asc", "id_asc"),
+)
+ConsumersPageParams = make_page_params(
+    default_sort="created_at_desc",
+    allowed_sorts=("created_at_desc", "created_at_asc", "id_asc"),
+)
 
 
 # ── Router ────────────────────────────────────────────────────────────
@@ -429,11 +465,12 @@ async def stream_events(
 
 @router.get(
     "/events",
-    response_model=list[Event],
+    response_model=Page[Event],
     summary="One-shot poll of events for a run.",
 )
 async def list_events(
     project: ProjectDep,
+    params: Annotated[PageParams, Depends(EventsPageParams)],
     run_id: Annotated[
         UUID,
         Query(description="The run whose events to fetch."),
@@ -458,47 +495,58 @@ async def list_events(
             ),
         ),
     ] = None,
-    limit: Annotated[
-        int,
-        Query(
-            ge=1,
-            le=_POLL_HARD_CAP,
-            description=(
-                "Maximum number of events to return. Hard-capped at "
-                f"{_POLL_HARD_CAP} server-side."
-            ),
-        ),
-    ] = 100,
-) -> list[Event]:
-    """Return up to ``limit`` events for ``run_id``, ordered by ``seq``.
+) -> Page[Event]:
+    """Return a page of events for ``run_id``, ordered per ``params.sort``.
 
-    Wraps :meth:`EventsRepo.by_run` which is an iterator; we
-    materialise it server-side under the ``limit`` cap so the JSON
-    response is bounded. The cursor (``since_seq``) is client-held —
-    callers track the last ``seq`` they received and pass it back on
-    the next call. Unlike the SSE stream, no delivery rows are
-    touched: this is a pure read.
+    Delegates to :meth:`EventsRepo.by_run_paged`, which runs a single
+    SQL statement (filtered WHERE + ``COUNT(*) OVER ()``) so the
+    handler never materialises the full journal just to slice off
+    one page. The pre-W22b2-iter draft pre-loaded every matching
+    row via the iterator-based :meth:`by_run` — fine for a small
+    fixture, a DoS vector for a long-lived run with hundreds of
+    thousands of events. Removing the cap from the wire while
+    keeping the in-memory drain would be strictly worse than the
+    pre-pagination ``limit`` parameter; the paged repo method
+    avoids the trap entirely.
+
+    The cursor (``since_seq``) is client-held — callers track the
+    last ``seq`` they received and pass it back on the next call.
+    Unlike the SSE stream, no delivery rows are touched: this is
+    a pure read.
     """
     normalised_kinds = _normalise_kinds(kinds)
     run_id_str = str(run_id)
 
-    def _read() -> list[Event]:
-        """Sync read body — invoked in the threadpool."""
-        collected: list[Event] = []
+    def _read() -> tuple[list[Event], int]:
+        """Sync read body — invoked in the threadpool.
+
+        :meth:`EventsRepo.by_run_paged` returns the bus-side
+        :class:`ctxr.fsm.sqlite.repos_events.Event` while the
+        handler's response_model is the lifecycle-side
+        :class:`ctxr.fsm.sqlite.repos_core.Event` (re-exported by
+        :mod:`ctxr.fsm.sqlite`). The two classes have field-
+        identical shapes — see the explanatory note in
+        ``ctxr/fsm/sqlite/__init__.py`` — but mypy treats them as
+        distinct. We bridge via ``model_dump()`` + ``model_validate``;
+        the cost is one dict round-trip per row (cheap relative to
+        the SQL query) and the upside is that the OpenAPI schema
+        stays consistent with the lifecycle ``Event`` definition.
+        """
         with project.session_factory() as session:
-            iterator = project.events.by_run(
+            bus_items, total = project.events.by_run_paged(
                 session,
                 run_id=run_id_str,
                 since_seq=since_seq,
                 kinds=normalised_kinds,
+                sort_axis=params.sort,
+                offset=params.offset,
+                limit=params.page_size,
             )
-            for event in iterator:
-                collected.append(event)
-                if len(collected) >= limit:
-                    break
-        return collected
+        items = [Event.model_validate(e.model_dump()) for e in bus_items]
+        return items, total
 
-    return await run_in_threadpool(_read)
+    items, total = await run_in_threadpool(_read)
+    return Page[Event].from_items_and_total(items, total, params=params)
 
 
 # ── Producers / consumers registry dumps ──────────────────────────────
@@ -506,33 +554,49 @@ async def list_events(
 
 @router.get(
     "/producers",
-    response_model=list[Producer],
+    response_model=Page[Producer],
     summary="List every registered event producer.",
 )
-async def list_producers(project: ProjectDep) -> list[Producer]:
-    """Return every producer currently registered on the bus.
+async def list_producers(
+    project: ProjectDep,
+    params: Annotated[PageParams, Depends(ProducersPageParams)],
+) -> Page[Producer]:
+    """Return a page of producers currently registered on the bus.
 
-    Ordered by ``id`` (UUIDv7) which approximates registration order.
-    Used by the UI's bus-topology view and by operators eyeballing
-    "who is producing what on this database".
+    Default sort is ``created_at_desc`` (most recently registered
+    first); ``id_asc`` recovers the previous UUIDv7-insertion-order
+    view. Used by the UI's bus-topology view and by operators
+    eyeballing "who is producing what on this database".
     """
 
     def _read() -> list[Producer]:
         with project.session_factory() as session:
             return project.producers.list(session)
 
-    return await run_in_threadpool(_read)
+    producers = await run_in_threadpool(_read)
+    # The repo currently returns rows in ``id ASC`` order. Sort
+    # in-process to honour the requested ordering — paginate_sequence
+    # slices what we give it without re-ordering.
+    if params.sort == "created_at_desc":
+        producers = sorted(producers, key=lambda p: p.created_at, reverse=True)
+    elif params.sort == "created_at_asc":
+        producers = sorted(producers, key=lambda p: p.created_at)
+    # ``id_asc`` is already the repo's native order.
+    return paginate_sequence(producers, params=params)
 
 
 @router.get(
     "/consumers",
-    response_model=list[Consumer],
+    response_model=Page[Consumer],
     summary="List every registered event consumer.",
 )
-async def list_consumers(project: ProjectDep) -> list[Consumer]:
-    """Return every consumer currently registered on the bus.
+async def list_consumers(
+    project: ProjectDep,
+    params: Annotated[PageParams, Depends(ConsumersPageParams)],
+) -> Page[Consumer]:
+    """Return a page of consumers currently registered on the bus.
 
-    Mirrors :func:`list_producers`: same ordering, same purpose
+    Mirrors :func:`list_producers`: same sort options, same purpose
     (topology view), different table. The ``kind`` column on each
     row tells you whether a consumer is the engine, an MCP client,
     an HTTP SSE subscriber, etc.
@@ -542,7 +606,13 @@ async def list_consumers(project: ProjectDep) -> list[Consumer]:
         with project.session_factory() as session:
             return project.consumers.list(session)
 
-    return await run_in_threadpool(_read)
+    consumers = await run_in_threadpool(_read)
+    if params.sort == "created_at_desc":
+        consumers = sorted(consumers, key=lambda c: c.created_at, reverse=True)
+    elif params.sort == "created_at_asc":
+        consumers = sorted(consumers, key=lambda c: c.created_at)
+    # ``id_asc`` is already the repo's native order.
+    return paginate_sequence(consumers, params=params)
 
 
 # ── Explicit ack endpoint ─────────────────────────────────────────────

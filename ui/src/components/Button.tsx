@@ -15,6 +15,14 @@ export interface ButtonProps {
   className?: string;
   /** ARIA label override (use when the button has icon-only children). */
   'aria-label'?: string;
+  /**
+   * ARIA current marker. Set to ``"page"`` for the active page button
+   * inside a Pagination control; ``"true"`` / ``"step"`` for other
+   * "you are here" affordances (active step in a wizard, etc.).
+   * AT users get an explicit "current page" announcement that the
+   * visual ``primary`` variant cannot convey on its own.
+   */
+  'aria-current'?: 'page' | 'step' | 'true' | 'false';
   /** Form id for type="submit" buttons living outside the form. */
   form?: string;
   /** Autofocus on mount — opt in only. */
@@ -67,6 +75,7 @@ export function Button({
   children,
   className = '',
   'aria-label': ariaLabel,
+  'aria-current': ariaCurrent,
   form,
   autofocus,
   title,
@@ -96,6 +105,7 @@ export function Button({
       aria-busy={loading || undefined}
       aria-disabled={isDisabled || undefined}
       aria-label={ariaLabel}
+      aria-current={ariaCurrent}
       form={form}
       autofocus={autofocus}
       title={title}

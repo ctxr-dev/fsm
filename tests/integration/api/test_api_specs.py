@@ -287,9 +287,13 @@ def test_get_specs_lists_every_registered_spec() -> None:
         response = client.get("/api/v1/specs")
 
     assert response.status_code == 200, response.text
-    rows = response.json()
+    page = response.json()
+    rows = page["items"]
     assert isinstance(rows, list)
     assert len(rows) == 3
+    assert page["total"] == 3
+    assert page["page"] == 1
+    assert page["has_next"] is False
 
     # Canonical ordering: project_slug asc, slug asc, version asc.
     triples = [(row["project_slug"], row["slug"], row["version"]) for row in rows]
@@ -329,7 +333,11 @@ def test_get_specs_returns_empty_list_on_fresh_db() -> None:
         response = client.get("/api/v1/specs")
 
     assert response.status_code == 200, response.text
-    assert response.json() == []
+    page = response.json()
+    assert page["items"] == []
+    assert page["total"] == 0
+    assert page["page"] == 1
+    assert page["has_next"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -364,13 +372,15 @@ def test_get_versions_lists_every_version_for_slug() -> None:
 
         response = client.get(
             f"/api/v1/specs/{slug}/versions",
-            params={"project_slug": "alpha"},
+            params={"project_slug": "alpha", "sort": "version_asc"},
         )
 
     assert response.status_code == 200, response.text
-    rows = response.json()
+    page = response.json()
+    rows = page["items"]
     assert isinstance(rows, list)
     assert len(rows) == 2
+    assert page["total"] == 2
 
     versions = [row["version"] for row in rows]
     assert versions == [1, 2], (
@@ -403,11 +413,11 @@ def test_get_versions_scopes_to_requested_project_slug() -> None:
         alpha_rows = client.get(
             f"/api/v1/specs/{slug}/versions",
             params={"project_slug": "alpha"},
-        ).json()
+        ).json()["items"]
         beta_rows = client.get(
             f"/api/v1/specs/{slug}/versions",
             params={"project_slug": "beta"},
-        ).json()
+        ).json()["items"]
 
     assert len(alpha_rows) == 1
     assert len(beta_rows) == 1
@@ -435,7 +445,11 @@ def test_get_versions_returns_empty_for_unknown_slug() -> None:
         )
 
     assert response.status_code == 200, response.text
-    assert response.json() == []
+    page = response.json()
+    assert page["items"] == []
+    assert page["total"] == 0
+    assert page["page"] == 1
+    assert page["has_next"] is False
 
 
 def test_get_versions_returns_empty_for_unknown_project_slug() -> None:
@@ -465,7 +479,11 @@ def test_get_versions_returns_empty_for_unknown_project_slug() -> None:
         )
 
     assert response.status_code == 200, response.text
-    assert response.json() == []
+    page = response.json()
+    assert page["items"] == []
+    assert page["total"] == 0
+    assert page["page"] == 1
+    assert page["has_next"] is False
 
 
 # ---------------------------------------------------------------------------

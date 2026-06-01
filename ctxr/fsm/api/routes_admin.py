@@ -44,7 +44,8 @@ Design notes
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated, Any
+from types import SimpleNamespace
+from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
@@ -54,6 +55,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from starlette.concurrency import run_in_threadpool
 
 from ctxr.fsm.api._deps import ProjectDep, require_auth
+from ctxr.fsm.api._pagination import (
+    Page,
+    PageParams,
+    make_page_params,
+    paginate_sa_select,
+)
 from ctxr.fsm.api._paths import looks_like_filesystem_db_path, project_root_and_relative
 from ctxr.fsm.core.models import JournalStatus
 from ctxr.fsm.sqlite import (
@@ -68,6 +75,30 @@ from ctxr.fsm.sqlite.models_core import LockTable
 from ctxr.fsm.sqlite.models_enforcement import (
     CommitSignatureTable,
     JournalTxnTable,
+)
+
+# ── Per-route pagination factories ──────────────────────────────────
+# Each list endpoint binds its own ``PageParams`` factory at module
+# scope. The factory captures the default + allowed sort keys so the
+# OpenAPI schema documents them and unknown keys 422 at the edge.
+JournalTxnsPageParams = make_page_params(
+    default_sort="started_at_desc",
+    allowed_sorts=("started_at_desc", "started_at_asc"),
+)
+
+LocksPageParams = make_page_params(
+    default_sort="acquired_at_desc",
+    allowed_sorts=("acquired_at_desc", "acquired_at_asc"),
+)
+
+ToolCallsPageParams = make_page_params(
+    default_sort="created_at_desc",
+    allowed_sorts=("created_at_desc", "created_at_asc"),
+)
+
+CommitSignaturesPageParams = make_page_params(
+    default_sort="created_at_desc",
+    allowed_sorts=("created_at_desc", "created_at_asc"),
 )
 
 __all__ = [
@@ -224,70 +255,127 @@ _VALID_JOURNAL_STATUSES: tuple[str, ...] = (
 )
 
 
-def _select_journal_txns(
+def _select_journal_txns_page(
     session_factory: sessionmaker[Session],
     *,
     status: JournalStatus | None,
-    limit: int,
-) -> list[JournalTxn]:
-    """Return journal-txn rows across all runs, optionally filtered by status.
+    params: PageParams,
+) -> Page[JournalTxn]:
+    """Return a page of journal-txn rows, optionally filtered by status.
 
-    Sorted ``started_at DESC`` so the freshest activity surfaces
-    first. The ORM rows are projected through
-    :meth:`JournalRepo._row_to_txn` so the API speaks the same
-    Pydantic shape the repo speaks — we re-implement the projection
-    inline (rather than calling the private method) to keep this
-    module's dependency on the repo at the public-symbol boundary.
+    Default sort surfaces the freshest activity first (``started_at
+    DESC, id DESC``); ``params.sort = "started_at_asc"`` inverts both
+    keys so the timeline reads chronologically. Rows are projected
+    through :meth:`JournalRepo._row_to_txn` — the canonical adapter
+    that owns the JSON-decode + datetime-parse boundary — so the wire
+    shape stays byte-equivalent with the rest of the substrate.
+
+    The base ``select()`` is built with its ``order_by`` clause already
+    applied; :func:`paginate_sa_select` then bolts on
+    ``COUNT(*) OVER ()`` plus ``LIMIT/OFFSET`` in one round-trip so
+    the envelope's ``total`` is consistent with the page slice even
+    under concurrent writes.
     """
     from ctxr.fsm.sqlite.repos_locks_journal import JournalRepo
 
-    with session_factory() as session:
-        stmt = select(JournalTxnTable).order_by(
+    if params.sort == "started_at_asc":
+        order_clause = (
+            JournalTxnTable.started_at.asc(),
+            JournalTxnTable.id.asc(),
+        )
+    else:  # "started_at_desc" — the default
+        order_clause = (
             JournalTxnTable.started_at.desc(),
             JournalTxnTable.id.desc(),
         )
-        if status is not None:
-            stmt = stmt.where(JournalTxnTable.status == status.value)
-        stmt = stmt.limit(limit)
-        rows = session.execute(stmt).scalars().all()
-        # ``_row_to_txn`` is the canonical projection — using it
-        # guarantees byte-equivalence with the rest of the substrate
-        # without re-implementing the JSON decode + datetime parse.
-        return [JournalRepo._row_to_txn(row) for row in rows]
+
+    stmt = select(JournalTxnTable).order_by(*order_clause)
+    if status is not None:
+        stmt = stmt.where(JournalTxnTable.status == status.value)
+
+    def _factory(mapping: Any) -> JournalTxn:
+        # ``conn.execute()`` over an ORM-targeted ``select()`` yields
+        # Core rows whose ``_mapping`` is column-name keyed. Wrapping
+        # in :class:`SimpleNamespace` gives the existing private
+        # ``_row_to_txn`` projector the attribute-style row it expects
+        # without forcing us to duplicate its decode logic here.
+        shim = SimpleNamespace(**{k: v for k, v in mapping.items() if k != "__page_total__"})
+        return JournalRepo._row_to_txn(cast(JournalTxnTable, shim))
+
+    with session_factory() as session:
+        return paginate_sa_select(
+            session.connection(),
+            stmt,
+            params=params,
+            row_factory=_factory,
+        )
 
 
-def _select_locks(session_factory: sessionmaker[Session]) -> list[Lock]:
-    """Return every lock row currently in the table.
+def _select_locks_page(
+    session_factory: sessionmaker[Session],
+    *,
+    params: PageParams,
+) -> Page[Lock]:
+    """Return a page of lock rows, freshest acquisition first by default.
 
-    The locks table is intentionally tiny (one row per held run); we
-    don't paginate. Sorted by ``acquired_at DESC`` so the most-recently
-    grabbed lock appears first.
+    The locks table is intentionally tiny (one row per actively-locked
+    run) so a single page typically holds every row; the envelope is
+    still useful so the UI gets a consistent shape across list
+    endpoints. ``params.sort = "acquired_at_asc"`` reverses the order
+    for "oldest lock first" diagnostics.
     """
     from ctxr.fsm.sqlite.repos_locks_journal import LocksRepo
 
+    if params.sort == "acquired_at_asc":
+        order_col = LockTable.acquired_at.asc()
+    else:  # "acquired_at_desc" — the default
+        order_col = LockTable.acquired_at.desc()
+
+    stmt = select(LockTable).order_by(order_col)
+
+    def _factory(mapping: Any) -> Lock:
+        shim = SimpleNamespace(**{k: v for k, v in mapping.items() if k != "__page_total__"})
+        return LocksRepo._row_to_lock(cast(LockTable, shim))
+
     with session_factory() as session:
-        stmt = select(LockTable).order_by(LockTable.acquired_at.desc())
-        rows = session.execute(stmt).scalars().all()
-        return [LocksRepo._row_to_lock(row) for row in rows]
+        return paginate_sa_select(
+            session.connection(),
+            stmt,
+            params=params,
+            row_factory=_factory,
+        )
 
 
-def _select_tool_calls(
+def _select_tool_calls_page(
     session_factory: sessionmaker[Session],
     *,
     run_id: str,
-    limit: int,
-) -> list[ToolCall]:
-    """Return the most-recent ``limit`` tool calls for ``run_id``.
+    params: PageParams,
+) -> Page[ToolCall]:
+    """Return a page of tool calls for ``run_id``.
 
-    Thin wrapper around :meth:`ToolCallsRepo.by_run` — kept here so the
-    sync/threadpool boundary is one obvious place rather than scattered
-    through the route handlers.
+    Delegates to :meth:`ToolCallsRepo.by_run_paged`, which runs a
+    single SQL statement (filtered WHERE + ``COUNT(*) OVER ()``) so
+    ``Page.total`` reflects the true population count even when a
+    run has more tool calls than the page-size cap. The pre-W22b2-
+    iter draft used the cap-bounded :meth:`by_run` then sliced in
+    memory; that path silently truncated ``total`` to
+    ``MAX_PAGE_SIZE`` for any run with more tool calls — making the
+    envelope's count lie, and rendering pages past the cap
+    unreachable.
     """
     from ctxr.fsm.sqlite.repos_enforcement import ToolCallsRepo
 
     repo = ToolCallsRepo()
     with session_factory() as session:
-        return repo.by_run(session, run_id, limit=limit)
+        items, total = repo.by_run_paged(
+            session,
+            run_id,
+            sort_axis=params.sort,
+            offset=params.offset,
+            limit=params.page_size,
+        )
+    return Page[ToolCall].from_items_and_total(items, total, params=params)
 
 
 def _select_drift_signals_with_score(
@@ -305,28 +393,44 @@ def _select_drift_signals_with_score(
     return DriftSignalsResponse(run_id=run_id, score=score, signals=signals)
 
 
-def _select_commit_signatures(
+def _select_commit_signatures_page(
     session_factory: sessionmaker[Session],
     *,
     run_id: str,
-) -> list[CommitSignatureRecord]:
-    """Return every commit-signature row for ``run_id``, newest first.
+    params: PageParams,
+) -> Page[CommitSignatureRecord]:
+    """Return a page of commit-signature rows for ``run_id``, newest first by default.
 
     The :class:`CommitSignaturesRepo` only exposes ``last_for_run`` and
     ``record``; the admin view wants the full timeline, so we issue
     the query directly here and project through the same private
-    adapter the repo uses.
+    adapter the repo uses. ``params.sort = "created_at_asc"`` flips
+    the order for chronological reads.
     """
     from ctxr.fsm.sqlite.repos_enforcement import _commit_signature_from_row
 
+    if params.sort == "created_at_asc":
+        order_col = CommitSignatureTable.created_at.asc()
+    else:  # "created_at_desc" — the default
+        order_col = CommitSignatureTable.created_at.desc()
+
+    stmt = (
+        select(CommitSignatureTable)
+        .where(CommitSignatureTable.run_id == run_id)
+        .order_by(order_col)
+    )
+
+    def _factory(mapping: Any) -> CommitSignatureRecord:
+        shim = SimpleNamespace(**{k: v for k, v in mapping.items() if k != "__page_total__"})
+        return _commit_signature_from_row(cast(CommitSignatureTable, shim))
+
     with session_factory() as session:
-        stmt = (
-            select(CommitSignatureTable)
-            .where(CommitSignatureTable.run_id == run_id)
-            .order_by(CommitSignatureTable.created_at.desc())
+        return paginate_sa_select(
+            session.connection(),
+            stmt,
+            params=params,
+            row_factory=_factory,
         )
-        rows = session.execute(stmt).scalars().all()
-        return [_commit_signature_from_row(row) for row in rows]
 
 
 def _list_user_tables(engine: Engine) -> list[str]:
@@ -465,11 +569,12 @@ def _build_doctor_report(
 
 @router.get(
     "/journal_txns",
-    response_model=list[JournalTxn],
+    response_model=Page[JournalTxn],
     summary="List journal transactions across every run (admin).",
 )
 async def list_journal_txns(
     project: ProjectDep,
+    params: Annotated[PageParams, Depends(JournalTxnsPageParams)],
     status: Annotated[
         JournalStatus | None,
         Query(
@@ -479,15 +584,7 @@ async def list_journal_txns(
             ),
         ),
     ] = None,
-    limit: Annotated[
-        int,
-        Query(
-            ge=1,
-            le=1000,
-            description="Maximum rows to return. Defaults to 100.",
-        ),
-    ] = 100,
-) -> list[JournalTxn]:
+) -> Page[JournalTxn]:
     """Return journal-txn rows for forensic inspection.
 
     The admin view is global (no ``run_id`` filter required) because
@@ -495,35 +592,45 @@ async def list_journal_txns(
     transactions right now?" — a query that needs to see every row.
     """
     return await run_in_threadpool(
-        _select_journal_txns,
+        _select_journal_txns_page,
         project.session_factory,
         status=status,
-        limit=limit,
+        params=params,
     )
 
 
 @router.get(
     "/locks",
-    response_model=list[Lock],
+    response_model=Page[Lock],
     summary="List every currently-held lock row (admin).",
 )
-async def list_locks(project: ProjectDep) -> list[Lock]:
+async def list_locks(
+    project: ProjectDep,
+    params: Annotated[PageParams, Depends(LocksPageParams)],
+) -> Page[Lock]:
     """Return every row in the ``locks`` table, freshest acquisition first.
 
     The table is intentionally tiny (one row per actively-locked run),
-    so we do not paginate. An empty list is the normal quiescent
-    state.
+    so a single page typically holds every row. The :class:`Page`
+    envelope is still returned for wire-format consistency with the
+    other list endpoints — an empty page (``total=0``) is the normal
+    quiescent state.
     """
-    return await run_in_threadpool(_select_locks, project.session_factory)
+    return await run_in_threadpool(
+        _select_locks_page,
+        project.session_factory,
+        params=params,
+    )
 
 
 @router.get(
     "/tool_calls",
-    response_model=list[ToolCall],
+    response_model=Page[ToolCall],
     summary="Tool-call audit log scoped to a run (W12 substrate).",
 )
 async def list_tool_calls(
     project: ProjectDep,
+    params: Annotated[PageParams, Depends(ToolCallsPageParams)],
     run_id: Annotated[
         str,
         Query(
@@ -531,15 +638,7 @@ async def list_tool_calls(
             description="Run id whose tool calls should be returned.",
         ),
     ],
-    limit: Annotated[
-        int,
-        Query(
-            ge=1,
-            le=1000,
-            description="Maximum rows to return. Defaults to 100.",
-        ),
-    ] = 100,
-) -> list[ToolCall]:
+) -> Page[ToolCall]:
     """Return the most recent tool calls for ``run_id``.
 
     ``run_id`` is required because the underlying repo only exposes a
@@ -548,10 +647,10 @@ async def list_tool_calls(
     log is run-scoped by design).
     """
     return await run_in_threadpool(
-        _select_tool_calls,
+        _select_tool_calls_page,
         project.session_factory,
         run_id=run_id,
-        limit=limit,
+        params=params,
     )
 
 
@@ -583,11 +682,12 @@ async def list_drift_signals(
 
 @router.get(
     "/commit_signatures",
-    response_model=list[CommitSignatureRecord],
+    response_model=Page[CommitSignatureRecord],
     summary="Commit-signature timeline for a run (W12 substrate).",
 )
 async def list_commit_signatures(
     project: ProjectDep,
+    params: Annotated[PageParams, Depends(CommitSignaturesPageParams)],
     run_id: Annotated[
         str,
         Query(
@@ -595,17 +695,20 @@ async def list_commit_signatures(
             description="Run id whose commit signatures should be returned.",
         ),
     ],
-) -> list[CommitSignatureRecord]:
+) -> Page[CommitSignatureRecord]:
     """Return every commit-signature envelope captured for ``run_id``.
 
-    Sorted newest-first so the most recent commit is element zero —
-    matches the shape :meth:`CommitSignaturesRepo.last_for_run`
-    returns and the order operators expect when reading a timeline.
+    Sorted newest-first by default so the most recent commit is
+    element zero — matches the shape
+    :meth:`CommitSignaturesRepo.last_for_run` returns and the order
+    operators expect when reading a timeline. ``?sort=created_at_asc``
+    flips the order for chronological reads.
     """
     return await run_in_threadpool(
-        _select_commit_signatures,
+        _select_commit_signatures_page,
         project.session_factory,
         run_id=run_id,
+        params=params,
     )
 
 

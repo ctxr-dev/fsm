@@ -34,6 +34,7 @@ import {
 import {
   api,
   ApiError,
+  walkAllPages,
   type RunSummary,
   type SpecSummary,
 } from '../lib/api';
@@ -134,7 +135,15 @@ export function SpecsRoute(): JSX.Element {
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([api.listSpecs(), api.listRuns({ limit: 500 })])
+    // The spec catalog needs to enumerate EVERY spec and EVERY run to
+    // group + count per slug — derivative aggregations, not a
+    // user-facing paged list — so we walk pages until ``has_next`` is
+    // false (with a 50-page safety stop) instead of wiring a
+    // <Pagination> control here.
+    Promise.all([
+      walkAllPages((p) => api.listSpecs(p), {}),
+      walkAllPages((p) => api.listRuns(p), {}),
+    ])
       .then(([s, r]) => {
         if (cancelled) return;
         setSpecs(s);

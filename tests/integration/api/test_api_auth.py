@@ -11,10 +11,10 @@ endpoint because:
 
 * it lives on the admin router which has ``Depends(require_auth)``
   applied at router-level, so a green case proves the guard fires;
-* it returns 200 with an empty list on a fresh DB (no fixtures
+* it returns 200 with an empty page on a fresh DB (no fixtures
   required), keeping the test focused on auth rather than seeding;
-* the response model is a list, so a dev-mode 200 is trivially
-  asserted on (``response.json() == []``).
+* the response model is a ``Page[Lock]`` envelope, so a dev-mode
+  200 is trivially asserted on (``response.json()["items"] == []``).
 
 Test isolation
 --------------
@@ -131,10 +131,17 @@ def test_no_token_env_dev_mode_returns_200(
         f"expected dev-mode 200 from {_ADMIN_ENDPOINT}; "
         f"got {response.status_code}, body={response.text!r}"
     )
-    # Fresh DB → no locks → empty list. Asserting on the shape
-    # protects against a future regression where the dependency layer
-    # silently swaps a different handler in front of the admin route.
-    assert response.json() == []
+    # Fresh DB → no locks → empty page. Asserting on the envelope
+    # shape protects against a future regression where the dependency
+    # layer silently swaps a different handler in front of the admin
+    # route. The list endpoint returns a Page[T] envelope with
+    # ``items``, ``page``, ``page_size``, ``total``, ``has_next``, and
+    # ``sort`` fields rather than a bare list.
+    page = response.json()
+    assert page["items"] == []
+    assert page["total"] == 0
+    assert page["page"] == 1
+    assert page["has_next"] is False
 
 
 def test_token_set_no_authorization_header_returns_401(
@@ -224,7 +231,13 @@ def test_token_set_correct_bearer_returns_200(
         f"expected 200 from {_ADMIN_ENDPOINT} with correct bearer token; "
         f"got {response.status_code}, body={response.text!r}"
     )
-    assert response.json() == []
+    # Same envelope shape as the dev-mode test — see that test for the
+    # rationale on why we assert on the shape and not just the items.
+    page = response.json()
+    assert page["items"] == []
+    assert page["total"] == 0
+    assert page["page"] == 1
+    assert page["has_next"] is False
 
 
 if __name__ == "__main__":  # pragma: no cover - manual debug path

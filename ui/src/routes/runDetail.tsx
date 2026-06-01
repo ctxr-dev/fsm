@@ -422,10 +422,12 @@ export function RunDetailRoute(): JSX.Element {
       Promise.allSettled([
         api.getRun(id),
         api.getStateTree(id),
-        api.getEvents(id, { limit: 200 }),
-        api.listToolCalls({ run_id: id, limit: 50 }),
+        api.getEvents(id, { page_size: 200 }),
+        api.listToolCalls({ run_id: id, page_size: 50 }),
         api.listDriftSignals(id),
-        api.listCommitSignatures(id),
+        // page_size=200 is the MAX_PAGE_SIZE cap; the "last 3" UI slice
+        // below operates on .items so this header-sized page is plenty.
+        api.listCommitSignatures(id, { page_size: 200 }),
       ]).then((results) => {
         if (cancelled) return;
         const [runRes, treeRes, eventsRes, toolsRes, driftRes, sigsRes] =
@@ -448,10 +450,16 @@ export function RunDetailRoute(): JSX.Element {
         } else {
           setStateTree(null);
         }
-        setEvents(eventsRes.status === 'fulfilled' ? eventsRes.value : []);
-        setToolCalls(toolsRes.status === 'fulfilled' ? toolsRes.value : []);
+        setEvents(
+          eventsRes.status === 'fulfilled' ? eventsRes.value.items : [],
+        );
+        setToolCalls(
+          toolsRes.status === 'fulfilled' ? toolsRes.value.items : [],
+        );
         setDrift(driftRes.status === 'fulfilled' ? driftRes.value : null);
-        setSignatures(sigsRes.status === 'fulfilled' ? sigsRes.value : []);
+        setSignatures(
+          sigsRes.status === 'fulfilled' ? sigsRes.value.items : [],
+        );
         setLoading(false);
       });
       return () => {

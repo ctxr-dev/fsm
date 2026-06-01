@@ -56,7 +56,7 @@ from typing import Any
 
 import uuid_utils
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select, update
+from sqlalchemy import func, over, select, update
 from sqlalchemy.orm import Session
 
 from ctxr.fsm.core.models import CommitSignature as CoreCommitSignature
@@ -417,6 +417,50 @@ class ToolCallsRepo:
         )
         rows = session.execute(stmt).scalars().all()
         return [_tool_call_from_row(row) for row in rows]
+
+    def by_run_paged(
+        self,
+        session: Session,
+        run_id: str,
+        *,
+        sort_axis: str,
+        offset: int,
+        limit: int,
+    ) -> tuple[list[ToolCall], int]:
+        """Paginated per-run tool-call slice + true total.
+
+        W22b2-introduced sibling to :meth:`by_run`. The non-paged
+        variant pre-caps with ``limit`` so the HTTP /admin/tool_calls
+        handler could never honestly report a population larger than
+        the cap — :attr:`Page.total` would lie for any run with more
+        than 100 tool calls. This variant runs the same WHERE filter
+        with ``COUNT(*) OVER ()`` so the slice and the population
+        total come back in one statement.
+
+        ``sort_axis`` accepts ``"created_at_desc"`` (matches
+        :meth:`by_run`'s default) or ``"created_at_asc"``.
+        """
+        if limit < 1:
+            return [], 0
+
+        stmt = select(ToolCallTable).where(ToolCallTable.run_id == run_id)
+        if sort_axis == "created_at_asc":
+            stmt = stmt.order_by(ToolCallTable.created_at.asc())
+        else:
+            stmt = stmt.order_by(ToolCallTable.created_at.desc())
+
+        count_col = over(func.count()).label("__page_total__")
+        paged = stmt.add_columns(count_col).offset(offset).limit(limit)
+
+        rows = list(session.execute(paged))
+        if not rows:
+            count_stmt = select(func.count()).select_from(stmt.subquery())
+            total = int(session.execute(count_stmt).scalar_one())
+            return [], total
+
+        total = int(rows[0]._mapping["__page_total__"])
+        items = [_tool_call_from_row(row[0]) for row in rows]
+        return items, total
 
 
 # ---------------------------------------------------------------------------

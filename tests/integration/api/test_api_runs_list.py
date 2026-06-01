@@ -12,14 +12,14 @@ for. Sync endpoints are exactly what TestClient is designed for.
 The contracts asserted here mirror the spec / MCP coverage at the
 HTTP layer:
 
-* An empty database returns the JSON literal ``[]`` — not ``null``, not
-  a wrapped envelope. The frontend's "did we get any runs?" check is a
-  truthy length test on this array, so the empty case must be a JSON
-  array.
+* An empty database returns the standard ``Page[T]`` envelope with
+  ``items=[]`` and ``total=0`` — not ``null``, not a bare array. The
+  frontend reads runs from ``items``, so the empty case must still
+  produce a well-formed envelope.
 * After we register a spec and start runs through the Python API
   (so this test isolates the *list* contract from the *start* contract),
-  ``GET /runs`` surfaces every run with the expected ``fsm_spec_id``
-  and ``id`` fields.
+  ``GET /runs`` surfaces every run inside ``items`` with the expected
+  ``fsm_spec_id`` and ``id`` fields.
 * ``?status=in_progress`` round-trips through the
   :meth:`RunsRepo.by_status` branch and only returns rows in that
   status — runs we transition to ``completed`` are excluded.
@@ -124,12 +124,14 @@ def client_and_project() -> Iterator[tuple[TestClient, Project]]:
 def test_list_runs_returns_empty_array_on_empty_db(
     client_and_project: tuple[TestClient, Project],
 ) -> None:
-    """An empty database must serialise as the JSON literal ``[]``.
+    """An empty database returns the Page envelope with an empty ``items`` array.
 
-    A wrapped envelope (e.g. ``{"runs": []}``) or ``null`` would force
-    every UI caller to type-check the response before iterating; the
-    contract is "always an array", and an empty DB is the canonical
-    boundary case for that contract.
+    The endpoint now wraps the row list in the standard
+    ``Page[T]`` envelope (``items``, ``page``, ``page_size``,
+    ``total``, ``has_next``, ``sort``). An empty DB is the canonical
+    boundary case: the envelope must still be present, ``items`` must
+    serialise as ``[]`` (not ``null``), and the counters must agree
+    that nothing is there.
     """
     client, _project = client_and_project
 
@@ -139,7 +141,10 @@ def test_list_runs_returns_empty_array_on_empty_db(
         f"GET /api/v1/runs returned {response.status_code}: body={response.text!r}"
     )
     payload = response.json()
-    assert payload == [], f"expected [] on empty DB, got {payload!r}"
+    assert payload["items"] == [], f"expected items=[] on empty DB, got {payload!r}"
+    assert payload["total"] == 0, f"expected total=0 on empty DB, got {payload!r}"
+    assert payload["page"] == 1, f"expected page=1, got {payload!r}"
+    assert payload["has_next"] is False, f"expected has_next=False, got {payload!r}"
 
 
 def test_list_runs_returns_runs_after_python_api_start(
@@ -165,17 +170,21 @@ def test_list_runs_returns_runs_after_python_api_start(
         f"GET /api/v1/runs returned {response.status_code}: body={response.text!r}"
     )
     payload = response.json()
-    assert isinstance(payload, list)
-    assert len(payload) == 2, f"expected exactly 2 runs, got {len(payload)}: {payload!r}"
+    items = payload["items"]
+    assert isinstance(items, list)
+    assert payload["total"] == 2, (
+        f"expected total=2 runs, got {payload['total']}: {payload!r}"
+    )
+    assert len(items) == 2, f"expected exactly 2 items on page, got {len(items)}: {items!r}"
 
-    listed_ids = {row["id"] for row in payload}
+    listed_ids = {row["id"] for row in items}
     assert listed_ids == {run_one.id, run_two.id}, (
         f"expected run ids {{{run_one.id}, {run_two.id}}}, got {listed_ids}"
     )
 
     # Every row must carry the spec id we registered against; a missing
     # value would mean the summary projection dropped the column.
-    for row in payload:
+    for row in items:
         assert row["fsm_spec_id"] == registered.spec.id, (
             f"row {row!r} has unexpected fsm_spec_id"
         )
@@ -225,12 +234,16 @@ def test_list_runs_status_filter_in_progress(
         f"{in_progress_response.status_code}: body={in_progress_response.text!r}"
     )
     in_progress_payload = in_progress_response.json()
-    assert isinstance(in_progress_payload, list)
-    assert len(in_progress_payload) == 1, (
-        f"expected exactly 1 in-progress run, got {in_progress_payload!r}"
+    in_progress_items = in_progress_payload["items"]
+    assert isinstance(in_progress_items, list)
+    assert in_progress_payload["total"] == 1, (
+        f"expected total=1 in-progress run, got {in_progress_payload!r}"
     )
-    assert in_progress_payload[0]["id"] == run_in_progress.id
-    assert in_progress_payload[0]["status"] == "in_progress"
+    assert len(in_progress_items) == 1, (
+        f"expected exactly 1 in-progress run, got {in_progress_items!r}"
+    )
+    assert in_progress_items[0]["id"] == run_in_progress.id
+    assert in_progress_items[0]["status"] == "in_progress"
 
     # --- negative: the completed filter returns exactly the other row ---
     # Confirms the filter is actually filtering rather than always
@@ -241,12 +254,16 @@ def test_list_runs_status_filter_in_progress(
         f"{completed_response.status_code}: body={completed_response.text!r}"
     )
     completed_payload = completed_response.json()
-    assert isinstance(completed_payload, list)
-    assert len(completed_payload) == 1, (
-        f"expected exactly 1 completed run, got {completed_payload!r}"
+    completed_items = completed_payload["items"]
+    assert isinstance(completed_items, list)
+    assert completed_payload["total"] == 1, (
+        f"expected total=1 completed run, got {completed_payload!r}"
     )
-    assert completed_payload[0]["id"] == run_to_complete.id
-    assert completed_payload[0]["status"] == "completed"
+    assert len(completed_items) == 1, (
+        f"expected exactly 1 completed run, got {completed_items!r}"
+    )
+    assert completed_items[0]["id"] == run_to_complete.id
+    assert completed_items[0]["status"] == "completed"
 
 
 if __name__ == "__main__":

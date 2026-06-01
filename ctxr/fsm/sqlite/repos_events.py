@@ -66,7 +66,7 @@ from typing import Any
 
 import uuid_utils
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import and_, or_, select, text, update
+from sqlalchemy import and_, func, or_, over, select, text, update
 from sqlalchemy.orm import Session
 
 from ctxr.fsm.sqlite.models_events import (
@@ -588,6 +588,58 @@ class EventsRepo:
         stmt = stmt.order_by(EventTable.created_at.desc())
         rows = session.execute(stmt).scalars().all()
         return [_row_to_event(r) for r in rows]
+
+    @staticmethod
+    def by_run_paged(
+        session: Session,
+        run_id: str,
+        *,
+        since_seq: int | None,
+        kinds: Sequence[str] | None,
+        sort_axis: str,
+        offset: int,
+        limit: int,
+    ) -> tuple[list[Event], int]:
+        """Paginated per-run event slice + true total.
+
+        W22b2-introduced sibling to :meth:`by_run`. The iterator-based
+        ``by_run`` is fine for the bus poll loop (which streams and
+        bails on a buffer limit), but the HTTP /events handler needs
+        an honest population count to serve pagination — which the
+        iterator can't give without exhausting itself. This variant
+        wraps the same WHERE filter in a single statement with
+        ``COUNT(*) OVER ()`` so the page slice and the total fall out
+        together.
+
+        ``sort_axis`` accepts ``"seq_asc"`` (the chronological replay
+        order matching :meth:`by_run`) or ``"seq_desc"``.
+        """
+        if limit < 1:
+            return [], 0
+
+        stmt = select(EventTable).where(EventTable.run_id == run_id)
+        if since_seq is not None:
+            stmt = stmt.where(EventTable.seq > since_seq)
+        if kinds:
+            stmt = stmt.where(EventTable.kind.in_(list(kinds)))
+
+        if sort_axis == "seq_desc":
+            stmt = stmt.order_by(EventTable.seq.desc())
+        else:
+            stmt = stmt.order_by(EventTable.seq.asc())
+
+        count_col = over(func.count()).label("__page_total__")
+        paged = stmt.add_columns(count_col).offset(offset).limit(limit)
+
+        rows = list(session.execute(paged))
+        if not rows:
+            count_stmt = select(func.count()).select_from(stmt.subquery())
+            total = int(session.execute(count_stmt).scalar_one())
+            return [], total
+
+        total = int(rows[0]._mapping["__page_total__"])
+        items = [_row_to_event(row[0]) for row in rows]
+        return items, total
 
     @staticmethod
     def by_run(

@@ -40,11 +40,11 @@ interface Loaded {
 }
 
 async function loadRun(id: string): Promise<Loaded> {
-  const [run, events] = await Promise.all([
+  const [run, eventsPage] = await Promise.all([
     api.getRun(id),
-    api.getEvents(id, { limit: 500 }),
+    api.getEvents(id, { page_size: 200 }),
   ]);
-  return { run, events };
+  return { run, events: eventsPage.items };
 }
 
 interface FlatState {
