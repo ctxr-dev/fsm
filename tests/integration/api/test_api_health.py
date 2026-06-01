@@ -220,6 +220,101 @@ def test_get_current_project_returns_metadata(
     )
 
 
+# ---------------------------------------------------------------------------
+# W22a: project_root + db_path_relative portable-path derivation
+# ---------------------------------------------------------------------------
+
+
+def test_get_current_project_derives_relative_path_for_canonical_layout(
+    tmp_path: Path,
+) -> None:
+    """When ``.ctxr-fsm/fsm.db`` lives under a project root, the route
+    derives ``project_root`` and ``db_path_relative`` correctly.
+
+    Uses a fresh on-disk DB under tmp_path so the standard
+    ``ctxr-fsm init`` layout (``<root>/.ctxr-fsm/fsm.db``) is exercised
+    end to end. The relative path must be exactly ``.ctxr-fsm/fsm.db``
+    on every host — that's what UI surfaces commit to shared configs.
+    """
+    project_dir = tmp_path / "my-project"
+    ctxr_dir = project_dir / ".ctxr-fsm"
+    ctxr_dir.mkdir(parents=True)
+    db_path = ctxr_dir / "fsm.db"
+
+    project = Project.open(db_path, migrate=True)
+    try:
+        _state.set_project(project)
+        with TestClient(app) as client:
+            body = client.get("/api/v1/projects/current").json()
+            assert body["db_path_relative"] == ".ctxr-fsm/fsm.db", (
+                f"canonical layout should produce '.ctxr-fsm/fsm.db'; got "
+                f"{body['db_path_relative']!r}"
+            )
+            assert Path(body["project_root"]).resolve() == project_dir.resolve(), (
+                f"project_root should resolve to {project_dir!s}; got "
+                f"{body['project_root']!r}"
+            )
+    finally:
+        _state.reset_project()
+        project.close()
+
+
+def test_get_current_project_falls_back_for_non_canonical_layout(
+    tmp_path: Path,
+) -> None:
+    """When the DB lives outside a ``.ctxr-fsm/`` ancestor (operator
+    passed an ad-hoc ``--db``), the relative path is just the filename
+    and the project root is the DB's parent. Honest signal, no
+    misleading walk-up to a random ancestor.
+    """
+    rogue_dir = tmp_path / "somewhere"
+    rogue_dir.mkdir()
+    db_path = rogue_dir / "random.db"
+
+    project = Project.open(db_path, migrate=True)
+    try:
+        _state.set_project(project)
+        with TestClient(app) as client:
+            body = client.get("/api/v1/projects/current").json()
+            assert body["db_path_relative"] == "random.db", (
+                f"non-canonical layout should fall back to bare filename; got "
+                f"{body['db_path_relative']!r}"
+            )
+            assert Path(body["project_root"]).resolve() == rogue_dir.resolve()
+    finally:
+        _state.reset_project()
+        project.close()
+
+
+def test_get_current_project_returns_null_for_in_memory_db() -> None:
+    """When the open DB is SQLite ``:memory:``, project_root +
+    db_path_relative must ship as ``null`` — running the walk-up
+    derivation on the ``:memory:`` sentinel would resolve it under
+    the test's cwd and emit a nonsense path. The sentinel guard in
+    :func:`ctxr.fsm.api._paths.looks_like_filesystem_db_path` is the
+    line of defence.
+    """
+    project = Project.open(":memory:", migrate=True)
+    try:
+        _state.set_project(project)
+        with TestClient(app) as client:
+            body = client.get("/api/v1/projects/current").json()
+            assert body["project_root"] is None, (
+                f"in-memory DB should produce project_root=None; got "
+                f"{body['project_root']!r}"
+            )
+            assert body["db_path_relative"] is None, (
+                f"in-memory DB should produce db_path_relative=None; got "
+                f"{body['db_path_relative']!r}"
+            )
+            # db_path itself is still surfaced (the :memory: sentinel)
+            # so the UI knows what it's talking to.
+            assert body["db_path"] == ":memory:"
+    finally:
+        _state.reset_project()
+        project.close()
+
+
 if __name__ == "__main__":  # pragma: no cover - manual debug path
     # Allow ``python tests/integration/api/test_api_health.py`` to
     # run the suite under pytest without remembering the full module

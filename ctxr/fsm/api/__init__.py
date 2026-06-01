@@ -59,6 +59,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -67,6 +68,7 @@ from pydantic import BaseModel, Field
 import ctxr.fsm
 from ctxr.fsm.api import _state
 from ctxr.fsm.api._deps import ProjectDep, require_auth
+from ctxr.fsm.api._paths import looks_like_filesystem_db_path, project_root_and_relative
 from ctxr.fsm.sqlite import Project
 
 __all__ = ["ProjectMetadata", "app", "lifespan_handler"]
@@ -210,16 +212,58 @@ class ReadinessResponse(BaseModel):
 class ProjectMetadata(BaseModel):
     """Metadata payload returned by ``GET /api/v1/projects/current``.
 
-    Intentionally minimal in this bootstrap phase — later waves
-    extend this with project name, root path, registered spec
-    counts, etc. The route exists now so the UI can issue a single
-    discovery call against a running API and know it's talking to a
-    live, project-bound server.
+    W22 added ``project_root`` + ``db_path_relative`` so the UI
+    topbar / Settings surface can render portable, committable
+    project-relative paths instead of absolute filesystem strings.
+    Future waves will extend this further with a project name (slug
+    pulled from ``.ctxr-fsm/``), registered spec + run counts, and
+    workspace metadata; the route already exists so the UI can issue
+    a single discovery call against a running API and know it's
+    talking to a live, project-bound server.
     """
 
     fsm_version: str = Field(..., description="The ``ctxr.fsm`` package version.")
     project_open: bool = Field(..., description="Whether the :class:`Project` is bound.")
-    db_path: str = Field(..., description="Filesystem path of the open SQLite database.")
+    db_path: str = Field(
+        ...,
+        description=(
+            "Absolute filesystem path of the open SQLite database when"
+            " filesystem-backed (normalised via :meth:`Path.resolve` so"
+            " the value is uniform across hosts regardless of how the"
+            " engine was opened). For non-file backends (``:memory:``,"
+            " ``file:``-URI variants), this is the raw"
+            " ``engine.url.database`` segment — e.g. ``:memory:`` or"
+            " ``file:test.db`` — so the operator sees exactly what"
+            " SQLAlchemy resolved from the URL. When the URL has no"
+            " ``database`` component at all (``sqlite://``), this"
+            " falls back to the rendered ``str(engine.url)``. Clients"
+            " distinguish a real path from a sentinel by checking"
+            " ``project_root`` / ``db_path_relative`` for ``None``."
+        ),
+    )
+    project_root: str | None = Field(
+        None,
+        description=(
+            "Absolute path of the project root that hosts ``.ctxr-fsm/``."
+            " Computed by walking up from the resolved DB path; falls"
+            " back to the DB's parent directory when no ``.ctxr-fsm/``"
+            " ancestor is found (operator passed a non-canonical"
+            " ``--db``). ``None`` when the DB URL has no filesystem"
+            " path (in-memory / non-file backends) — derivation is"
+            " meaningless in that case."
+        ),
+    )
+    db_path_relative: str | None = Field(
+        None,
+        description=(
+            "Path of the open DB relative to ``project_root``. For the"
+            " canonical layout this is ``.ctxr-fsm/fsm.db``. UI surfaces"
+            " prefer this over ``db_path`` so the value stays portable"
+            " across machines and committable to shared configs."
+            " ``None`` when ``project_root`` is also ``None`` (paired"
+            " field; see above)."
+        ),
+    )
 
 
 # ── Health endpoints ───────────────────────────────────────────────
@@ -283,12 +327,37 @@ def get_current_project(project: ProjectDep) -> ProjectMetadata:
     # attribute is the filesystem path for SQLite URLs. Falls back to
     # the rendered URL string so a future swap to a non-file backend
     # (memory, network) still returns something useful instead of
-    # ``None``.
-    db_path = project.engine.url.database or str(project.engine.url)
+    # ``None`` — but in that case we cannot meaningfully derive a
+    # project root / relative path, so the paired fields stay ``None``
+    # rather than emit nonsense (e.g. treating ``sqlite://`` as a
+    # filesystem path).
+    db_url_database = project.engine.url.database
+    # For non-file backends fall back to the rendered URL so the field
+    # still has SOMETHING useful; for file backends we resolve below
+    # so the doc-promised "absolute filesystem path" actually holds
+    # even when the engine was opened with a relative ``--db`` arg.
+    db_path = db_url_database or str(project.engine.url)
+    project_root_str: str | None = None
+    db_relative: str | None = None
+    # `looks_like_filesystem_db_path` filters out :memory:, the URI
+    # in-memory variant, and any other non-file sentinel SQLAlchemy
+    # could expose — a plain `if db_url_database:` truthy check would
+    # treat ':memory:' as a path and resolve it under cwd.
+    if looks_like_filesystem_db_path(db_url_database):
+        project_root_path, db_relative = project_root_and_relative(db_url_database)
+        project_root_str = str(project_root_path)
+        # Normalise db_path to absolute too — `project_root_and_relative`
+        # already resolves the path internally, and the doc string says
+        # this field is "absolute". When the engine was opened with a
+        # relative path the raw url.database would be relative too,
+        # contradicting the doc.
+        db_path = str(Path(db_url_database).resolve())
     return ProjectMetadata(
         fsm_version=ctxr.fsm.__version__,
         project_open=True,
         db_path=db_path,
+        project_root=project_root_str,
+        db_path_relative=db_relative,
     )
 
 

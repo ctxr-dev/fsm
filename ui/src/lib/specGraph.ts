@@ -30,10 +30,24 @@ import type { FlowNodeData, FlowNodeKind } from '../components/FlowGraph';
 interface SpecStateShape {
   id: string;
   kind?: string;
+  purpose?: string;
   worker?: { role?: string; prompt_template?: string };
-  loop?: unknown;
-  inline?: { handler_id?: string };
+  /** Loop config. We type the structured keys we KNOW about
+   *  (`max_iterations`, `done_field`) and accept extra keys via the
+   *  index signature so the type doesn't collapse to `unknown` (which
+   *  is what `{ ... } | unknown` would have done — a union with
+   *  `unknown` loses all structure). */
+  loop?: { max_iterations?: number; done_field?: string; [k: string]: unknown };
+  inline?: {
+    handler_id?: string;
+    purpose?: string;
+    response_schema?: { schema?: { properties?: Record<string, unknown> } };
+    post_validations?: unknown[];
+  };
+  outputs?: unknown[];
+  post_validations?: unknown[];
   transitions?: SpecTransitionShape[];
+  verifier?: unknown;
 }
 
 interface SpecTransitionShape {
@@ -109,6 +123,28 @@ export function transitionKind(t: { when?: unknown }): string | undefined {
   return undefined;
 }
 
+/** Build a short, info-dense sublabel from structural counts on the
+ *  spec state. Used when the canonical `worker: <role>` /
+ *  `inline: <handler_id>` line would mirror the main label (which is
+ *  the state id) and therefore add no information. Returns '' when
+ *  no structural facts are worth showing, so the caller can fall
+ *  through to its next default. */
+function structuralSublabel(s: SpecStateShape): string {
+  const parts: string[] = [];
+  const outs = Array.isArray(s.outputs) ? s.outputs.length : 0;
+  const trans = Array.isArray(s.transitions) ? s.transitions.length : 0;
+  if (outs > 0) parts.push(`${outs} output${outs === 1 ? '' : 's'}`);
+  if (trans > 0) parts.push(`→ ${trans}`);
+  if (s.verifier) parts.push('✓ verifier');
+  const inlinePV = Array.isArray(s.inline?.post_validations)
+    ? s.inline!.post_validations!.length
+    : 0;
+  const statePV = Array.isArray(s.post_validations) ? s.post_validations.length : 0;
+  const pv = inlinePV + statePV;
+  if (pv > 0) parts.push(`post-val ×${pv}`);
+  return parts.join(' · ');
+}
+
 export interface SpecGraph {
   nodes: Node<FlowNodeData>[];
   edges: Edge[];
@@ -130,40 +166,84 @@ export function specToGraph(definition: unknown): SpecGraph {
 
   const nodes: Node<FlowNodeData>[] = states.map((s) => {
     const kind = inferKind(s);
+
+    // Canonical sublabel: `worker: <role>` / `inline: <handler_id>` /
+    // `terminal`. Always kept on `data.fullSublabel` (and surfaced via
+    // hover Tooltip + the inspector Sheet) even when the visible row
+    // gets demoted in favour of a more informative line below.
     let sublabel = '';
     if (s.worker?.role) sublabel = `worker: ${s.worker.role}`;
     else if (s.inline?.handler_id) sublabel = `inline: ${s.inline.handler_id}`;
     else if (kind === 'terminal') sublabel = 'terminal';
+    const canonicalSublabel = sublabel || undefined;
+
+    // W22 redundancy guard: when the canonical line would mirror the
+    // main label (skill-code-review names every handler after its
+    // state, so `inline: synthesize_release_readiness` duplicates the
+    // label one row up), swap the visible row for new information:
+    // prefer `inline.purpose` / `state.purpose` (human-readable),
+    // otherwise fall through to a structural summary built from
+    // counts on the same node (`N outputs · → M · ✓ verifier ·
+    // post-val ×K`). The full canonical line is preserved on
+    // fullSublabel so hover + inspector show it on demand.
+    const mirrorsLabel =
+      (s.inline?.handler_id !== undefined && s.inline.handler_id === s.id) ||
+      (s.worker?.role !== undefined && s.worker.role === s.id);
+    if (mirrorsLabel) {
+      const purpose = (s.inline?.purpose ?? s.purpose ?? '').trim();
+      const structural = structuralSublabel(s);
+      sublabel = purpose || structural || '';
+    }
+
     return {
       id: s.id,
       position: { x: 0, y: 0 }, // dagre fills these in
       // W21: copy the FULL spec state object onto data.state so the
       // click handler can render a State Inspector Sheet without
       // re-walking the spec. fullLabel/fullSublabel mirror the
-      // visible strings; node-label tooltip falls back to label when
-      // these are absent.
-      data: {
-        kind,
-        label: s.id,
-        sublabel,
-        fullLabel: s.id,
-        fullSublabel: sublabel || undefined,
-        state: s as unknown as Record<string, unknown>,
-      },
+      // visible strings; the Tooltip falls back to label when
+      // fullLabel is absent.
+      // Compose fullSublabel via `||` (not `??`) so an empty-string
+      // `sublabel` (the initial value when no worker/inline/terminal
+      // applies) falls through to undefined instead of pinning the
+      // tooltip content to '' — which downstream `?? data.sublabel`
+      // wouldn't short-circuit past. Empty-content Tooltip auto-no-
+      // renders, but having `fullSublabel = ''` would suppress the
+      // hover fallback even when `sublabel` IS non-empty.
+      data: (() => {
+        const fs = canonicalSublabel ?? sublabel;
+        return {
+          kind,
+          label: s.id,
+          sublabel,
+          fullLabel: s.id,
+          fullSublabel: fs && fs.length > 0 ? fs : undefined,
+          state: s as unknown as Record<string, unknown>,
+        };
+      })(),
     };
   });
 
-  // Mark the entry state visually with a sublabel hint.
+  // Mark the entry state visually with a sublabel hint. The `entry ·`
+  // prefix composes onto whatever sublabel we already chose (canonical
+  // worker:/inline: line OR the structural-summary demotion from the
+  // W22 mirror guard). fullSublabel composes onto the CANONICAL line
+  // (not the demoted visible one) so hover + inspector still see the
+  // un-demoted form — losing it here would defeat the redundancy-
+  // guard's whole point.
   if (def.entry) {
     const entry = nodes.find((n) => n.id === def.entry);
     if (entry) {
-      const newSub = entry.data.sublabel
+      const visibleSub = entry.data.sublabel
         ? `entry · ${entry.data.sublabel}`
         : 'entry';
+      const fullSub = entry.data.fullSublabel
+        ? `entry · ${entry.data.fullSublabel}`
+        : visibleSub;
       entry.data = {
         ...entry.data,
-        sublabel: newSub,
-        fullSublabel: newSub,
+        sublabel: visibleSub,
+        fullSublabel: fullSub,
       };
     }
   }

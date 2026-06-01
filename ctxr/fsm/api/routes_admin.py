@@ -43,6 +43,7 @@ Design notes
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -53,6 +54,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from starlette.concurrency import run_in_threadpool
 
 from ctxr.fsm.api._deps import ProjectDep, require_auth
+from ctxr.fsm.api._paths import looks_like_filesystem_db_path, project_root_and_relative
 from ctxr.fsm.core.models import JournalStatus
 from ctxr.fsm.sqlite import (
     CommitSignatureRecord,
@@ -123,15 +125,57 @@ class DriftSignalsResponse(BaseModel):
 class DoctorReport(BaseModel):
     """HTTP shape of the ``ctxr-fsm doctor`` report.
 
-    Mirrors the dict produced by :func:`ctxr.fsm.cli.doctor_cmd.doctor`
-    so an operator can move freely between the CLI and the API without
-    relearning field names. Field-by-field commentary lives on each
-    attribute below.
+    Mostly mirrors the dict produced by
+    :func:`ctxr.fsm.cli.doctor_cmd.doctor`, but the HTTP surface is
+    a strict superset: it additionally carries ``project_root`` +
+    ``db_path_relative`` (W22) so UI consumers can display portable,
+    project-relative paths without re-deriving them. A follow-up
+    will plumb the same fields into the CLI's ``--json`` output so
+    the two surfaces converge; today, an operator reading the CLI
+    JSON will see the absolute ``db_path`` only. Field-by-field
+    commentary lives on each attribute below.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
-    db_path: str = Field(..., description="Filesystem path of the open DB file.")
+    db_path: str = Field(
+        ...,
+        description=(
+            "Absolute filesystem path of the open DB file when"
+            " filesystem-backed (normalised via :meth:`Path.resolve`)."
+            " For non-file backends (``:memory:``, ``file:``-URI"
+            " variants), this is the raw ``engine.url.database``"
+            " segment — ``:memory:`` or ``file:test.db`` —"
+            " surfacing what SQLAlchemy resolved from the URL. When"
+            " the URL has no ``database`` component (``sqlite://``),"
+            " falls back to the rendered ``str(engine.url)``. Clients"
+            " distinguish a real path from a sentinel by checking"
+            " ``project_root`` / ``db_path_relative`` for ``None``."
+        ),
+    )
+    project_root: str | None = Field(
+        None,
+        description=(
+            "Absolute path of the project root that hosts ``.ctxr-fsm/``."
+            " Computed by walking up from the resolved DB path; falls"
+            " back to the DB's parent directory when no ``.ctxr-fsm/``"
+            " ancestor is found (operator passed a non-canonical"
+            " ``--db``). UI surfaces use this as the anchor for"
+            " portable, relative display of the DB path. ``None`` when"
+            " the DB URL has no filesystem path (in-memory / non-file"
+            " backends) — derivation is meaningless in that case."
+        ),
+    )
+    db_path_relative: str | None = Field(
+        None,
+        description=(
+            "DB path rendered relative to ``project_root``. Canonical"
+            " layout: ``.ctxr-fsm/fsm.db``. UI prefers this over"
+            " ``db_path`` so the displayed value stays portable across"
+            " machines and committable to shared configs. ``None`` when"
+            " ``project_root`` is also ``None``."
+        ),
+    )
     pragmas: dict[str, Any] = Field(
         default_factory=dict,
         description=(
@@ -373,7 +417,14 @@ def _build_doctor_report(
     :func:`run_in_threadpool` and the tests can call this directly
     without spinning up FastAPI.
     """
-    db_path = engine.url.database or str(engine.url)
+    # ``engine.url.database`` is the filesystem path for SQLite URLs.
+    # When it's missing (in-memory backend, non-file URL) we still
+    # surface a ``db_path`` derived from the rendered URL for
+    # legibility, but skip the portable-path derivation — calling
+    # project_root_and_relative on ``sqlite://`` would produce
+    # misleading values.
+    db_url_database = engine.url.database
+    db_path = db_url_database or str(engine.url)
     pragmas = detect_journal_state(engine)
     tables = _list_user_tables(engine)
     row_counts = {name: _count_table_rows(engine, name) for name in tables}
@@ -381,8 +432,24 @@ def _build_doctor_report(
     journal_breakdown = _journal_status_breakdown(session_factory)
     lock_count = _lock_table_count(session_factory)
 
+    project_root_str: str | None = None
+    db_path_relative: str | None = None
+    # `looks_like_filesystem_db_path` filters out :memory: and the URI
+    # in-memory variant (and the empty string), so we never derive a
+    # fake project_root for a non-file backend.
+    if looks_like_filesystem_db_path(db_url_database):
+        project_root_path, db_path_relative = project_root_and_relative(db_url_database)
+        project_root_str = str(project_root_path)
+        # Normalise db_path to absolute (matches the field's doc
+        # contract). When the engine was opened with a relative path
+        # the raw url.database would be relative too — `Path.resolve`
+        # plus the canonical layout walk-up keeps the wire shape
+        # uniform across hosts.
+        db_path = str(Path(db_url_database).resolve())
     return DoctorReport(
         db_path=db_path,
+        project_root=project_root_str,
+        db_path_relative=db_path_relative,
         pragmas=pragmas,
         tables_with_row_counts=row_counts,
         alembic_revision=revision,

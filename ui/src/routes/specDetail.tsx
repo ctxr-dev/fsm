@@ -169,10 +169,15 @@ function StateInspectorBody({ state, isEntry }: StateInspectorBodyProps): JSX.El
           <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
             worker.response_schema
           </h4>
+          {/* W22 Fix 2: default to the top two levels of the schema
+              expanded — the operator wants a glance at the shape
+              without scrolling through every nested property. Click
+              the chevrons or the toolbar's Expand button to descend. */}
           <JsonViewer
             value={worker.response_schema}
             rootLabel="response_schema"
-            mode="inline"
+            mode="expanded"
+            defaultExpandDepth={2}
             maxInlineHeight="max-h-64"
           />
         </section>
@@ -214,12 +219,25 @@ function StateInspectorBody({ state, isEntry }: StateInspectorBodyProps): JSX.El
                     ?? ((t.when as Record<string, unknown>).criteria as string | undefined)
                     ?? '')
                 : '';
+              // W22 Fix 3 site 2: highlight predicates (deterministic /
+              // judgement) so the operator's eye jumps to the
+              // conditions that actually MATTER for understanding why
+              // the FSM branched. always / otherwise stay slate.
+              const isPredicate = tKind === 'deterministic' || tKind === 'judgement';
+              // `min-w-0` is mandatory on a `truncate` flex item: without
+              // it the item's intrinsic min-content width wins and a long
+              // predicate overflows the row instead of truncating with
+              // ellipsis. `flex-1` only gives the item room to grow, not
+              // permission to shrink below its content width.
+              const whenClass = isPredicate
+                ? 'font-mono text-amber-700 dark:text-amber-300 font-semibold truncate flex-1 min-w-0 px-1.5 py-0.5 rounded bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-700/50'
+                : 'font-mono text-slate-500 dark:text-slate-400 truncate flex-1 min-w-0';
               return (
                 <li key={`${target}-${idx}`} class="py-1.5 flex items-center gap-2">
                   {tKind ? <Pill variant={transitionKindVariant(tKind)} size="sm">{tKind}</Pill> : null}
                   <code class="font-mono text-slate-700 dark:text-slate-300">{target}</code>
                   {when ? (
-                    <code class="font-mono text-slate-500 dark:text-slate-400 truncate flex-1" title={when}>
+                    <code class={whenClass} title={when}>
                       {when}
                     </code>
                   ) : null}
@@ -267,9 +285,13 @@ function TransitionInspectorBody({
       {/* Same convention as StateInspectorBody above: headings are
           the FSM library's literal transition-shape paths so the
           operator sees field names, not designer text. */}
+      {/* W22 Fix 3 site 3: predicate section gets an amber frame +
+          header colour so it visually pops the moment the inspector
+          opens. always / otherwise transitions skip this section
+          entirely (they have no predicate to render). */}
       {predicate ? (
-        <section>
-          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+        <section class="rounded-md border border-amber-300 dark:border-amber-700/50 bg-amber-50/40 dark:bg-amber-900/10 p-2">
+          <h4 class="text-[11px] font-mono text-amber-700 dark:text-amber-300 mb-1 font-semibold">
             transition.when
           </h4>
           <CodeBlock
@@ -285,10 +307,15 @@ function TransitionInspectorBody({
           <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
             transition (raw)
           </h4>
+          {/* W22 Fix 2: default to the top two levels expanded for
+              the raw transition object — gives the operator a glance
+              at the shape without overwhelming them with every
+              nested predicate node. */}
           <JsonViewer
             value={transition}
             rootLabel="transition"
-            mode="inline"
+            mode="expanded"
+            defaultExpandDepth={2}
             maxInlineHeight="max-h-48"
           />
         </section>
