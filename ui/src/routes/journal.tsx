@@ -49,10 +49,20 @@ interface Pending {
   txnId: string;
 }
 
+type JournalStatusFilter = 'all' | 'pending' | 'ready_to_finalise' | 'finalised';
+
+const STATUS_FILTERS: readonly { value: JournalStatusFilter; label: string; variant: 'neutral' | 'warning' | 'info' | 'success' }[] = [
+  { value: 'all', label: 'All', variant: 'neutral' },
+  { value: 'pending', label: 'Pending', variant: 'info' },
+  { value: 'ready_to_finalise', label: 'Ready to finalise', variant: 'warning' },
+  { value: 'finalised', label: 'Finalised', variant: 'success' },
+];
+
 export function JournalRoute(): JSX.Element {
   const [txnsPage, setTxnsPage] = useState<Page<JournalTxn> | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+  const [statusFilter, setStatusFilter] = useState<JournalStatusFilter>('all');
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState<Pending | null>(null);
   const [busy, setBusy] = useState(false);
@@ -61,7 +71,17 @@ export function JournalRoute(): JSX.Element {
   const reload = useCallback(() => {
     let cancelled = false;
     setTxnsPage(null);
-    api.listJournalTxns({ page, page_size: pageSize })
+    // W22b6: pass the status filter through to the server. The endpoint
+    // owns the filtered count via Page.total, so the operator sees the
+    // honest population size for the chosen scope rather than a
+    // post-fetch length() that would drop to zero after every filter
+    // narrowing.
+    const params: { page: number; page_size: number; status?: 'pending' | 'ready_to_finalise' | 'finalised' } = {
+      page,
+      page_size: pageSize,
+    };
+    if (statusFilter !== 'all') params.status = statusFilter;
+    api.listJournalTxns(params)
       .then((resp) => {
         if (!cancelled) {
           // Sort recent first by started_at within the page.
@@ -75,7 +95,7 @@ export function JournalRoute(): JSX.Element {
         if (!cancelled) setError(err instanceof ApiError ? err.message : String(err));
       });
     return () => { cancelled = true; };
-  }, [page, pageSize]);
+  }, [page, pageSize, statusFilter]);
 
   useEffect(reload, [reload]);
 
@@ -166,15 +186,47 @@ export function JournalRoute(): JSX.Element {
 
   return (
     <div class="p-4 md:p-6 space-y-4">
-      <header class="flex items-baseline justify-between gap-2">
+      <header class="flex flex-wrap items-baseline justify-between gap-2">
         <div>
           <h1 class="text-2xl font-semibold">Journal recovery</h1>
           <p class="text-sm text-slate-600 dark:text-slate-400">
-            Pending + ready journal txns across all runs. Replay or discard from here.
+            Per-run journal txns. Replay or discard pending / ready txns from here.
           </p>
         </div>
         <Button variant="ghost" size="sm" onClick={reload}>Refresh</Button>
       </header>
+      {/* W22b6: status filter row. Drives Page.total via the server's
+          ?status= query param so the readout under the table reflects
+          the filtered population, not the unfiltered one. */}
+      <div role="tablist" aria-label="Filter journal txns by status" class="flex flex-wrap items-center gap-1.5">
+        {STATUS_FILTERS.map((f) => {
+          const active = f.value === statusFilter;
+          return (
+            <button
+              key={f.value}
+              type="button"
+              role="tab"
+              aria-selected={active ? 'true' : 'false'}
+              onClick={() => {
+                setStatusFilter(f.value);
+                if (page !== 1) setPage(1);
+              }}
+              class={[
+                'inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium',
+                'focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500',
+                active
+                  ? 'bg-emerald-600 text-white shadow-sm'
+                  : 'bg-slate-100 text-slate-700 hover:bg-slate-200 dark:bg-slate-700 dark:text-slate-200 dark:hover:bg-slate-600',
+              ].join(' ')}
+            >
+              {f.label}
+              {active && txnsPage ? (
+                <span class="text-[10px] opacity-80">· {txnsPage.total}</span>
+              ) : null}
+            </button>
+          );
+        })}
+      </div>
       <Card>
         {txnsPage === null ? (
           <div class="flex items-center justify-center py-12"><Spinner label="Loading journal" /></div>
