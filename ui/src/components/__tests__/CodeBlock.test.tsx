@@ -90,4 +90,60 @@ describe('CodeBlock', () => {
     const { container } = render(<CodeBlock text="" />);
     expect(container.querySelectorAll('.cb-line').length).toBe(1);
   });
+
+  // -------------------------------------------------------------------------
+  // W21: markdown render path (toggle + auto-detect + view sync + sanitise)
+  // -------------------------------------------------------------------------
+
+  test('markdown content auto-defaults to Rendered view + exposes a Raw toggle', () => {
+    const md = '# Hello\n\n- one\n- two\n\n```js\nconst x = 1;\n```\n';
+    const { getByText, container } = render(<CodeBlock text={md} />);
+    expect(getByText('Raw')).toBeInTheDocument();
+    expect(container.querySelector('h1')?.textContent).toBe('Hello');
+  });
+
+  test('plain text shows no markdown toggle and stays in Raw view', () => {
+    const { queryByText } = render(<CodeBlock text="just plain text no markdown" />);
+    expect(queryByText('Raw')).toBeNull();
+    expect(queryByText('Rendered')).toBeNull();
+  });
+
+  test('clicking Raw toggle flips to raw monospace view', () => {
+    const md = '# Title\n\nbody';
+    const { getByText, container } = render(<CodeBlock text={md} />);
+    fireEvent.click(getByText('Raw'));
+    expect(container.querySelector('h1')).toBeNull();
+    expect(getByText('Rendered')).toBeInTheDocument();
+  });
+
+  test('view auto-syncs back to Raw when content stops being markdown-eligible', () => {
+    const md = '# Title';
+    const plain = 'plain';
+    const { rerender, queryByText } = render(<CodeBlock text={md} />);
+    expect(queryByText('Raw')).not.toBeNull();
+    rerender(<CodeBlock text={plain} />);
+    expect(queryByText('Raw')).toBeNull();
+    expect(queryByText('Rendered')).toBeNull();
+  });
+
+  test('rendered markdown forbids img / svg / iframe / script for security', () => {
+    const dangerous = [
+      '# Safe',
+      '',
+      '![img](https://example.com/x.png)',
+      '<iframe src="https://evil.example.com"></iframe>',
+      '<svg onload="alert(1)"><circle r="10"/></svg>',
+      '<script>alert(1)</script>',
+    ].join('\n');
+    const { container } = render(<CodeBlock text={dangerous} />);
+    const body = container.querySelector('.cb-markdown');
+    expect(body).not.toBeNull();
+    const html = body!.innerHTML;
+    expect(html).not.toContain('<img');
+    expect(html).not.toContain('<iframe');
+    expect(html).not.toContain('<svg');
+    expect(html).not.toContain('<script');
+    expect(html).not.toContain('onload=');
+    expect(html).toContain('Safe');
+  });
 });

@@ -18,7 +18,7 @@
  * parity with JsonViewer's match emphasis (raw mode only).
  */
 
-import { useCallback, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
@@ -58,12 +58,44 @@ function looksLikeMarkdown(text: string): boolean {
 /** Render markdown to a safe HTML string. Synchronous marked is fine
  *  for the prompt-template scale we're rendering; DOMPurify strips any
  *  script tags / event handlers / data: URIs / etc. that the upstream
- *  content might contain. */
+ *  content might contain.
+ *
+ *  Forbidden tags lock the surface down further: <img>/<picture>/
+ *  <video>/<audio>/<source>/<track> can trigger outbound network
+ *  requests just by rendering, leaking the operator's IP to whatever
+ *  URL the spec author chose. <svg> + <math> have large attack
+ *  surfaces around foreignObject / use[href] / etc. <iframe>/<object>/
+ *  <embed>/<form>/<link>/<meta>/<base>/<style>/<script> are the usual
+ *  active-content vectors. The result is text-only HTML: headers,
+ *  paragraphs, lists, tables, blockquotes, code, fences, inline
+ *  emphasis, links (still allowed; the user clicks intentionally). */
 function renderMarkdown(text: string): string {
   const raw = marked.parse(text, { async: false }) as string;
   return DOMPurify.sanitize(raw, {
     USE_PROFILES: { html: true },
-    FORBID_TAGS: ['style', 'script', 'iframe', 'object', 'embed'],
+    FORBID_TAGS: [
+      'style',
+      'script',
+      'iframe',
+      'object',
+      'embed',
+      'img',
+      'picture',
+      'video',
+      'audio',
+      'source',
+      'track',
+      'svg',
+      'math',
+      'form',
+      'input',
+      'button',
+      'select',
+      'textarea',
+      'link',
+      'meta',
+      'base',
+    ],
   });
 }
 
@@ -173,6 +205,14 @@ export function CodeBlock({
   const [view, setView] = useState<'raw' | 'rendered'>(
     markdownEligible ? 'rendered' : 'raw',
   );
+  // Sync view back to 'raw' when the content stops being
+  // markdown-eligible (e.g. caller swapped the text prop to a plain
+  // string). Without this the toggle disappears AND the renderedHtml
+  // becomes '' — the body would render an empty Sheet with no way
+  // for the user to flip back to raw.
+  useEffect(() => {
+    if (!markdownEligible && view === 'rendered') setView('raw');
+  }, [markdownEligible, view]);
   const [search, setSearch] = useState('');
   const [sheetOpen, setSheetOpen] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -182,13 +222,13 @@ export function CodeBlock({
   const bytes = useMemo(() => new Blob([text]).size, [text]);
   const sizeLabel = bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} kB`;
 
-  // Memoise the rendered HTML: parsing markdown + DOMPurify on every
-  // render is wasteful for long prompts. Only recompute when the text
-  // changes or the view flips into 'rendered'.
+  // Memoise the rendered HTML. Only compute when the user is actually
+  // looking at the rendered view; parsing + sanitising a long prompt
+  // every render is wasteful when the user is in raw mode.
   const renderedHtml = useMemo(() => {
-    if (!markdownEligible) return '';
+    if (!markdownEligible || view !== 'rendered') return '';
     return renderMarkdown(text);
-  }, [text, markdownEligible]);
+  }, [text, markdownEligible, view]);
 
   const onCopy = useCallback(() => void copyText(text), [text]);
   const onDownload = useCallback(

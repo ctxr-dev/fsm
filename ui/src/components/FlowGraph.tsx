@@ -169,9 +169,13 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
       </Tooltip>
       {data.sublabel ? (
         <Tooltip content={data.fullSublabel ?? data.sublabel} delay={400}>
-          <div class="text-[11px] opacity-70 truncate block w-full leading-tight">
+          {/* <span> not <div>: Tooltip's wrapper renders as a <span>,
+              and HTML doesn't allow <div> inside <span>. The `block`
+              class restores div-like layout without invalidating the
+              DOM. */}
+          <span class="text-[11px] opacity-70 truncate block w-full leading-tight">
             {data.sublabel}
-          </div>
+          </span>
         </Tooltip>
       ) : null}
       <Handle
