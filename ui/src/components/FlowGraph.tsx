@@ -395,6 +395,13 @@ export function FlowGraph({
 
   const showMiniMap = miniMap ?? nodes.length > 10;
 
+  // Compute decorated edges BEFORE any conditional return. React's
+  // rules-of-hooks require every hook to be called in the same order
+  // on every render; the previous version put this useMemo after the
+  // empty-graph early return, which threw when the same FlowGraph
+  // flipped between 0 nodes and >0 nodes (Copilot finding on PR #57).
+  const decoratedEdges = useMemo(() => decorateEdges(edges), [edges]);
+
   if (nodes.length === 0) {
     return (
       <div
@@ -418,7 +425,6 @@ export function FlowGraph({
   // stroke colour via currentColor (see decorateEdges). The fitView
   // padding adds breathing room so dagre's wide LR layout doesn't
   // clip nodes at the viewport edges.
-  const decoratedEdges = useMemo(() => decorateEdges(edges), [edges]);
   return (
     <FsmEdgeClickContext.Provider value={onEdgeClick ?? null}>
     <div

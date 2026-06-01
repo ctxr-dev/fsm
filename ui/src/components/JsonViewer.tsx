@@ -127,7 +127,12 @@ export interface JsonViewerProps {
   value: unknown;
   /** Default render mode. Inline = scrollable max-h-40 box. Expanded = tree. */
   mode?: JsonViewerMode;
-  /** Initial collapse depth in expanded mode. Default 2. */
+  /** Initial collapse depth in expanded mode. When OMITTED, the
+   *  "Expanded" view recursively expands every level (the user-
+   *  facing "Expand" button promises full inspection). When
+   *  explicitly passed (even `0`), the caller's number is honoured —
+   *  use this only when the JSON is large enough that auto-expanding
+   *  everything would overwhelm the inline view. */
   defaultExpandDepth?: number;
   /** Inline-mode height cap. Default `max-h-40`. */
   maxInlineHeight?: string;
@@ -179,7 +184,7 @@ function downloadAs(filename: string, text: string): void {
 export function JsonViewer({
   value,
   mode = 'inline',
-  defaultExpandDepth = 2,
+  defaultExpandDepth,
   maxInlineHeight = 'max-h-40',
   rootLabel = 'value',
   onSelect,
@@ -359,18 +364,16 @@ export function JsonViewer({
         <JsonView
           value={value as object}
           // currentMode==='inline' → collapsed at depth 0 (just root
-          // visible); currentMode==='expanded' → recursively expand
-          // EVERY nested level (the user-facing "Expand" button
-          // semantically promises "show me everything", not "show me
-          // the first two layers"). false at the library API expands
-          // all; defaultExpandDepth is preserved as the fallback when
-          // callers explicitly pin a partial depth via the prop.
+          // visible); currentMode==='expanded' → expand recursively
+          // unless the caller pinned a specific depth via the prop.
+          // `undefined` (the default) gets full expansion via the
+          // library's `collapsed={false}` semantics.
           collapsed={
             currentMode === 'inline'
               ? 0
-              : defaultExpandDepth !== 2
-              ? defaultExpandDepth
-              : false
+              : defaultExpandDepth === undefined
+              ? false
+              : defaultExpandDepth
           }
           displayDataTypes={false}
           enableClipboard={false}

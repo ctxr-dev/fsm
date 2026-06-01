@@ -20,7 +20,7 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { act, cleanup, fireEvent, render } from '@testing-library/preact';
 
-import { Tooltip } from '../Tooltip';
+import { Tooltip, __resetTooltipStateForTests } from '../Tooltip';
 
 /**
  * Dispatch a real, bubbling FocusEvent on `el`. @testing-library/preact's
@@ -40,11 +40,15 @@ afterEach(() => {
   vi.unstubAllGlobals();
   // Drain the singleton portal root so each test starts clean.
   document.getElementById('tooltip-root')?.replaceChildren();
+  // Reset module-level singletons (warmUntil / closeAll / id counter)
+  // so the next test starts with a fresh 400-ms delay budget instead
+  // of inheriting a warm window from this test (Copilot finding).
+  __resetTooltipStateForTests();
 });
 
 beforeEach(() => {
-  // Drain singleton state in the module between tests.
   document.getElementById('tooltip-root')?.replaceChildren();
+  __resetTooltipStateForTests();
 });
 
 describe('Tooltip', () => {

@@ -39,6 +39,24 @@ let warmUntil = 0; // wall-clock ms after which the warm window expires
 let closeAll: (() => void) | null = null; // installed by the currently-open instance
 
 /**
+ * Test-only helper: reset every piece of module-level singleton state
+ * so a fresh test run can't be influenced by a stale warm window /
+ * closeAll registration / id counter from the previous test. Call
+ * from `beforeEach` (or `afterEach`) in any suite that renders
+ * <Tooltip>.
+ *
+ * Out of the testing path this is a no-op tool — it doesn't affect
+ * normal app behaviour, but exporting it documents the singleton
+ * surface and keeps the test suite order-independent (Copilot finding
+ * on PR #57: warm window could leak between tests).
+ */
+export function __resetTooltipStateForTests(): void {
+  nextTooltipId = 1;
+  warmUntil = 0;
+  closeAll = null;
+}
+
+/**
  * Returns the singleton #tooltip-root portal target, creating it if
  * absent. The target lives under document.body so the bubble escapes
  * every overflow:hidden ancestor in the app.

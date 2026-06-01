@@ -28,10 +28,14 @@ import { Sheet } from './Sheet';
 
 // Configure marked once at module load. GFM enables tables, task
 // lists, strikethrough, auto-link, etc. breaks=true so single newlines
-// become <br>, matching GitHub's rendering on issues / PRs / comments.
+// become <br>, matching GitHub's rendering on issues / PRs / comments
+// (which is what most operators expect when they author prompt
+// templates). The CommonMark default (breaks=false) collapses single
+// newlines into the surrounding paragraph; that's wrong for the
+// prompt-as-instructions style the FSM ecosystem uses.
 marked.use({
   gfm: true,
-  breaks: false,
+  breaks: true,
 });
 
 // Heuristic: does the text look like markdown? Used to default the
