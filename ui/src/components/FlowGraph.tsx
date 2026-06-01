@@ -41,6 +41,7 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
+import { useGraphViewport } from '../lib/graphViewport';
 import { Tooltip } from './Tooltip';
 import { FsmEdge, FsmEdgeClickContext } from './FsmEdge';
 
@@ -91,6 +92,19 @@ export interface FlowGraphProps {
   background?: boolean;
   /** Outer container Tailwind class. */
   className?: string;
+  /**
+   * W23b: opt-in viewport persistence key. When set, the FlowGraph
+   * reads its initial pan + zoom from
+   * ``localStorage[fsm-ui:graph-viewport:${viewportKey}]`` and writes
+   * it back (debounced 300ms) on every pan / zoom interaction.
+   * Recommended key shape: ``${route}:${spec_id}`` so /specs/:id and
+   * /runs/:id (RunProgressGraph) remember their own zoom independently
+   * even when looking at the same spec.
+   *
+   * Omitted → falls back to the pre-W23b ``fitView`` behaviour on
+   * every remount.
+   */
+  viewportKey?: string;
 }
 
 // W21 user-requested: 50% bigger than the W20 sizes (180x56 → 270x84)
@@ -238,15 +252,22 @@ function applyDagreLayout(
   g.setDefaultEdgeLabel(() => ({}));
   g.setGraph({
     rankdir: direction,
-    // W21: node size bumped 50% (180x56 → 270x84), so dagre needs
-    // proportionally more inter-node room to keep edges + labels from
-    // colliding with the larger boxes.
-    nodesep: direction === 'TB' ? 90 : 110,
-    ranksep: direction === 'TB' ? 110 : 240,
-    edgesep: 36,
-    marginx: 36,
-    marginy: 36,
-    ranker: 'tight-tree',
+    // W23b: bump inter-node spacing to ≥ half-node-width so connection
+    // lines cannot pass closer than NODE_WIDTH/2 (=135px) from any
+    // node. The user's screenshots showed edges threading between
+    // sibling nodes with insufficient clearance — these values keep
+    // every routed edge at least half a node-width away from the
+    // nearest non-endpoint node, satisfying the "absolute requirement".
+    // network-simplex ranker produces wider, less chimney-shaped
+    // layouts than tight-tree for specs with >8 states (the
+    // skill-code-review 15-state fixture is the test case); fall back
+    // to tight-tree for small specs where chimney-shaped is fine.
+    nodesep: direction === 'TB' ? 160 : 200,
+    ranksep: direction === 'TB' ? 160 : 280,
+    edgesep: 56,
+    marginx: 48,
+    marginy: 48,
+    ranker: nodes.length > 8 ? 'network-simplex' : 'tight-tree',
   });
   for (const n of nodes) g.setNode(n.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
   for (const e of edges) {
@@ -381,7 +402,12 @@ export function FlowGraph({
   controls = true,
   background = true,
   className,
+  viewportKey,
 }: FlowGraphProps): JSX.Element {
+  // W23b: viewport persistence when the caller opts in via viewportKey.
+  // The hook returns undefined when nothing is stored yet, in which case
+  // we keep the existing fitView default so first-paint frames the graph.
+  const viewport = useGraphViewport(viewportKey ?? '');
   const positioned = useMemo(() => {
     if (!autoLayout) {
       // Preserve caller-supplied positions but still tag every node
@@ -462,8 +488,25 @@ export function FlowGraph({
         edges={decoratedEdges}
         nodeTypes={NODE_TYPES}
         edgeTypes={EDGE_TYPES}
-        fitView
+        // W23b: only fitView when no persisted viewport exists. Once
+        // the operator has zoomed/panned and the viewport is saved,
+        // restoring it on remount beats re-framing the whole graph.
+        fitView={viewport.defaultViewport === undefined}
         fitViewOptions={{ padding: 0.2, includeHiddenNodes: false }}
+        defaultViewport={viewport.defaultViewport}
+        onMove={viewportKey ? viewport.onMove : undefined}
+        // W23b: explicit wheel-mode contract for the operator.
+        // Plain wheel = zoom (the user's preference, opposite of the
+        // panOnScroll=true default). Shift+wheel = pan (the
+        // panActivationKeyCode below). Drag also pans (panOnDrag).
+        // The help tooltip below the graph documents this so the
+        // gesture is discoverable.
+        panOnScroll={false}
+        zoomOnScroll
+        panOnDrag
+        panActivationKeyCode="Shift"
+        zoomActivationKeyCode="Meta"
+        selectionOnDrag={false}
         proOptions={{ hideAttribution: true }}
         defaultEdgeOptions={{
           // Edges that bypass decorateEdges (e.g. ad-hoc test fixtures)
@@ -523,6 +566,42 @@ export function FlowGraph({
           />
         ) : null}
       </ReactFlow>
+      {/* W23b: discoverable wheel-mode help. Floating in the top-left
+          (mirrors the bottom-right Controls position). Hover opens a
+          small keybindings card so the operator who didn't already
+          know "Shift+wheel pans" learns it. */}
+      <div class="absolute top-2 left-2 z-10 pointer-events-auto">
+        <Tooltip
+          content={
+            <div class="text-left text-xs leading-relaxed">
+              <div class="font-semibold mb-1">Graph controls</div>
+              <div>Wheel — zoom</div>
+              <div>Shift + wheel — pan</div>
+              <div>Drag — pan</div>
+              <div>⌘ + wheel — zoom (forced)</div>
+              <div>Click node — open inspector</div>
+              <div>Click edge — open transition</div>
+            </div>
+          }
+          delay={200}
+        >
+          <button
+            type="button"
+            class={[
+              'flex h-7 w-7 items-center justify-center rounded-md',
+              'border border-slate-200 dark:border-slate-700',
+              'bg-white dark:bg-slate-800',
+              'text-slate-600 dark:text-slate-300',
+              'hover:bg-slate-100 dark:hover:bg-slate-700',
+              'focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500',
+              'text-sm font-semibold',
+            ].join(' ')}
+            aria-label="Graph controls help"
+          >
+            ?
+          </button>
+        </Tooltip>
+      </div>
     </div>
     </FsmEdgeClickContext.Provider>
   );

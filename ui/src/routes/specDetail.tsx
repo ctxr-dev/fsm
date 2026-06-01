@@ -379,6 +379,7 @@ function GraphPanel({ detail }: GraphPanelProps): JSX.Element {
         direction="TB"
         onNodeClick={handleNodeClick}
         onEdgeClick={handleEdgeClick}
+        viewportKey={`specs:${detail.id}`}
       />
     </div>
   );
