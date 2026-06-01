@@ -53,7 +53,7 @@ _INLINE_END = "<!-- bootstrap-content-end -->"
 # demotion (the heading text itself is unchanged; only the leading
 # ``#`` count grows). Used to verify the bootstrap BODY (not just
 # the markers) landed inside the inlined block.
-_BOOTSTRAP_SUBSTRING = "Step 1 — confirm the package is installed"
+_BOOTSTRAP_SUBSTRING = "Step 1 — detect the package, then install ONCE if missing"
 
 
 @pytest.fixture

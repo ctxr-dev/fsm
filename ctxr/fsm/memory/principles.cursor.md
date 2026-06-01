@@ -25,26 +25,74 @@ Before any FSM-using skill or agent does ANYTHING else, follow the bootstrap pro
 
 **Before any work in a skill that depends on `ctxr-fsm`, run this once per session.** It is idempotent and fast (<500ms) when the project is already initialised and the supervisor is running.
 
-#### Step 1 — confirm the package is installed
+#### Step 1 — detect the package, then install ONCE if missing
+
+**Decision tree (no improvising):**
 
 ```bash
-uv run ctxr-fsm --version  # or: pipx run ctxr-fsm --version
+### Detect. Clear PACKAGE_MISSING and FSM_CMD first so pre-set env vars
+### from the parent shell can't force-install or wedge the runner. Try
+### `uv run` first (project-installed ctxr-fsm wins; `uv run` honours
+### the workdir pyproject.toml when present and falls back to the
+### UV_PROJECT_ENVIRONMENT cache otherwise). On miss, fall through to
+### `command -v` (catches pipx / pip --user installs that don't live
+### in a uv environment).
+#
+### FSM_CMD captures the runner that succeeded so Step 2 invokes the
+### same one — otherwise `uv run ctxr-fsm ensure` would fail for a
+### pipx-installed package and send the caller back to Step 1
+### (risking duplicate installs, which this doc is trying to prevent).
+unset PACKAGE_MISSING FSM_CMD
+if uv run --quiet ctxr-fsm --version >/dev/null 2>&1; then
+  FSM_CMD="uv run ctxr-fsm"
+elif command -v ctxr-fsm >/dev/null 2>&1; then
+  FSM_CMD="ctxr-fsm"
+else
+  PACKAGE_MISSING=1
+fi
 ```
 
-If this prints a version, skip to Step 2. If it errors with "command not found":
+If `PACKAGE_MISSING` is set, follow this rule **exactly once**, in this order:
 
-```bash
-uv add ctxr-fsm                              # in a uv project
-pipx install ctxr-fsm                        # globally, isolated
-pip install --user ctxr-fsm                  # last resort
-```
+| Workdir state | Run THIS command (and only this command) |
+|---|---|
+| `pyproject.toml` exists at workdir root | `uv add 'ctxr-fsm[all]'` |
+| No `pyproject.toml`, `pipx` on `PATH` | `pipx install 'ctxr-fsm[all]'` |
+| Neither | Return `MissingRequirement` and ASK the user (Principle 1). Do not pick a third path on your own. |
 
-Then retry the version check. If it still fails, return `MissingRequirement` and STOP — do NOT improvise.
+After the install command completes, re-run the version check from the top of this step to confirm.
+
+**Hard rules to prevent the common LLM failure modes:**
+
+- **Resolve "this workdir" BEFORE installing.** Walk up from `cwd` looking for `pyproject.toml`; if none, treat `cwd` as the workdir. Run the install command from that directory and nowhere else. An install in the wrong directory lands in the wrong project venv and the next session sees a "missing" package again.
+- **Do not run a second installer in a different directory.** One per workdir, ever. If the first command fails, surface the error to the user, do not silently try the next row.
+- **Do not try the three installers in sequence "just in case".** Each one targets a different install scope (project venv vs user-isolated vs system); chaining them creates multiple installs that drift and confuse the next session.
+- **Concurrency:** if `.ctxr-fsm/install.lock/` exists, another session is mid-install. Wait or back off; do not run the install command. **The CALLER (you, the skill or agent following this doc) wraps the install in the lock — `uv add` / `pipx install` do NOT manage it themselves.** The contract is `mkdir -p .ctxr-fsm/` followed by `mkdir .ctxr-fsm/install.lock` BEFORE the install command, `rmdir .ctxr-fsm/install.lock` AFTER (success or failure). The first `mkdir -p` is idempotent and just ensures the parent directory exists (cold projects have no `.ctxr-fsm/` until `ctxr-fsm ensure` creates it); the second is the atomic lock acquisition that fails fast when another caller holds the lock. On a crash that leaves the lock dangling, the operator unwedges with `rmdir .ctxr-fsm/install.lock`.
+
+If the install fails for any reason (permission, network, version pin), return `MissingRequirement` to the caller with the captured stderr and STOP. Do not improvise.
 
 #### Step 2 — bootstrap the project (`ctxr-fsm ensure`)
 
+**Probe first to short-circuit on a warm project.** `ensure --check` is the read-only probe; if it reports `ready`, you are done and MUST skip the rest of this file. Use `$FSM_CMD` carried forward from Step 1 so a pipx-installed package isn't re-probed via `uv run` (which would fail and falsely report missing):
+
 ```bash
-uv run ctxr-fsm ensure --json
+$FSM_CMD ensure --check --json
+```
+
+Routing rule (no improvising):
+
+| `--check` JSON `status` | Action |
+|---|---|
+| `ready` | **DONE. Skip every other step in this file** and proceed to your skill's actual work. The project is fully bootstrapped. |
+| `missing_init` / `missing_supervisor` / `missing_mcp_config` / `missing_memory` | Run the full `ensure` command below to apply the missing axis. |
+| `failed` | The check itself succeeded but the project is in an unrecoverable state (e.g. corrupt DB). Return `MissingRequirement` to the caller with the JSON envelope and STOP — do not re-run `ensure --json` blindly. |
+| Exit non-zero AND no JSON, AND `FSM_CMD` was just set in Step 1 (i.e. the runner responded to `--version` seconds ago) | This is a **broken install** crashing before it can emit JSON (import error, Python version mismatch, corrupt venv). Capture stderr, return `MissingRequirement` with the captured output, and STOP. Do NOT loop back to Step 1 — reinstalling will not fix a runtime crash, and on a shared workdir it will trample whatever the operator was debugging. |
+| Exit non-zero AND no JSON, AND Step 1 left `PACKAGE_MISSING=1` (the runner check itself failed) | The package isn't installed in this workdir — go back to Step 1's install table. This branch only fires when you got here in error (Step 2 should not have been attempted with `PACKAGE_MISSING` set). |
+
+When the status is `missing_*` (and ONLY then), apply the changes by re-invoking with the same runner:
+
+```bash
+$FSM_CMD ensure --json
 ```
 
 This is idempotent. On a cold project it: creates `.ctxr-fsm/fsm.db`, runs migrations, installs principles into CLAUDE.md/AGENTS.md/.cursor/rules, registers `ctxr-fsm` as an MCP server in the active client config(s), boots the supervisor (MCP + FastAPI + UI). On a warm project it returns in <500ms confirming everything is up.
@@ -89,7 +137,7 @@ This is the path skills should default to when invoked from a Bash-driven shell 
 Skills that ship an FsmSpec must register it before `start_run`:
 
 ```bash
-uv run ctxr-fsm spec register <your.module.path:fsm>
+$FSM_CMD spec register <your.module.path:fsm>
 ```
 
 Idempotent — re-registering the same spec at the same version is a no-op. If the spec's body changed, fsm bumps `fsm_specs.version` automatically.
