@@ -67,7 +67,7 @@ from pydantic import BaseModel, Field
 import ctxr.fsm
 from ctxr.fsm.api import _state
 from ctxr.fsm.api._deps import ProjectDep, require_auth
-from ctxr.fsm.api._paths import project_root_and_relative
+from ctxr.fsm.api._paths import looks_like_filesystem_db_path, project_root_and_relative
 from ctxr.fsm.sqlite import Project
 
 __all__ = ["ProjectMetadata", "app", "lifespan_handler"]
@@ -318,7 +318,11 @@ def get_current_project(project: ProjectDep) -> ProjectMetadata:
     db_path = db_url_database or str(project.engine.url)
     project_root_str: str | None = None
     db_relative: str | None = None
-    if db_url_database:
+    # `looks_like_filesystem_db_path` filters out :memory:, the URI
+    # in-memory variant, and any other non-file sentinel SQLAlchemy
+    # could expose — a plain `if db_url_database:` truthy check would
+    # treat ':memory:' as a path and resolve it under cwd.
+    if looks_like_filesystem_db_path(db_url_database):
         project_root_path, db_relative = project_root_and_relative(db_url_database)
         project_root_str = str(project_root_path)
     return ProjectMetadata(

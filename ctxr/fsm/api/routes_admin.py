@@ -53,7 +53,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from starlette.concurrency import run_in_threadpool
 
 from ctxr.fsm.api._deps import ProjectDep, require_auth
-from ctxr.fsm.api._paths import project_root_and_relative
+from ctxr.fsm.api._paths import looks_like_filesystem_db_path, project_root_and_relative
 from ctxr.fsm.core.models import JournalStatus
 from ctxr.fsm.sqlite import (
     CommitSignatureRecord,
@@ -419,7 +419,10 @@ def _build_doctor_report(
 
     project_root_str: str | None = None
     db_path_relative: str | None = None
-    if db_url_database:
+    # `looks_like_filesystem_db_path` filters out :memory: and the URI
+    # in-memory variant (and the empty string), so we never derive a
+    # fake project_root for a non-file backend.
+    if looks_like_filesystem_db_path(db_url_database):
         project_root_path, db_path_relative = project_root_and_relative(db_url_database)
         project_root_str = str(project_root_path)
     return DoctorReport(
