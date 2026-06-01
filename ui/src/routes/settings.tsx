@@ -87,8 +87,25 @@ export function SettingsRoute(): JSX.Element {
           <div class="flex items-center justify-center py-6"><Spinner label="Loading project metadata" /></div>
         ) : (
           <dl class="grid grid-cols-1 sm:grid-cols-[10rem_1fr] gap-x-4 gap-y-2 text-sm">
+            {/* W22 Fix 5: display DB path RELATIVE to the project root
+                so the value stays portable across machines and can be
+                committed to shared configs. Falls back to the absolute
+                form when the server is older than W22 (the new field
+                is optional on the wire), and the absolute form is
+                also surfaced below as a small slate-tinted line for
+                operators who genuinely need it (debugging a non-
+                canonical --db location). */}
             <dt class="text-slate-500 dark:text-slate-400">DB path</dt>
-            <dd><code class="font-mono text-xs break-all">{report.db_path}</code></dd>
+            <dd>
+              <code class="font-mono text-xs break-all text-emerald-700 dark:text-emerald-300">
+                {report.db_path_relative ?? report.db_path}
+              </code>
+              {report.project_root && report.db_path_relative ? (
+                <div class="text-[10px] text-slate-400 dark:text-slate-500 mt-0.5 break-all">
+                  relative to <code class="font-mono">{report.project_root}</code>
+                </div>
+              ) : null}
+            </dd>
             <dt class="text-slate-500 dark:text-slate-400">SQLite user_version</dt>
             <dd><code class="font-mono text-xs">{pragma(report, 'user_version')}</code></dd>
             <dt class="text-slate-500 dark:text-slate-400">Alembic revision</dt>

@@ -274,6 +274,13 @@ function applyDagreLayout(
     return {
       ...n,
       position: { x: x - NODE_WIDTH / 2, y: y - NODE_HEIGHT / 2 },
+      // xyflow v12 MiniMap reads node.width / node.height to draw the
+      // thumbnail rectangle. Without these, the mini-map shows only the
+      // viewport indicator + grid, no node dots (W22 user-visible bug).
+      // Stamping the same dimensions we already feed dagre keeps the
+      // mini-map in lockstep with the on-canvas layout.
+      width: NODE_WIDTH,
+      height: NODE_HEIGHT,
       sourcePosition: direction === 'LR' ? Position.Right : Position.Bottom,
       targetPosition: direction === 'LR' ? Position.Left : Position.Top,
       type: 'fsmNode',
@@ -387,6 +394,12 @@ export function FlowGraph({
       const tp = direction === 'LR' ? Position.Left : Position.Top;
       return nodes.map((n) => ({
         ...n,
+        // W22: stamp width/height so MiniMap renders thumbnails even
+        // for callers that supply manual positions. Only fill in
+        // defaults — callers that explicitly set per-node dimensions
+        // (a future cardinality-aware layout) keep their values.
+        width: n.width ?? NODE_WIDTH,
+        height: n.height ?? NODE_HEIGHT,
         sourcePosition: n.sourcePosition ?? sp,
         targetPosition: n.targetPosition ?? tp,
         type: n.type ?? 'fsmNode',

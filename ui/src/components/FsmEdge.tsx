@@ -128,17 +128,37 @@ export function FsmEdge(props: EdgeProps): JSX.Element {
             }}
             data-edge-id={id}
           >
+            {(() => {
+              // W22: highlight predicate edges — deterministic /
+              // judgement transitions carry meaningful guard text and
+              // should pop visually. always / otherwise bare guards
+              // keep the neutral slate badge so the eye is drawn to
+              // the conditions that actually MATTER for understanding
+              // why the FSM branched.
+              const kind = ed.kind;
+              const isPredicate = kind === 'deterministic' || kind === 'judgement';
+              const badgeClass = isPredicate
+                ? [
+                    'inline-block max-w-[160px] truncate cursor-pointer',
+                    'rounded px-1.5 py-0.5 text-[10px] leading-tight font-semibold font-mono',
+                    'bg-amber-100 dark:bg-amber-900/40',
+                    'border border-amber-400 dark:border-amber-600',
+                    'text-amber-900 dark:text-amber-200',
+                    'focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500',
+                  ].join(' ')
+                : [
+                    'inline-block max-w-[160px] truncate cursor-pointer',
+                    'rounded px-1.5 py-0.5 text-[10px] leading-tight',
+                    'bg-[var(--xy-label-bg,#f8fafc)]/90',
+                    'border border-slate-200 dark:border-slate-700',
+                    'text-slate-700 dark:text-slate-200',
+                    'focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500',
+                  ].join(' ');
+              return (
             <Tooltip content={fullText} delay={400}>
               <button
                 type="button"
-                class={[
-                  'inline-block max-w-[160px] truncate cursor-pointer',
-                  'rounded px-1.5 py-0.5 text-[10px] leading-tight',
-                  'bg-[var(--xy-label-bg,#f8fafc)]/90',
-                  'border border-slate-200 dark:border-slate-700',
-                  'text-slate-700 dark:text-slate-200',
-                  'focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500',
-                ].join(' ')}
+                class={badgeClass}
                 // No native title= here: the custom Tooltip already
                 // surfaces fullText with the right delay + ARIA wiring,
                 // and a sibling native title would produce a double
@@ -154,6 +174,8 @@ export function FsmEdge(props: EdgeProps): JSX.Element {
                 {visibleLabel}
               </button>
             </Tooltip>
+              );
+            })()}
           </div>
         </EdgeLabelRenderer>
       ) : null}

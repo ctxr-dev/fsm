@@ -278,7 +278,15 @@ export interface CommitSignatureRecord {
 
 /** Admin: doctor-report payload (mirrors ``ctxr-fsm doctor``). */
 export interface DoctorReport {
+  /** Absolute filesystem path of the open DB file. */
   db_path: string;
+  /** Absolute path of the project root that hosts ``.ctxr-fsm/``.
+   *  Optional so the UI handles servers older than W22 gracefully. */
+  project_root?: string;
+  /** DB path rendered relative to ``project_root``. UI surfaces
+   *  prefer this so the displayed value stays portable. Canonical
+   *  layout: ``.ctxr-fsm/fsm.db``. */
+  db_path_relative?: string;
   pragmas: JsonObject;
   tables_with_row_counts: Record<string, number>;
   alembic_revision: string | null;

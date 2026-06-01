@@ -251,6 +251,46 @@ describe('specToGraph', () => {
     expect(data.fullLabel).toBe('x > 0');
   });
 
+  // -------------------------------------------------------------------------
+  // W22: redundant `inline: <handler_id>` sublabel suppression
+  // -------------------------------------------------------------------------
+
+  test('W22: inline state whose handler_id mirrors state id drops the redundant `inline:` line', () => {
+    const g = specToGraph({
+      states: [{ id: 'synth', inline: { handler_id: 'synth' }, outputs: ['x', 'y'], transitions: [{ to: 'done', when: 'always' }] }, { id: 'done' }],
+    });
+    // Visible row no longer mirrors the label.
+    expect(g.nodes[0].data.sublabel).not.toBe('inline: synth');
+    // ...but the canonical line stays on fullSublabel for the hover
+    // + inspector path.
+    expect(g.nodes[0].data.fullSublabel).toBe('inline: synth');
+    // Structural fallback shows up.
+    expect(g.nodes[0].data.sublabel).toContain('output');
+  });
+
+  test('W22: inline.purpose is preferred over the structural summary when present', () => {
+    const g = specToGraph({
+      states: [{ id: 'judge', inline: { handler_id: 'judge', purpose: 'rank candidates' }, outputs: ['ranked'] }],
+    });
+    expect(g.nodes[0].data.sublabel).toBe('rank candidates');
+  });
+
+  test('W22: structural summary surfaces verifier and post-val counts', () => {
+    const g = specToGraph({
+      states: [{ id: 'check', inline: { handler_id: 'check' }, verifier: {}, post_validations: [1, 2] }],
+    });
+    const sub = g.nodes[0].data.sublabel ?? '';
+    expect(sub).toContain('verifier');
+    expect(sub).toContain('post-val ×2');
+  });
+
+  test('W22: non-mirroring handler_id keeps the canonical line (no false-positive demotion)', () => {
+    const g = specToGraph({
+      states: [{ id: 's', inline: { handler_id: 'aggregate' } }],
+    });
+    expect(g.nodes[0].data.sublabel).toBe('inline: aggregate');
+  });
+
   test('W21: bare predicate-string when is treated as deterministic', () => {
     const g = specToGraph({
       states: [

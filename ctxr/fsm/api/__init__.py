@@ -67,6 +67,7 @@ from pydantic import BaseModel, Field
 import ctxr.fsm
 from ctxr.fsm.api import _state
 from ctxr.fsm.api._deps import ProjectDep, require_auth
+from ctxr.fsm.api._paths import project_root_and_relative
 from ctxr.fsm.sqlite import Project
 
 __all__ = ["ProjectMetadata", "app", "lifespan_handler"]
@@ -219,7 +220,25 @@ class ProjectMetadata(BaseModel):
 
     fsm_version: str = Field(..., description="The ``ctxr.fsm`` package version.")
     project_open: bool = Field(..., description="Whether the :class:`Project` is bound.")
-    db_path: str = Field(..., description="Filesystem path of the open SQLite database.")
+    db_path: str = Field(..., description="Absolute filesystem path of the open SQLite database.")
+    project_root: str = Field(
+        ...,
+        description=(
+            "Absolute path of the project root that hosts ``.ctxr-fsm/``."
+            " Computed by walking up from the resolved DB path; falls"
+            " back to the DB's parent.parent when no ``.ctxr-fsm/`` is"
+            " found (operator passed a non-canonical ``--db``)."
+        ),
+    )
+    db_path_relative: str = Field(
+        ...,
+        description=(
+            "Path of the open DB relative to ``project_root``. For the"
+            " canonical layout this is ``.ctxr-fsm/fsm.db``. UI surfaces"
+            " prefer this over ``db_path`` so the value stays portable"
+            " across machines + commitable to shared configs."
+        ),
+    )
 
 
 # ── Health endpoints ───────────────────────────────────────────────
@@ -285,10 +304,17 @@ def get_current_project(project: ProjectDep) -> ProjectMetadata:
     # (memory, network) still returns something useful instead of
     # ``None``.
     db_path = project.engine.url.database or str(project.engine.url)
+    # Derive project_root + db_path_relative for portable display
+    # (the UI prefers the relative form for the topbar / Settings
+    # surface — sharing absolute paths across machines is exactly
+    # what this contract avoids).
+    project_root_path, db_relative = project_root_and_relative(db_path)
     return ProjectMetadata(
         fsm_version=ctxr.fsm.__version__,
         project_open=True,
         db_path=db_path,
+        project_root=str(project_root_path),
+        db_path_relative=db_relative,
     )
 
 

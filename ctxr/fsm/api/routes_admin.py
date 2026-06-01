@@ -53,6 +53,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from starlette.concurrency import run_in_threadpool
 
 from ctxr.fsm.api._deps import ProjectDep, require_auth
+from ctxr.fsm.api._paths import project_root_and_relative
 from ctxr.fsm.core.models import JournalStatus
 from ctxr.fsm.sqlite import (
     CommitSignatureRecord,
@@ -131,7 +132,24 @@ class DoctorReport(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
-    db_path: str = Field(..., description="Filesystem path of the open DB file.")
+    db_path: str = Field(..., description="Absolute filesystem path of the open DB file.")
+    project_root: str = Field(
+        ...,
+        description=(
+            "Absolute path of the project root that hosts ``.ctxr-fsm/``."
+            " UI surfaces use it as the anchor for portable, relative"
+            " display of the DB path."
+        ),
+    )
+    db_path_relative: str = Field(
+        ...,
+        description=(
+            "DB path rendered relative to ``project_root``. Canonical"
+            " layout: ``.ctxr-fsm/fsm.db``. UI prefers this over"
+            " ``db_path`` so the displayed value stays portable across"
+            " machines and committable to shared configs."
+        ),
+    )
     pragmas: dict[str, Any] = Field(
         default_factory=dict,
         description=(
@@ -381,8 +399,11 @@ def _build_doctor_report(
     journal_breakdown = _journal_status_breakdown(session_factory)
     lock_count = _lock_table_count(session_factory)
 
+    project_root, db_path_relative = project_root_and_relative(db_path)
     return DoctorReport(
         db_path=db_path,
+        project_root=str(project_root),
+        db_path_relative=db_path_relative,
         pragmas=pragmas,
         tables_with_row_counts=row_counts,
         alembic_revision=revision,
