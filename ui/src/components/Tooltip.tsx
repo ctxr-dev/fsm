@@ -95,8 +95,6 @@ function computePosition(
   const margin = 8;
   const vw = window.innerWidth;
   const vh = window.innerHeight;
-  let top: number;
-  let left: number;
   let flipped = false;
 
   const placeTop = (): { top: number; left: number } => ({
@@ -108,22 +106,28 @@ function computePosition(
     left: trigger.left + trigger.width / 2 - bubble.width / 2,
   });
 
-  const initial = placement === 'bottom' ? placeBottom() : placeTop();
-  top = initial.top;
-  left = initial.left;
-  if (top < margin) {
-    const flipTo = placement === 'bottom' ? placeTop() : placeBottom();
-    if (
-      flipTo.top >= margin &&
-      flipTo.top + bubble.height <= vh - margin
-    ) {
-      top = flipTo.top;
-      left = flipTo.left;
+  const fitsVertically = (candidateTop: number): boolean =>
+    candidateTop >= margin && candidateTop + bubble.height <= vh - margin;
+
+  // Auto-flip is symmetric: if the preferred side clips EITHER the top
+  // OR bottom edge AND the opposite side fits, we flip. Without this,
+  // placement='bottom' near the page bottom would clamp the bubble
+  // over the trigger instead of flipping above it.
+  const preferred = placement === 'bottom' ? placeBottom() : placeTop();
+  let top = preferred.top;
+  let left = preferred.left;
+  if (!fitsVertically(top)) {
+    const alternate = placement === 'bottom' ? placeTop() : placeBottom();
+    if (fitsVertically(alternate.top)) {
+      top = alternate.top;
+      left = alternate.left;
       flipped = true;
-    } else {
-      top = margin;
     }
   }
+
+  // Final clamp so the bubble never punches outside the viewport even
+  // when neither side fits cleanly (e.g. on a very short window).
+  if (top < margin) top = margin;
   if (top + bubble.height > vh - margin) {
     top = Math.max(margin, vh - bubble.height - margin);
   }
@@ -187,8 +191,18 @@ export function Tooltip(props: TooltipProps): JSX.Element {
     setOpen(false);
   }, []);
 
-  // Suppress native title= on the trigger so the browser doesn't
-  // race our bubble with its own. Restore on close.
+  // The wrapping span ALMOST never has a native title= (callers attach
+  // title to the inner trigger child, not to the Tooltip wrapper),
+  // but if a future caller does add one via the className prop's
+  // sibling attributes we strip it on open and restore on close so the
+  // browser doesn't race our bubble with its native title popup.
+  //
+  // NOT SUPPORTED: we do NOT recursively suppress title= on the inner
+  // children. Callers must avoid setting `title=` on the trigger child
+  // when it is already wrapped in <Tooltip> — that would produce a
+  // double bubble (instant native + delayed custom). The audit-strings
+  // lint catches this in practice; the contract is documented at the
+  // top of this file.
   const suppressTitle = (): void => {
     const el = triggerRef.current;
     if (!el) return;

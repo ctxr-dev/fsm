@@ -174,10 +174,17 @@ function StateInspectorBody({ state, isEntry }: StateInspectorBodyProps): JSX.El
             {transitions.map((t, idx) => {
               const target = typeof t.to === 'string' ? t.to : '(unknown)';
               const tKind = typeof t.kind === 'string' ? t.kind : undefined;
+              // Mirror specGraph.predicateLabel(): an object-form
+              // `when` can encode the predicate under EITHER `.predicate`
+              // OR `.expression`. Checking only one of the two leaves
+              // the inspector blank for transitions whose graph edge
+              // label/tooltip is non-empty — a confusing divergence.
               const when = typeof t.when === 'string'
                 ? t.when
                 : t.when && typeof t.when === 'object'
-                ? ((t.when as Record<string, unknown>).predicate as string | undefined) ?? ''
+                ? (((t.when as Record<string, unknown>).predicate as string | undefined)
+                    ?? ((t.when as Record<string, unknown>).expression as string | undefined)
+                    ?? '')
                 : '';
               return (
                 <li key={`${target}-${idx}`} class="py-1.5 flex items-center gap-2">

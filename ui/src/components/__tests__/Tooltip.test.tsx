@@ -227,6 +227,36 @@ describe('Tooltip', () => {
     expect(queryByRole('tooltip')).toBeNull();
   });
 
+  test('auto-flips placement=bottom to top when the bubble would clip the bottom edge', () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('innerWidth', 1000);
+    vi.stubGlobal('innerHeight', 400);
+    const { container, queryByRole } = render(
+      <Tooltip content="flip-me" delay={0} placement="bottom">
+        <button type="button">trigger</button>
+      </Tooltip>,
+    );
+    const wrapper = container.firstChild as HTMLElement;
+    // Stub trigger close to the bottom edge so placement=bottom clips
+    // but placement=top fits.
+    vi.spyOn(wrapper, 'getBoundingClientRect').mockReturnValue({
+      x: 200, y: 360, top: 360, left: 200, right: 240, bottom: 380, width: 40, height: 20,
+      toJSON() { return this; },
+    } as DOMRect);
+    fireEvent.mouseEnter(wrapper);
+    act(() => { vi.advanceTimersByTime(0); });
+    const tip = queryByRole('tooltip') as HTMLElement | null;
+    expect(tip).not.toBeNull();
+    vi.spyOn(tip!, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, top: 0, left: 0, right: 120, bottom: 60, width: 120, height: 60,
+      toJSON() { return this; },
+    } as DOMRect);
+    // Force re-measure.
+    act(() => { fireEvent(window, new Event('resize')); });
+    // Flipped to top → bubble top should be ABOVE the trigger top.
+    expect(parseFloat(tip!.style.top)).toBeLessThan(360);
+  });
+
   test('viewport-edge clamping pulls the bubble inside the right edge', () => {
     vi.useFakeTimers();
     const innerWidth = 1000;
