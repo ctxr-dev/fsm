@@ -63,7 +63,8 @@ Routing rule (no improvising):
 | `ready` | **DONE. Skip every other step in this file** and proceed to your skill's actual work. The project is fully bootstrapped. |
 | `missing_init` / `missing_supervisor` / `missing_mcp_config` / `missing_memory` | Run the full `ensure` command below to apply the missing axis. |
 | `failed` | The check itself succeeded but the project is in an unrecoverable state (e.g. corrupt DB). Return `MissingRequirement` to the caller with the JSON envelope and STOP — do not re-run `ensure --json` blindly. |
-| Exit non-zero AND no JSON on stdout | The package itself isn't installed in this workdir — go back to Step 1. |
+| Exit non-zero AND no JSON, AND `FSM_CMD` was just set in Step 1 (i.e. the runner responded to `--version` seconds ago) | This is a **broken install** crashing before it can emit JSON (import error, Python version mismatch, corrupt venv). Capture stderr, return `MissingRequirement` with the captured output, and STOP. Do NOT loop back to Step 1 — reinstalling will not fix a runtime crash, and on a shared workdir it will trample whatever the operator was debugging. |
+| Exit non-zero AND no JSON, AND Step 1 left `PACKAGE_MISSING=1` (the runner check itself failed) | The package isn't installed in this workdir — go back to Step 1's install table. This branch only fires when you got here in error (Step 2 should not have been attempted with `PACKAGE_MISSING` set). |
 
 When the status is `missing_*` (and ONLY then), apply the changes by re-invoking with the same runner:
 
