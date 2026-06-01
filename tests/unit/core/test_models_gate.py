@@ -237,3 +237,83 @@ def test_state_gate_without_outputs_or_transitions_still_typed_as_gate() -> None
         ),
     )
     assert state.kind is StateKind.gate
+
+
+# ---------------------------------------------------------------------------
+# Brief.gate surface + EventKind extensions
+# ---------------------------------------------------------------------------
+
+
+def test_event_kind_has_gate_members() -> None:
+    from ctxr.fsm.core.models import EventKind
+
+    assert EventKind.gate_resolved.value == "gate_resolved"
+    assert EventKind.gate_resolution_failed.value == "gate_resolution_failed"
+    assert EventKind.gate_binding_recorded.value == "gate_binding_recorded"
+
+
+def test_build_brief_surfaces_gate_when_state_is_gate() -> None:
+    import uuid as _uuid
+
+    from ctxr.fsm.core.engine import build_brief
+
+    state = State(
+        id="await_review",
+        gate=Gate(
+            source_kind=GateSourceKind.llm_supplied,
+            response_schema=_SCHEMA,
+        ),
+        outputs=["review_verdict"],
+        transitions=[Transition(to="ship", when=TransitionKind.always)],
+    )
+    # FsmSpec stub is only used for its id; build the smallest legal spec.
+    from ctxr.fsm.core.models import FsmSpec
+
+    spec = FsmSpec(
+        id="demo",
+        version=1,
+        entry="await_review",
+        states=[
+            state,
+            State(id="ship", transitions=[]),
+        ],
+    )
+    brief = build_brief(spec, state, env={}, run_id=_uuid.uuid4())
+
+    assert brief.gate is not None
+    assert brief.gate.source_kind is GateSourceKind.llm_supplied
+    # Has no worker / loop — consumers branch on gate to switch from
+    # commit_outputs to resolve_gate.
+    assert brief.has_worker is False
+    assert brief.has_loop is False
+    assert brief.worker is None
+    assert brief.loop is None
+
+
+def test_build_brief_carries_no_gate_for_non_gate_states() -> None:
+    import uuid as _uuid
+
+    from ctxr.fsm.core.engine import build_brief
+    from ctxr.fsm.core.models import FsmSpec
+
+    state = State(
+        id="plan",
+        worker=Worker(
+            role="planner",
+            prompt_template="do the work",
+            inputs=[],
+            response_schema=_SCHEMA,
+        ),
+        outputs=["verdict"],
+        transitions=[Transition(to="end", when=TransitionKind.always)],
+    )
+    spec = FsmSpec(
+        id="demo",
+        version=1,
+        entry="plan",
+        states=[state, State(id="end", transitions=[])],
+    )
+    brief = build_brief(spec, state, env={}, run_id=_uuid.uuid4())
+
+    assert brief.gate is None
+    assert brief.has_worker is True

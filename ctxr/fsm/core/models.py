@@ -179,6 +179,15 @@ class EventKind(StrEnum):
     commit_token_expired = "commit_token_expired"
     inline_executed = "inline_executed"
     inline_failed = "inline_failed"
+    # W23g cross-FSM gates: gate_resolved when fsm.resolve_gate has
+    # validated + landed a value; gate_resolution_failed for any error
+    # envelope listed in GATE_CONTRACT.md; gate_binding_recorded when
+    # a binding row lands in the gate_bindings table (source_kind
+    # 'run_output' bindings only, since 'llm_supplied' resolutions
+    # have no cross-run link to record).
+    gate_resolved = "gate_resolved"
+    gate_resolution_failed = "gate_resolution_failed"
+    gate_binding_recorded = "gate_binding_recorded"
 
 
 class DeliveryStatus(StrEnum):
@@ -934,6 +943,12 @@ class Brief(BaseModel):
     allowed_tools: list[str] = Field(default_factory=list)
     worker: Worker | None = None
     loop: Loop | None = None
+    # W23g cross-FSM gates: when the current state is a gate, the
+    # brief carries the Gate body (response_schema + bindings +
+    # source_kind) instead of a Worker. has_worker and has_loop both
+    # stay False; consumers branch on `gate is not None` to switch
+    # from the commit_outputs path to the resolve_gate path.
+    gate: Gate | None = None
     iteration_n: int | None = None
     outputs_path: str | None = None
     brief_id: uuid.UUID

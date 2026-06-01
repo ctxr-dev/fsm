@@ -233,6 +233,12 @@ def build_brief(
         allowed_tools=list(state.allowed_tools),
         worker=worker,
         loop=state.loop,
+        # W23g: surface the gate body when this state is a gate state.
+        # The engine pause-on-gate dispatch + fsm.resolve_gate MCP tool
+        # consume this in a follow-up commit; the brief surface is
+        # locked here so MCP / API / UI clients can recognise gate
+        # briefs immediately.
+        gate=state.gate,
         iteration_n=effective_iteration,
         outputs_path=outputs_path,
         brief_id=brief_id if brief_id is not None else _new_brief_id(),
