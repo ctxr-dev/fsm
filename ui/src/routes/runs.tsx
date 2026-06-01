@@ -43,6 +43,7 @@ import {
 import {
   api,
   ApiError,
+  walkAllPages,
   type ListRunsParams,
   type Page,
   type RunSummary,
@@ -66,13 +67,6 @@ const STATUS_FILTERS: readonly { value: string; label: string }[] = [
 
 /** Default page size — kept modest so the first paint is cheap. */
 const DEFAULT_PAGE_SIZE = 25;
-
-/**
- * Upper bound the API will accept for ``?page_size=``. Mirrors the
- * server-side ``MAX_PAGE_SIZE`` cap (ctxr/fsm/api/_pagination.py).
- * Used when walking pages to populate the spec resolver below.
- */
-const MAX_PAGE_SIZE = 200;
 
 /** Event kinds that should trigger a list refresh. */
 const REFRESH_EVENT_KINDS: ReadonlySet<string> = new Set([
@@ -152,31 +146,13 @@ function specCell(run: RunSummary, resolver: Map<string, { slug: string; version
   return run.fsm_spec_id.slice(0, 12) + '…';
 }
 
-/**
- * Walk every page of ``api.listSpecs()`` and return the merged list.
- *
- * Used by the spec-resolver bootstrap below — the resolver needs every
- * spec the project has ever registered, not just the first page worth,
- * so the Spec column on each run row can render ``slug v<n>`` rather
- * than a raw UUID. Kept inline (rather than promoted to a shared
- * helper) per the W22b3 migration brief: the few routes that need
- * "all rows" can each pay the small bespoke cost until a real pattern
- * emerges.
- */
-async function fetchAllSpecs(): Promise<SpecSummary[]> {
-  const all: SpecSummary[] = [];
-  let page = 1;
-  // Defensive cap: ten pages of 200 = 2000 specs. If a project has
-  // more than that, the loop still terminates and the resolver simply
-  // misses the very tail; the row falls back to the UUID prefix.
-  for (let i = 0; i < 10; i++) {
-    const result = await api.listSpecs({ page, page_size: MAX_PAGE_SIZE });
-    for (const s of result.items) all.push(s);
-    if (!result.has_next) break;
-    page += 1;
-  }
-  return all;
-}
+// Spec resolver bootstrap delegates to the shared ``walkAllPages``
+// helper in ``lib/api.ts``. Pre-W22b2-iter we had a bespoke inline
+// loop here that capped at 10 pages of 200 (2000 specs); the shared
+// helper offers a 50-page default with the same per-page size. The
+// resolver needs every spec the project has ever registered, not
+// just the first page, so the Spec column on each run row can render
+// ``slug v<n>`` rather than a raw UUID.
 
 // ---------------------------------------------------------------------------
 // Filter bar
@@ -354,8 +330,8 @@ export function Runs(): JSX.Element {
   // the project may have more specs than fit in one page.
   useEffect(() => {
     let cancelled = false;
-    fetchAllSpecs()
-      .then((specs) => {
+    walkAllPages((p) => api.listSpecs(p), {}, 10)
+      .then((specs: SpecSummary[]) => {
         if (cancelled) return;
         const m = new Map<string, { slug: string; version: number }>();
         for (const s of specs) m.set(s.id, { slug: s.slug, version: s.version });

@@ -183,10 +183,23 @@ export function Pagination(props: PaginationProps): JSX.Element {
               </li>
             ) : (
               <li key={`p-${slot}`}>
+                {/* Active page gets aria-current="page" + an aria-
+                    label that names the current state explicitly
+                    ("Page N, current page") rather than the misleading
+                    "Go to page N" used for navigable siblings. Screen
+                    readers read aria-current as part of the role text,
+                    so AT users hear "Page 3, current page, button"
+                    instead of "Go to page 3, button" when the cursor
+                    lands on the active slot. */}
                 <Button
                   variant={slot === page.page ? 'primary' : 'ghost'}
                   size="sm"
-                  aria-label={`Go to page ${slot}`}
+                  aria-label={
+                    slot === page.page
+                      ? `Page ${slot}, current page`
+                      : `Go to page ${slot}`
+                  }
+                  aria-current={slot === page.page ? 'page' : undefined}
                   onClick={() => onPageChange(slot)}
                   className={
                     slot === page.page
