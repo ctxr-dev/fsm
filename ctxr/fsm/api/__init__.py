@@ -61,7 +61,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -69,6 +69,7 @@ import ctxr.fsm
 from ctxr.fsm.api import _state
 from ctxr.fsm.api._deps import ProjectDep, require_auth
 from ctxr.fsm.api._paths import looks_like_filesystem_db_path, project_root_and_relative
+from ctxr.fsm.cli.lifecycle.primitives import read_active_mcp_file
 from ctxr.fsm.sqlite import Project
 
 __all__ = ["ProjectMetadata", "app", "lifespan_handler"]
@@ -209,21 +210,93 @@ class ReadinessResponse(BaseModel):
     )
 
 
+class SubsystemInfo(BaseModel):
+    """One row of the ``ProjectMetadata.subsystems`` map.
+
+    Mirrors the per-subsystem block written by the supervisor into
+    ``.ctxr-fsm/active-mcp.json`` (mcp / api / ui). The UI topbar
+    surfaces this so an operator can see at a glance which subsystem
+    is up + click through to its endpoint (Swagger, the UI itself,
+    the MCP SSE healthz, etc.) without leaving the dashboard.
+
+    ``healthz_url`` is the probe the supervisor uses to verify the
+    subsystem is live before writing the discovery doc, so the UI
+    can re-probe it on demand to show "healthy / degraded" badges
+    next to the URL. ``base_url`` is the human-clickable link the
+    operator wants. ``pid`` is included so the UI can show
+    "subsystem owned by pid 42 on this host", useful when two
+    operators are debugging the same project from different
+    terminals.
+    """
+
+    base_url: str = Field(..., description="Primary URL for this subsystem (the human-clickable one).")
+    healthz_url: str | None = Field(
+        None,
+        description="Health probe URL. ``None`` when the subsystem doesn't expose a separate healthz path.",
+    )
+    pid: int | None = Field(
+        None,
+        description="Process ID of the subsystem worker. ``None`` when not reported by the supervisor.",
+    )
+
+
 class ProjectMetadata(BaseModel):
     """Metadata payload returned by ``GET /api/v1/projects/current``.
 
     W22 added ``project_root`` + ``db_path_relative`` so the UI
     topbar / Settings surface can render portable, committable
     project-relative paths instead of absolute filesystem strings.
-    Future waves will extend this further with a project name (slug
-    pulled from ``.ctxr-fsm/``), registered spec + run counts, and
-    workspace metadata; the route already exists so the UI can issue
-    a single discovery call against a running API and know it's
-    talking to a live, project-bound server.
+    W22b3 extends the payload with the operator-facing project slug
+    (read from the ``projects`` table) and the live ``subsystems``
+    map read from ``.ctxr-fsm/active-mcp.json`` so the info-rich
+    topbar can show "you're connected to ``my-project`` on
+    ``/Users/dev/work/my-project`` with mcp+api+ui all green" as a
+    single discovery roundtrip. Swagger is derived from the API's
+    own base_url (``/docs``) rather than threaded through
+    active-mcp.json because Swagger is just a route on the API
+    process, not a separate subsystem.
     """
 
     fsm_version: str = Field(..., description="The ``ctxr.fsm`` package version.")
     project_open: bool = Field(..., description="Whether the :class:`Project` is bound.")
+    project_slug: str | None = Field(
+        None,
+        description=(
+            "The slug of the default project row in the ``projects``"
+            " table. ``None`` when the projects table is empty (a"
+            " freshly-migrated DB with no project rows yet — the seeded"
+            " ``default`` row is created lazily by"
+            " :meth:`Project.start_run`)."
+        ),
+    )
+    swagger_url: str = Field(
+        ...,
+        description=(
+            "Absolute URL of the API's auto-generated OpenAPI viewer."
+            " Derived from the incoming request's ``base_url`` so the"
+            " value is correct regardless of how the API is mounted"
+            " (loopback, dev proxy, future reverse-proxy)."
+        ),
+    )
+    api_base_url: str = Field(
+        ...,
+        description=(
+            "Absolute base URL of this API. Same derivation as"
+            " ``swagger_url``; exposed so the UI can build deep links"
+            " into the JSON API without re-deriving the prefix."
+        ),
+    )
+    subsystems: dict[str, SubsystemInfo] = Field(
+        default_factory=dict,
+        description=(
+            "Subsystem-name -> :class:`SubsystemInfo` mapping read"
+            " verbatim from ``.ctxr-fsm/active-mcp.json``. Empty when"
+            " the supervisor hasn't written the discovery doc yet"
+            " (cold boot before ``ctxr-fsm serve`` completes its"
+            " healthz polls, or when ``project_root`` is None). The"
+            " canonical subsystem names are ``mcp``, ``api``, ``ui``."
+        ),
+    )
     db_path: str = Field(
         ...,
         description=(
@@ -313,7 +386,7 @@ def readyz() -> ReadinessResponse:
     tags=["projects"],
     dependencies=[Depends(require_auth)],
 )
-def get_current_project(project: ProjectDep) -> ProjectMetadata:
+def get_current_project(project: ProjectDep, request: Request) -> ProjectMetadata:
     """Return metadata about the currently open project.
 
     The :class:`Project` handle exposes the SQLAlchemy engine, whose
@@ -352,12 +425,68 @@ def get_current_project(project: ProjectDep) -> ProjectMetadata:
         # relative path the raw url.database would be relative too,
         # contradicting the doc.
         db_path = str(Path(db_url_database).resolve())
+    # Project slug — first row of the ``projects`` table. Schema reserves
+    # multi-project mounts as a future extension; today there's at most
+    # one project row per DB. ``None`` when the table is empty (lazy
+    # seeded by ``Project.start_run``) — UI renders "no project yet"
+    # rather than crashing the discovery call.
+    project_slug: str | None = None
+    try:
+        with project.session_factory() as session:
+            projects = project.projects.list(session)
+        if projects:
+            project_slug = projects[0].slug
+    except Exception:
+        # Never let metadata derivation fail the discovery route — the
+        # UI's info-rich topbar would lose its slug for a transient DB
+        # blip and the operator would see "no project yet" rather than
+        # the real error context (the rest of the payload still lands).
+        project_slug = None
+
+    # Subsystem map — read the supervisor's discovery doc from
+    # ``<project_root>/.ctxr-fsm/active-mcp.json``. Tolerate every
+    # failure mode (file missing, malformed, partial keys) with an
+    # empty map so the topbar shows "no subsystems reported" rather
+    # than 500ing.
+    subsystems: dict[str, SubsystemInfo] = {}
+    if project_root_str is not None:
+        doc = read_active_mcp_file(Path(project_root_str))
+        if doc is not None:
+            raw_subsystems = doc.get("subsystems")
+            if isinstance(raw_subsystems, dict):
+                for name, block in raw_subsystems.items():
+                    if not isinstance(block, dict):
+                        continue
+                    base = block.get("base_url")
+                    if not isinstance(base, str) or not base:
+                        continue
+                    healthz = block.get("healthz_url")
+                    pid = block.get("pid")
+                    subsystems[str(name)] = SubsystemInfo(
+                        base_url=base,
+                        healthz_url=healthz if isinstance(healthz, str) else None,
+                        pid=pid if isinstance(pid, int) else None,
+                    )
+
+    # Swagger + API base URL — ``request.base_url`` carries scheme +
+    # host + port + root_path (always trailing-slashed). Hard-code
+    # ``/docs`` since FastAPI's default Swagger mount lives there;
+    # avoids importing the app inside its own route to read
+    # ``app.docs_url``.
+    base_url = str(request.base_url).rstrip("/")
+    api_base_url = base_url
+    swagger_url = f"{base_url}/docs"
+
     return ProjectMetadata(
         fsm_version=ctxr.fsm.__version__,
         project_open=True,
+        project_slug=project_slug,
         db_path=db_path,
         project_root=project_root_str,
         db_path_relative=db_relative,
+        swagger_url=swagger_url,
+        api_base_url=api_base_url,
+        subsystems=subsystems,
     )
 
 

@@ -303,6 +303,42 @@ export interface DoctorReport {
   lock_count: number;
 }
 
+/**
+ * One row of the ``ProjectMetadata.subsystems`` map.
+ *
+ * Mirrors :class:`SubsystemInfo` in ``ctxr/fsm/api/__init__.py``. The
+ * supervisor's discovery doc (``.ctxr-fsm/active-mcp.json``) carries
+ * one of these per running subsystem (``mcp`` / ``api`` / ``ui``);
+ * the info-rich topbar uses them to render a clickable status pill
+ * for each subsystem with the right URL + a re-probe target.
+ */
+export interface SubsystemInfo {
+  base_url: string;
+  healthz_url: string | null;
+  pid: number | null;
+}
+
+/**
+ * Response shape of ``GET /api/v1/projects/current``.
+ *
+ * Mirrors :class:`ProjectMetadata` in ``ctxr/fsm/api/__init__.py``.
+ * ``project_slug`` / ``project_root`` / ``db_path_relative`` /
+ * ``subsystems`` are all population-state-dependent (empty when the
+ * supervisor hasn't written ``active-mcp.json`` yet, or when the DB
+ * is in-memory).
+ */
+export interface ProjectMetadata {
+  fsm_version: string;
+  project_open: boolean;
+  project_slug: string | null;
+  db_path: string;
+  project_root: string | null;
+  db_path_relative: string | null;
+  swagger_url: string;
+  api_base_url: string;
+  subsystems: Record<string, SubsystemInfo>;
+}
+
 // ---------------------------------------------------------------------------
 // Request parameter shapes
 // ---------------------------------------------------------------------------
@@ -794,6 +830,20 @@ export class ApiClient {
   /** ``POST /admin/db/doctor`` — diagnostic dump of the project DB. */
   doctor(): Promise<DoctorReport> {
     return this.request<DoctorReport>('POST', '/admin/db/doctor');
+  }
+
+  /**
+   * ``GET /projects/current`` — full project + subsystem discovery doc.
+   *
+   * Returns everything the info-rich topbar needs to render in one
+   * round-trip: fsm version, project slug, project root, db_path
+   * (absolute + relative), Swagger / API base URLs derived from the
+   * request, and the supervisor's subsystem map (mcp / api / ui base
+   * URLs + healthz URLs + pids) read from
+   * ``<project_root>/.ctxr-fsm/active-mcp.json``.
+   */
+  getCurrentProject(): Promise<ProjectMetadata> {
+    return this.request<ProjectMetadata>('GET', '/projects/current');
   }
 }
 
