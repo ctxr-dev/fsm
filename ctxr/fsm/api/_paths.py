@@ -11,9 +11,10 @@ project-root-relative rewrite the UI prefers for display.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TypeGuard
 
 
-def looks_like_filesystem_db_path(db_url_database: str | None) -> bool:
+def looks_like_filesystem_db_path(db_url_database: str | None) -> TypeGuard[str]:
     """Return whether ``db_url_database`` is plausibly a real on-disk path.
 
     Filters out every non-filesystem sentinel SQLAlchemy's SQLite
