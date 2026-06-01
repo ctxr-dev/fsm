@@ -465,13 +465,17 @@ def get_current_project(project: ProjectDep, request: Request) -> ProjectMetadat
     # than 500ing.
     # ``.ctxr-fsm/active-mcp.json`` writes each subsystem's primary URL
     # under the key ``http_url`` (see
-    # :func:`ctxr.fsm.cli.lifecycle.supervisor._subsystem_payload`); the
-    # API row additionally carries a ``docs_url``. We map both to
-    # ``SubsystemInfo.base_url`` so the UI doesn't need to know about
-    # the on-disk key vocabulary — its only contract is "give me a URL
-    # I can show + a healthz URL I can probe". The original draft of
-    # this route incorrectly looked for ``base_url`` and produced an
-    # empty subsystems map even with a live supervisor.
+    # :func:`ctxr.fsm.cli.lifecycle.supervisor._subsystem_payload`); we
+    # map that to ``SubsystemInfo.base_url`` so the UI doesn't need to
+    # know about the on-disk key vocabulary — its only contract is
+    # "give me a URL I can show + a healthz URL I can probe". The
+    # API row's ``docs_url`` is NOT carried into ``SubsystemInfo`` —
+    # the route derives Swagger separately from the request below
+    # (``swagger_url``) so the topbar gets a dedicated pill rather
+    # than burying the docs link inside the API row. The original
+    # draft of this route incorrectly read ``base_url`` from the
+    # discovery doc and produced an empty subsystems map even with a
+    # live supervisor.
     subsystems: dict[str, SubsystemInfo] = {}
     if project_root_str is not None:
         doc = read_active_mcp_file(Path(project_root_str))
