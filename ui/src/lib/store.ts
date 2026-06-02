@@ -29,7 +29,7 @@
 import { signal, type Signal, effect } from '@preact/signals';
 
 import type { ConnectionState } from './sse';
-import type { Event as FsmEvent, RunSummary } from './api';
+import type { Event as FsmEvent, ProjectMetadata, RunSummary } from './api';
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -264,6 +264,60 @@ export const runComparisonContext: Signal<{ a: string; b: string | null } | null
   a: string;
   b: string | null;
 } | null>(null);
+
+// ---------------------------------------------------------------------------
+// W23c — hoisted project metadata
+// Single source of truth so InfoTopBar, Settings, PageHeader, and any
+// future consumer reach the same value without re-fetching.
+// ---------------------------------------------------------------------------
+
+export const projectMetadata: Signal<ProjectMetadata | null> = signal<ProjectMetadata | null>(null);
+export const projectMetadataError: Signal<string | null> = signal<string | null>(null);
+// Defaults to ``false`` so SSR / vitest / any environment that never
+// reaches ``wireProjectMetadata()`` does not render a permanent
+// "loading…" affordance. The wiring flips this to ``true`` immediately
+// before the first fetch and back to ``false`` in the ``finally`` block.
+export const projectMetadataLoading: Signal<boolean> = signal<boolean>(false);
+
+let _metadataWired = false;
+
+/**
+ * One-shot wiring: fetches the current project metadata and refreshes
+ * it whenever the browser tab regains focus. Idempotent; safe to call
+ * from app boot. NO-OP in non-browser environments (SSR / tests) — and
+ * in that no-op path we explicitly pin ``projectMetadataLoading`` to
+ * ``false`` so a caller that flipped it earlier does not leave the UI
+ * stuck on a "loading…" eyebrow.
+ */
+export function wireProjectMetadata(): void {
+  if (_metadataWired || typeof window === 'undefined') {
+    if (typeof window === 'undefined') {
+      projectMetadataLoading.value = false;
+    }
+    return;
+  }
+  _metadataWired = true;
+
+  const load = async (): Promise<void> => {
+    projectMetadataLoading.value = true;
+    try {
+      // Lazy import to avoid a circular when store.ts is consumed by api.ts.
+      const { api: apiClient } = await import('./api');
+      const metadata = await apiClient.getCurrentProject();
+      projectMetadata.value = metadata;
+      projectMetadataError.value = null;
+    } catch (err) {
+      projectMetadataError.value = err instanceof Error ? err.message : String(err);
+    } finally {
+      projectMetadataLoading.value = false;
+    }
+  };
+
+  void load();
+  window.addEventListener('focus', () => {
+    void load();
+  });
+}
 
 // ---------------------------------------------------------------------------
 // W18a mutators

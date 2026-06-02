@@ -68,3 +68,9 @@ export type { RunProgressGraphProps } from './RunProgressGraph';
 
 export { RunsSummaryStats } from './RunsSummaryStats';
 export type { RunsSummaryStatsProps } from './RunsSummaryStats';
+
+export { PageHeader } from './PageHeader';
+export type { PageHeaderProps } from './PageHeader';
+
+export { MultiSelectCombobox } from './MultiSelectCombobox';
+export type { MultiSelectComboboxProps } from './MultiSelectCombobox';

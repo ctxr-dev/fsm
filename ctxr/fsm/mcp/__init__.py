@@ -85,9 +85,65 @@ entry point.
 
 from __future__ import annotations
 
+import os
+import re
+
 from mcp.server.fastmcp import FastMCP
 
 __all__ = ["mcp"]
+
+
+# ── CORS allowlist (mirrors ctxr.fsm.api) ──────────────────────────
+# The dashboard polls this MCP ``/healthz`` from the Vite dev origin
+# (and from any operator-extended origin). Without these headers the
+# browser blocks the response and the InfoTopBar health pill never
+# turns green. We mirror the FastAPI defaults + env-var hook so the
+# two subsystems share one allowlist surface.
+_DEFAULT_CORS_ORIGINS: tuple[str, ...] = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+)
+_CORS_ENV_VAR: str = "CTXR_FSM_API_CORS_ORIGINS"
+
+# Permissive regex for ANY loopback origin on ANY port. The supervisor
+# can pick ephemeral ports for Vite (and for itself) when 5173 is
+# busy; in that case the static allowlist above misses and the
+# dashboard pill drops to "degraded" purely from a CORS rejection
+# even though the service is healthy. Loopback origins are private to
+# the operator's machine, so widening to ``http://127.0.0.1:<port>``
+# and ``http://localhost:<port>`` is the right safety/usability trade.
+_LOOPBACK_ORIGIN_RE: re.Pattern[str] = re.compile(
+    r"^http://(127\.0\.0\.1|localhost):\d+$"
+)
+
+
+def _resolve_cors_origins() -> list[str]:
+    """Return the combined CORS allowlist for the MCP healthz route."""
+    extra = os.environ.get(_CORS_ENV_VAR, "")
+    parsed = [o.strip() for o in extra.split(",") if o.strip()]
+    return list(dict.fromkeys([*_DEFAULT_CORS_ORIGINS, *parsed]))
+
+
+def _is_allowed_origin(origin: str) -> bool:
+    """Return True for any allowlisted or loopback origin."""
+    if origin in _resolve_cors_origins():
+        return True
+    return bool(_LOOPBACK_ORIGIN_RE.match(origin))
+
+
+def _cors_headers_for(origin: str | None) -> dict[str, str]:
+    """Return ``Access-Control-*`` headers when ``origin`` is allowed.
+
+    Returns an empty dict for missing / non-allowlisted origins so
+    same-origin (e.g. curl, the supervisor probe) callers get no
+    spurious CORS headers and unknown origins are silently refused.
+    """
+    if not origin or not _is_allowed_origin(origin):
+        return {}
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Vary": "Origin",
+    }
 
 
 # The single FastMCP instance. Module-level so the ``@mcp.tool()``
@@ -133,36 +189,37 @@ async def _healthz(request: object) -> object:  # pragma: no cover - trivial
     we import lazily so a CLI invocation that never boots the HTTP
     transport doesn't pay the import cost.
 
-    The response carries CORS headers reflecting any loopback
-    ``Origin`` (localhost or 127.0.0.1 on any port). FastMCP does not
-    install a CORS middleware of its own, and the UI's InfoTopBar
-    polls this route cross-origin from the Vite dev server. Without
-    these headers the browser logs a CORS failure that the autouse
-    console-audit fixture turns into an e2e teardown error. We mirror
-    the FastAPI-side regex so dev-loop ephemeral ports stay covered.
+    The dashboard ``InfoTopBar`` polls this from the Vite dev origin,
+    so we echo CORS headers from :func:`_cors_headers_for` for any
+    request that carries an allowlisted ``Origin``. Same-origin
+    probes (supervisor / curl) get no extra headers and are
+    unaffected. The handler also responds to OPTIONS preflights so
+    a future client that adds custom request headers still works.
+
+    ``type: ignore[untyped-decorator]`` on the decorator: FastMCP's
+    ``custom_route`` is typed loosely (it accepts Any callable) and
+    mypy flags it as an untyped decorator. The body itself is fully
+    typed; the ignore is purely about FastMCP's decorator signature.
     """
-    import re
+    from starlette.requests import Request
+    from starlette.responses import PlainTextResponse, Response
 
-    from starlette.responses import PlainTextResponse
-
-    origin = getattr(request, "headers", {}).get("origin", "") if request else ""
-    cors_headers: dict[str, str] = {}
-    if origin and re.match(r"^http://(?:localhost|127\.0\.0\.1)(?::\d+)?$", origin):
-        cors_headers = {
-            "Access-Control-Allow-Origin": origin,
+    origin: str | None = None
+    if isinstance(request, Request):
+        origin = request.headers.get("origin")
+    headers = _cors_headers_for(origin)
+    # Preflight: empty body, full method/header allowlist mirroring
+    # the FastAPI side so any future header tweak in the dashboard
+    # works without another round-trip here.
+    if isinstance(request, Request) and request.method == "OPTIONS":
+        preflight_headers = {
+            **headers,
             "Access-Control-Allow-Methods": "GET, OPTIONS",
             "Access-Control-Allow-Headers": "*",
-            "Vary": "Origin",
-        }
-
-    # Preflight: 204 No Content with the CORS headers so the browser
-    # accepts the follow-up GET. GETs without special headers do not
-    # normally trigger preflight, but adding the OPTIONS handler keeps
-    # us robust against any future client that adds custom headers.
-    method = getattr(request, "method", "GET") if request else "GET"
-    if method == "OPTIONS":
-        return PlainTextResponse("", status_code=204, headers=cors_headers)
-    return PlainTextResponse("ok", status_code=200, headers=cors_headers)
+            "Access-Control-Max-Age": "600",
+        } if headers else {}
+        return Response(status_code=204, headers=preflight_headers)
+    return PlainTextResponse("ok", status_code=200, headers=headers)
 
 
 # Import the tools module for its decorator side effects. This must

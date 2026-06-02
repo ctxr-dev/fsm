@@ -33,6 +33,7 @@ import {
   Button,
   Card,
   EmptyState,
+  MultiSelectCombobox,
   Pagination,
   Pill,
   RunsSummaryStats,
@@ -41,6 +42,7 @@ import {
   type PillVariant,
   type TableColumn,
 } from '../components';
+import { useProjectPref } from '../lib/projectPrefs';
 import {
   api,
   ApiError,
@@ -190,10 +192,16 @@ interface FilterBarProps {
   onSearchChange: (next: string) => void;
   onRefresh: () => void;
   searchInputRef: { current: HTMLInputElement | null };
+  // W23d: spec multiselect filter — the dropdown options + the
+  // selection state are managed by the parent so the persistence layer
+  // (useProjectPref) lives in one place.
+  specOptions: readonly { id: string; label: string; sub: string }[];
+  selectedSpecIds: Set<string>;
+  onSpecsChange: (next: Set<string>) => void;
 }
 
 /**
- * Sticky filter bar — status chips + search box + refresh button.
+ * Sticky filter bar — status chips + spec multiselect + search box + refresh.
  *
  * Kept as a sub-component so the parent's render tree stays focused on
  * data orchestration; the bar itself is purely a controlled-input
@@ -207,6 +215,9 @@ function FilterBar({
   onSearchChange,
   onRefresh,
   searchInputRef,
+  specOptions,
+  selectedSpecIds,
+  onSpecsChange,
 }: FilterBarProps): JSX.Element {
   return (
     <div
@@ -230,7 +241,7 @@ function FilterBar({
                 key={f.value}
                 type="button"
                 role="tab"
-                aria-selected={active}
+                aria-selected={active ? 'true' : 'false'}
                 onClick={() => onStatusChange(f.value)}
                 class={[
                   'inline-flex items-center rounded-full px-3 py-1',
@@ -249,6 +260,22 @@ function FilterBar({
             );
           })}
         </div>
+        {/* W23d: spec multiselect filter. Only rendered when there's
+            at least one spec to pick from; otherwise the dropdown
+            would surface "no options" with no recovery. */}
+        {specOptions.length > 0 ? (
+          <MultiSelectCombobox
+            options={specOptions}
+            selected={selectedSpecIds}
+            onChange={onSpecsChange}
+            getId={(o) => o.id}
+            getLabel={(o) => o.label}
+            getSubLabel={(o) => o.sub}
+            placeholder="All specs"
+            searchPlaceholder="Filter by slug…"
+            ariaLabel="Filter runs by spec"
+          />
+        ) : null}
         <div class="flex-1 min-w-[12rem]">
           <label class="sr-only" htmlFor="runs-search">
             Search runs
@@ -451,16 +478,77 @@ export function Runs(): JSX.Element {
 
   // --- Filtering ------------------------------------------------------------
 
+  // W23d: per-project spec multiselect filter. Persisted to
+  // localStorage under fsm-ui:proj:<projectName>:runs.specFilter so
+  // the selection survives reloads and stays isolated to the
+  // current project. Stored as array (JSON-serialisable), hydrated
+  // into a Set for O(1) membership tests during filtering.
+  const [selectedSpecIdsArray, setSelectedSpecIdsArray] =
+    useProjectPref<string[]>('runs.specFilter', []);
+  const selectedSpecIds = useMemo(
+    () => new Set(selectedSpecIdsArray),
+    [selectedSpecIdsArray],
+  );
+
+  // Options for the multiselect: every spec in the resolver, sorted
+  // by slug asc + numeric version desc. We derive afresh whenever the
+  // resolver populates so the dropdown reflects every spec the project
+  // has registered. Sorting on the rendered label string would
+  // lexicographically order "v10" before "v2"; sort on (slug, version)
+  // primitives so "code-reviewer v10" sits above "code-reviewer v2".
+  const specOptions = useMemo(() => {
+    const out: Array<{
+      id: string;
+      label: string;
+      sub: string;
+      slug: string;
+      version: number;
+    }> = [];
+    for (const [id, { slug, version }] of specResolver.entries()) {
+      out.push({
+        id,
+        label: `${slug} v${version}`,
+        sub: id.slice(0, 12) + '…',
+        slug,
+        version,
+      });
+    }
+    out.sort((a, b) => {
+      const bySlug = a.slug.localeCompare(b.slug);
+      if (bySlug !== 0) return bySlug;
+      return b.version - a.version;
+    });
+    return out;
+  }, [specResolver]);
+
+  // Auto-prune stale selections — if a spec was deleted upstream and
+  // its id still sits in the persisted filter, drop it so the
+  // operator doesn't see an "empty filter" with no recovery hint.
+  useEffect(() => {
+    if (selectedSpecIdsArray.length === 0 || specResolver.size === 0) return;
+    const valid = new Set(specResolver.keys());
+    const pruned = selectedSpecIdsArray.filter((id) => valid.has(id));
+    if (pruned.length !== selectedSpecIdsArray.length) {
+      setSelectedSpecIdsArray(pruned);
+    }
+  }, [selectedSpecIdsArray, specResolver, setSelectedSpecIdsArray]);
+
   const runs = runsPage?.items ?? [];
   const visibleRuns = useMemo(() => {
-    if (!search.trim()) return runs;
-    const needle = search.trim().toLowerCase();
-    return runs.filter(
-      (r) =>
-        r.id.toLowerCase().includes(needle) ||
-        r.fsm_spec_id.toLowerCase().includes(needle),
-    );
-  }, [runs, search]);
+    let filtered = runs;
+    if (selectedSpecIds.size > 0) {
+      filtered = filtered.filter((r) => selectedSpecIds.has(r.fsm_spec_id));
+    }
+    if (search.trim()) {
+      const needle = search.trim().toLowerCase();
+      filtered = filtered.filter(
+        (r) =>
+          r.id.toLowerCase().includes(needle) ||
+          r.fsm_spec_id.toLowerCase().includes(needle),
+      );
+    }
+    return filtered;
+  }, [runs, search, selectedSpecIds]);
 
   // --- Keyboard navigation --------------------------------------------------
 
@@ -685,6 +773,9 @@ export function Runs(): JSX.Element {
         onSearchChange={setSearch}
         onRefresh={onRefresh}
         searchInputRef={searchInputRef}
+        specOptions={specOptions}
+        selectedSpecIds={selectedSpecIds}
+        onSpecsChange={(next) => setSelectedSpecIdsArray([...next])}
       />
       <main class="p-4 space-y-4">
         <div class="flex items-baseline justify-between">

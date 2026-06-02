@@ -407,15 +407,20 @@ def _ui_cmd(*, port: int) -> list[str]:
     """Build the argv for the UI child (Vite dev server).
 
     The leading ``--`` is npm's pass-through marker; everything after
-    it is handed verbatim to the underlying ``vite`` invocation.
+    it is handed verbatim to the underlying ``vite`` invocation. We
+    bind explicitly to ``127.0.0.1`` because Vite's default ``host``
+    resolves ``localhost`` to whichever loopback the OS prefers
+    (IPv6 on some CI runners), while the supervisor + e2e fixtures
+    always probe ``http://127.0.0.1:<port>``. An explicit
+    ``--host 127.0.0.1`` keeps the bind address and the probe target
+    in lockstep so the dev server is reachable the moment it binds.
 
-    ``--host 127.0.0.1`` pins the bind to IPv4 loopback so it matches
-    the supervisor's probe URL (``_probe_url_for`` returns
-    ``http://127.0.0.1:<port>``) and the e2e fixture's poll target.
-    Vite's default bind is ``localhost``, which on Linux CI runners
-    resolves first to ``::1`` (IPv6) and rejects IPv4 connections with
-    ConnectionRefused, leaving the e2e fixture waiting on a port the
-    child never opened on that address.
+    ``--strictPort`` is added so Vite fails fast if the requested
+    port is already taken instead of silently incrementing to the
+    next free port (e.g. 5174). The supervisor + e2e probes target
+    a fixed port that was negotiated up-front, so a silent re-bind
+    surfaces as a 60s ConnectionRefused timeout rather than a clear
+    error from Vite itself.
     """
     return [
         "npm",
@@ -426,6 +431,7 @@ def _ui_cmd(*, port: int) -> list[str]:
         "127.0.0.1",
         "--port",
         str(port),
+        "--strictPort",
     ]
 
 
