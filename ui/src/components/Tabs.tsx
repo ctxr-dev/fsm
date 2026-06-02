@@ -89,7 +89,7 @@ export function Tabs({
   );
 
   return (
-    <div class={['tabs flex flex-col min-h-0', className ?? ''].join(' ')}>
+    <div class={['tabs flex flex-col h-full min-h-0', className ?? ''].join(' ')}>
       <div
         role="tablist"
         aria-label={ariaLabel}
