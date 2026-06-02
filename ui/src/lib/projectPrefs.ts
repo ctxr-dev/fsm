@@ -4,7 +4,10 @@
  * W23d mandate: "filterable by spec names (multiselect dropdown with
  * search, saved user choice in local storage per project name)."
  *
- * Storage key shape: ``fsm-ui:proj:${encodeURIComponent(projectName) | 'default'}:${prefName}``.
+ * Storage key shape: ``fsm-ui:proj:<slot>:<prefName>`` where
+ * ``<slot>`` is ``encodeURIComponent(projectName)`` when ``projectName``
+ * is a non-empty string, and the literal ``'default'`` otherwise (see
+ * ``projectPrefKey`` below for the canonical implementation).
  *
  * - Per-project isolation means switching projects (today: pointing
  *   the dashboard at a different `.ctxr-fsm/` via cwd / future

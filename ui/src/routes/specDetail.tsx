@@ -45,6 +45,7 @@ import {
 import { canonicalJson } from '../lib/canonicalJson';
 import { specToGraph, transitionKind } from '../lib/specGraph';
 import { openSheet } from '../lib/store';
+import { tokenisePredicate, classForPredicateKind } from '../lib/predicateTokens';
 
 const shortHash = (h: string): string => (h.length > 12 ? h.slice(0, 12) : h);
 const shortId = (id: string): string => (id.length > 7 ? id.slice(0, 7) : id);
@@ -111,23 +112,64 @@ function transitionKindVariant(kind: string | undefined): PillVariant {
 
 function StateInspectorBody({ state, isEntry }: StateInspectorBodyProps): JSX.Element {
   const id = typeof state.id === 'string' ? state.id : '(unknown)';
-  const kind = typeof state.kind === 'string' ? state.kind : '—';
+  const kind = typeof state.kind === 'string' ? state.kind : 'state';
   const worker = state.worker as Record<string, unknown> | undefined;
   const inline = state.inline as Record<string, unknown> | undefined;
-  const loop = state.loop as unknown;
+  const loop = state.loop as Record<string, unknown> | undefined;
+  const verifier = state.verifier as unknown;
+  const outputs = Array.isArray(state.outputs) ? (state.outputs as unknown[]) : null;
+  const statePostVals = Array.isArray(state.post_validations)
+    ? (state.post_validations as unknown[])
+    : null;
+  const inlinePostVals = inline && Array.isArray(inline.post_validations)
+    ? (inline.post_validations as unknown[])
+    : null;
+  const inlineInputs = inline && Array.isArray(inline.inputs)
+    ? (inline.inputs as unknown[])
+    : null;
+  const workerInputs = worker && Array.isArray(worker.inputs)
+    ? (worker.inputs as unknown[])
+    : null;
+  const purpose = typeof state.purpose === 'string'
+    ? state.purpose
+    : typeof inline?.purpose === 'string'
+    ? (inline.purpose as string)
+    : undefined;
   const transitions = Array.isArray(state.transitions)
     ? (state.transitions as Array<Record<string, unknown>>)
     : [];
 
+  // ``rows`` collects flat scalar metadata for the KeyValueTable at
+  // the top of the inspector. Anything structured (schemas, code,
+  // transitions, raw JSON) renders in its own section below so the
+  // operator can scan the metadata at a glance and drill into details
+  // by section.
   const rows: KvRow[] = [
     { key: 'id', value: id },
     { key: 'kind', value: kind },
   ];
   if (isEntry) rows.push({ key: 'entry', value: true, hint: 'spec entry state' });
+  if (purpose) rows.push({ key: 'purpose', value: purpose });
   if (worker?.role) rows.push({ key: 'worker.role', value: String(worker.role) });
   if (inline?.handler_id) rows.push({ key: 'inline.handler_id', value: String(inline.handler_id) });
   const allowedTools = Array.isArray(worker?.allowed_tools) ? worker?.allowed_tools : null;
   if (allowedTools) rows.push({ key: 'worker.allowed_tools', value: allowedTools });
+  if (workerInputs) rows.push({ key: 'worker.inputs', value: workerInputs });
+  if (inlineInputs) rows.push({ key: 'inline.inputs', value: inlineInputs });
+  // Loop scalar config surfaces in the flat metadata table so the
+  // operator sees max_iterations / done_field / aggregator at a glance
+  // without expanding the structured loop JSON below.
+  if (loop) {
+    if (typeof loop.max_iterations === 'number') {
+      rows.push({ key: 'loop.max_iterations', value: loop.max_iterations });
+    }
+    if (typeof loop.done_field === 'string') {
+      rows.push({ key: 'loop.done_field', value: loop.done_field });
+    }
+    if (typeof loop.aggregator === 'string') {
+      rows.push({ key: 'loop.aggregator', value: loop.aggregator });
+    }
+  }
 
   return (
     <div class="space-y-4 p-3">
@@ -191,6 +233,62 @@ function StateInspectorBody({ state, isEntry }: StateInspectorBodyProps): JSX.El
           <JsonViewer value={loop} rootLabel="loop" mode="inline" maxInlineHeight="max-h-48" />
         </section>
       ) : null}
+      {outputs && outputs.length > 0 ? (
+        <section>
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            state.outputs ({outputs.length})
+          </h4>
+          <JsonViewer
+            value={outputs}
+            rootLabel="outputs"
+            mode="expanded"
+            defaultExpandDepth={2}
+            maxInlineHeight="max-h-48"
+          />
+        </section>
+      ) : null}
+      {statePostVals && statePostVals.length > 0 ? (
+        <section>
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            state.post_validations ({statePostVals.length})
+          </h4>
+          <JsonViewer
+            value={statePostVals}
+            rootLabel="post_validations"
+            mode="expanded"
+            defaultExpandDepth={2}
+            maxInlineHeight="max-h-48"
+          />
+        </section>
+      ) : null}
+      {inlinePostVals && inlinePostVals.length > 0 ? (
+        <section>
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            inline.post_validations ({inlinePostVals.length})
+          </h4>
+          <JsonViewer
+            value={inlinePostVals}
+            rootLabel="inline.post_validations"
+            mode="expanded"
+            defaultExpandDepth={2}
+            maxInlineHeight="max-h-48"
+          />
+        </section>
+      ) : null}
+      {verifier ? (
+        <section>
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            state.verifier
+          </h4>
+          <JsonViewer
+            value={verifier}
+            rootLabel="verifier"
+            mode="expanded"
+            defaultExpandDepth={2}
+            maxInlineHeight="max-h-48"
+          />
+        </section>
+      ) : null}
       {transitions.length > 0 ? (
         <section>
           <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
@@ -231,15 +329,21 @@ function StateInspectorBody({ state, isEntry }: StateInspectorBodyProps): JSX.El
               // ellipsis. `flex-1` only gives the item room to grow, not
               // permission to shrink below its content width.
               const whenClass = isPredicate
-                ? 'font-mono text-amber-700 dark:text-amber-300 font-semibold truncate flex-1 min-w-0 px-1.5 py-0.5 rounded bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-700/50'
+                ? 'font-mono font-semibold truncate flex-1 min-w-0 px-1.5 py-0.5 rounded bg-amber-900/80 dark:bg-amber-900/70 border border-amber-500 dark:border-amber-600 text-amber-50'
                 : 'font-mono text-slate-500 dark:text-slate-400 truncate flex-1 min-w-0';
               return (
                 <li key={`${target}-${idx}`} class="py-1.5 flex items-center gap-2">
                   {tKind ? <Pill variant={transitionKindVariant(tKind)} size="sm">{tKind}</Pill> : null}
+                  <code class="font-mono text-slate-500 dark:text-slate-400 text-[10px]">{id}</code>
+                  <span class="text-slate-400">{'->'}</span>
                   <code class="font-mono text-slate-700 dark:text-slate-300">{target}</code>
                   {when ? (
                     <code class={whenClass} title={when}>
-                      {when}
+                      {isPredicate
+                        ? tokenisePredicate(when).map((t, ti) => (
+                            <span key={ti} class={classForPredicateKind(t.kind)}>{t.text}</span>
+                          ))
+                        : when}
                     </code>
                   ) : null}
                 </li>
@@ -248,6 +352,22 @@ function StateInspectorBody({ state, isEntry }: StateInspectorBodyProps): JSX.El
           </ul>
         </section>
       ) : null}
+      <section>
+        <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+          state (raw)
+        </h4>
+        {/* Raw state JSON renders collapsed (defaultExpandDepth: 0)
+            so the section header acts as a disclosure for operators
+            who want the unfiltered definition without the curated
+            sections above getting in the way. */}
+        <JsonViewer
+          value={state}
+          rootLabel={id}
+          mode="expanded"
+          defaultExpandDepth={0}
+          maxInlineHeight="max-h-64"
+        />
+      </section>
     </div>
   );
 }
@@ -291,16 +411,18 @@ function TransitionInspectorBody({
           opens. always / otherwise transitions skip this section
           entirely (they have no predicate to render). */}
       {predicate ? (
-        <section class="rounded-md border border-amber-300 dark:border-amber-700/50 bg-amber-50/40 dark:bg-amber-900/10 p-2">
-          <h4 class="text-[11px] font-mono text-amber-700 dark:text-amber-300 mb-1 font-semibold">
+        <section class="rounded-md border border-amber-500 dark:border-amber-600 bg-amber-900/80 dark:bg-amber-900/70 p-2">
+          <h4 class="text-[11px] font-mono text-amber-200 mb-1 font-semibold">
             transition.when
           </h4>
-          <CodeBlock
-            text={predicate}
-            language="plain"
-            maxInlineHeight="max-h-64"
-            ariaLabel={`${source} to ${target} predicate`}
-          />
+          <pre
+            class="font-mono text-xs whitespace-pre-wrap break-words text-amber-50 max-h-64 overflow-auto"
+            aria-label={`${source} to ${target} predicate`}
+          >
+            {tokenisePredicate(predicate).map((t, idx) => (
+              <span key={idx} class={classForPredicateKind(t.kind)}>{t.text}</span>
+            ))}
+          </pre>
         </section>
       ) : null}
       {transition ? (
@@ -371,7 +493,7 @@ function GraphPanel({ detail }: GraphPanelProps): JSX.Element {
   };
 
   return (
-    <div class="h-[70vh] p-3">
+    <div class="h-full min-h-0 p-3 flex flex-col">
       <FlowGraph
         nodes={graph.nodes}
         edges={graph.edges}
@@ -718,19 +840,21 @@ export function SpecDetailRoute(): JSX.Element {
           </span>
         </div>
       </header>
-      <Card className="flex-1 min-h-0 p-0">
-        <Tabs
-          tabs={tabs}
-          activeTab={activeTab}
-          onChange={setActiveTab}
-          panels={{
-            graph: <GraphPanel detail={detail} />,
-            runs: <div class="p-3"><RunsPanel spec={spec} navigate={navigate} /></div>,
-            schemas: <div class="p-3"><SchemasPanel detail={detail} /></div>,
-            definition: <div class="p-3"><DefinitionPanel detail={detail} /></div>,
-            versions: <div class="p-3"><VersionsPanel spec={spec} navigate={navigate} /></div>,
-          }}
-        />
+      <Card className="flex-1 min-h-0 p-0 flex flex-col">
+        <div class="flex flex-col h-full min-h-0">
+          <Tabs
+            tabs={tabs}
+            activeTab={activeTab}
+            onChange={setActiveTab}
+            panels={{
+              graph: <GraphPanel detail={detail} />,
+              runs: <div class="p-3"><RunsPanel spec={spec} navigate={navigate} /></div>,
+              schemas: <div class="p-3"><SchemasPanel detail={detail} /></div>,
+              definition: <div class="p-3"><DefinitionPanel detail={detail} /></div>,
+              versions: <div class="p-3"><VersionsPanel spec={spec} navigate={navigate} /></div>,
+            }}
+          />
+        </div>
       </Card>
     </div>
   );

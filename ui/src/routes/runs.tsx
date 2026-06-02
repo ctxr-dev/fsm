@@ -373,6 +373,17 @@ export function Runs(): JSX.Element {
   const [specResolver, setSpecResolver] = useState<Map<string, { slug: string; version: number }>>(
     new Map(),
   );
+  // Monotonic counter that bumps ONLY when an SSE refresh event
+  // suggests server-side run state has shifted (run started, faulted,
+  // completed, etc.). The summary stats reloadKey threads this in, so
+  // the tiles re-fetch only when there is a real reason to: not on
+  // pagination (which would burn four /runs calls for no new
+  // information since the per-status totals are page-independent), and
+  // not on the every-``fetchRuns`` path either (since ``fetchRuns``
+  // itself runs on every page/pageSize change). Status changes are
+  // already covered by the ``status`` segment of ``reloadKey``; the
+  // tile's own initial mount covers first load.
+  const [statsReload, setStatsReload] = useState<number>(0);
 
   // Fetch the spec list once on mount + build a resolver map so the
   // Spec column on each row can render slug + version instead of a
@@ -417,6 +428,13 @@ export function Runs(): JSX.Element {
         setCursor((c) =>
           result.items.length === 0 ? 0 : Math.min(c, result.items.length - 1),
         );
+        // NOTE: the summary tiles are NOT bumped here. ``fetchRuns``
+        // fires on every page/pageSize change too, so bumping
+        // ``statsReload`` here would burn four extra /runs calls per
+        // pagination click for no new information (the per-status
+        // totals are page-independent). The SSE effect below bumps
+        // ``statsReload`` instead, which is the only path that
+        // represents a genuine server-side change in run state.
       } catch (err) {
         const msg =
           err instanceof ApiError
@@ -451,6 +469,10 @@ export function Runs(): JSX.Element {
     lastSeenEventId.current = newest.id;
     if (REFRESH_EVENT_KINDS.has(newest.kind)) {
       void fetchRuns({ page, pageSize, status });
+      // Server-side run state has shifted (run started / faulted /
+      // completed / etc.) — bump the tile reloadKey so the four
+      // per-status totals refetch in lockstep with the table.
+      setStatsReload((n) => n + 1);
     }
   }, [fetchRuns, page, pageSize, status]);
 
@@ -469,15 +491,33 @@ export function Runs(): JSX.Element {
   );
 
   // Options for the multiselect: every spec in the resolver, sorted
-  // by slug + version desc. We derive afresh whenever the resolver
-  // populates so the dropdown reflects every spec the project has
-  // registered.
+  // by slug asc + numeric version desc. We derive afresh whenever the
+  // resolver populates so the dropdown reflects every spec the project
+  // has registered. Sorting on the rendered label string would
+  // lexicographically order "v10" before "v2"; sort on (slug, version)
+  // primitives so "code-reviewer v10" sits above "code-reviewer v2".
   const specOptions = useMemo(() => {
-    const out: Array<{ id: string; label: string; sub: string }> = [];
+    const out: Array<{
+      id: string;
+      label: string;
+      sub: string;
+      slug: string;
+      version: number;
+    }> = [];
     for (const [id, { slug, version }] of specResolver.entries()) {
-      out.push({ id, label: `${slug} v${version}`, sub: id.slice(0, 12) + '…' });
+      out.push({
+        id,
+        label: `${slug} v${version}`,
+        sub: id.slice(0, 12) + '…',
+        slug,
+        version,
+      });
     }
-    out.sort((a, b) => a.label.localeCompare(b.label));
+    out.sort((a, b) => {
+      const bySlug = a.slug.localeCompare(b.slug);
+      if (bySlug !== 0) return bySlug;
+      return b.version - a.version;
+    });
     return out;
   }, [specResolver]);
 
@@ -746,13 +786,19 @@ export function Runs(): JSX.Element {
             {loading ? 'Refreshing…' : `${visibleRuns.length} shown`}
           </span>
         </div>
-        {/* W22b5: four-tile glance card. Reloads in lockstep with
-            page / status changes so the count tiles match whatever
-            the table is showing right now. Clicking a tile re-applies
-            its status filter to the table (and resets the cursor to
-            page 1). */}
+        {/* W22b5: four-tile glance card. The reload key is composed
+            of ``status`` (so a status change refetches even when the
+            cursor was already on page 1) and ``statsReload`` (a
+            counter bumped ONLY by SSE refresh events — the path that
+            represents a genuine server-side run-state change). Page
+            intentionally does NOT appear here, and the bump is NOT
+            wired into the every-``fetchRuns`` path either: paging
+            calls ``fetchRuns`` too, so bumping there would burn four
+            extra /runs calls per pagination click for no new
+            information (the per-status totals are page-independent).
+            The tile's own initial mount covers first load. */}
         <RunsSummaryStats
-          reloadKey={page}
+          reloadKey={`${status}:${statsReload}`}
           onFilterPick={(nextStatus) => {
             setStatus(nextStatus ?? 'all');
             if (page !== 1) setPage(1);
