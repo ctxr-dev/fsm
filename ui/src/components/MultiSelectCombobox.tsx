@@ -25,10 +25,9 @@
  * Keyboard:
  *   - Click trigger / Enter / Space on the trigger opens the panel.
  *   - Standard text-input keyboard handling on the search field.
- *     There is no custom Up/Down/Tab arrow navigation today; the
- *     navigation model is "type to filter, then click / Space /
- *     Enter the row you want". (Listed as a follow-up for fuller
- *     keyboard navigation parity with the ARIA combobox pattern.)
+ *   - Arrow Down from the search input (or first option) moves focus
+ *     into / through the option list; Arrow Up walks back. Options
+ *     use a roving tabindex so Tab also reaches the active option.
  *   - Click / Space / Enter on a focused option toggles selection.
  *   - Escape closes the panel and restores focus to the trigger.
  *
@@ -88,9 +87,16 @@ export function MultiSelectCombobox<T>({
 }: MultiSelectComboboxProps<T>): JSX.Element {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
+  const [focusedIndex, setFocusedIndex] = useState(-1);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
+  const optionRefs = useRef<Array<HTMLLIElement | null>>([]);
+  // Track previous `open` so we only restore focus on a true
+  // open -> closed transition. Without this, the effect would fire
+  // on the initial mount (open === false) and steal focus on page
+  // load, which is exactly the bug the Copilot reviewer flagged.
+  const prevOpenRef = useRef(false);
 
   // Close on click-outside while open.
   useEffect(() => {
@@ -106,13 +112,19 @@ export function MultiSelectCombobox<T>({
     return () => document.removeEventListener('mousedown', onMousedown);
   }, [open]);
 
-  // Autofocus search on open; restore focus to trigger on close.
+  // Autofocus search on open; restore focus to trigger only on
+  // the open -> closed transition (never on initial mount).
   useEffect(() => {
     if (open) {
       const t = setTimeout(() => searchRef.current?.focus(), 0);
+      prevOpenRef.current = true;
       return () => clearTimeout(t);
     }
-    triggerRef.current?.focus();
+    if (prevOpenRef.current) {
+      triggerRef.current?.focus();
+      prevOpenRef.current = false;
+    }
+    setFocusedIndex(-1);
     return undefined;
   }, [open]);
 
@@ -143,6 +155,30 @@ export function MultiSelectCombobox<T>({
     const next = new Set(selected);
     for (const opt of filtered) next.add(getId(opt));
     onChange(next);
+  };
+
+  // Roving-tabindex navigation. Move focus among filtered options
+  // with Arrow Up / Arrow Down; keep `focusedIndex` clamped when
+  // the filter changes underneath us. Home/End jump to ends.
+  useEffect(() => {
+    if (focusedIndex < 0) return;
+    if (focusedIndex >= filtered.length) {
+      setFocusedIndex(filtered.length > 0 ? filtered.length - 1 : -1);
+      return;
+    }
+    const el = optionRefs.current[focusedIndex];
+    if (el) el.focus();
+  }, [focusedIndex, filtered.length]);
+
+  const moveFocus = (delta: number) => {
+    if (filtered.length === 0) return;
+    setFocusedIndex((cur) => {
+      const start = cur < 0 ? (delta > 0 ? -1 : filtered.length) : cur;
+      const next = start + delta;
+      if (next < 0) return 0;
+      if (next >= filtered.length) return filtered.length - 1;
+      return next;
+    });
   };
 
   return (
@@ -194,6 +230,22 @@ export function MultiSelectCombobox<T>({
               type="text"
               value={query}
               onInput={(e) => setQuery((e.currentTarget as HTMLInputElement).value)}
+              onKeyDown={(e) => {
+                if (e.key === 'ArrowDown') {
+                  e.preventDefault();
+                  if (filtered.length > 0) setFocusedIndex(0);
+                } else if (e.key === 'Home') {
+                  if (filtered.length > 0) {
+                    e.preventDefault();
+                    setFocusedIndex(0);
+                  }
+                } else if (e.key === 'End') {
+                  if (filtered.length > 0) {
+                    e.preventDefault();
+                    setFocusedIndex(filtered.length - 1);
+                  }
+                }
+              }}
               placeholder={searchPlaceholder}
               aria-label="Filter options"
               class={[
@@ -215,10 +267,17 @@ export function MultiSelectCombobox<T>({
                 No matches
               </li>
             ) : (
-              filtered.map((opt) => {
+              filtered.map((opt, index) => {
                 const id = getId(opt);
                 const checked = selected.has(id);
                 const sub = getSubLabel?.(opt);
+                // Roving tabindex: only the active option is in the
+                // tab order. The remaining options stay at -1 and are
+                // reached via Arrow Up/Down. This keeps the listbox
+                // pattern intact while making Space/Enter reachable.
+                const isActive =
+                  focusedIndex === index ||
+                  (focusedIndex < 0 && index === 0);
                 // ARIA listbox-with-multi-select: each option carries
                 // its own aria-selected; we deliberately do NOT nest a
                 // checkbox input inside (mixing role=option with a
@@ -227,14 +286,40 @@ export function MultiSelectCombobox<T>({
                 return (
                   <li
                     key={id}
+                    ref={(el) => {
+                      optionRefs.current[index] = el;
+                    }}
                     role="option"
                     aria-selected={checked ? 'true' : 'false'}
-                    tabIndex={-1}
-                    onClick={() => toggle(id)}
+                    tabIndex={isActive ? 0 : -1}
+                    onClick={() => {
+                      setFocusedIndex(index);
+                      toggle(id);
+                    }}
+                    onFocus={() => {
+                      if (focusedIndex !== index) setFocusedIndex(index);
+                    }}
                     onKeyDown={(e) => {
                       if (e.key === ' ' || e.key === 'Enter') {
                         e.preventDefault();
                         toggle(id);
+                      } else if (e.key === 'ArrowDown') {
+                        e.preventDefault();
+                        moveFocus(1);
+                      } else if (e.key === 'ArrowUp') {
+                        e.preventDefault();
+                        if (index === 0) {
+                          setFocusedIndex(-1);
+                          searchRef.current?.focus();
+                        } else {
+                          moveFocus(-1);
+                        }
+                      } else if (e.key === 'Home') {
+                        e.preventDefault();
+                        setFocusedIndex(0);
+                      } else if (e.key === 'End') {
+                        e.preventDefault();
+                        setFocusedIndex(filtered.length - 1);
                       }
                     }}
                     class={[
