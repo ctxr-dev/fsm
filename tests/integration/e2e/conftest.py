@@ -95,20 +95,21 @@ def _run_ensure(project_root: Path, timeout_s: float = 60.0) -> dict:
 def _read_supervisor_logs(project_root: Path, *, tail_bytes: int = 32_768) -> str:
     """Return the tail of the supervisor log dir, joined for diagnostics.
 
-    The supervisor forwards each child's stdout/stderr to its own
-    stderr with a ``[ctxr-fsm supervisor]`` / ``[<child>]`` prefix and
-    persists rotating files under ``.ctxr-fsm/logs/``. On CI we can
-    only see what we print, so when a wait-for-url times out we dump
-    the tail of every log file so the failure is diagnosable instead
-    of opaque (the symptom was ``ConnectionRefusedError`` without any
-    hint about whether npm crashed, Vite was still pre-bundling, or
-    the port was simply taken).
+    The supervisor forwards each child's stdout/stderr (the UI
+    child's inherited stdio — Vite's banner, dep-optimise progress,
+    any startup error trace) into a date-sharded log under
+    ``<project_root>/.ctxr-fsm/logs/``. On CI we can only see what we
+    print, so when a wait-for-url times out we dump the tail of every
+    file there so the failure is diagnosable instead of opaque (the
+    symptom was ``ConnectionRefusedError`` without any hint about
+    whether npm crashed, Vite was still pre-bundling, or the port was
+    simply taken).
     """
     logs_dir = project_root / ".ctxr-fsm" / "logs"
     if not logs_dir.is_dir():
         return f"<no supervisor logs at {logs_dir}>"
     chunks: list[str] = []
-    for log_file in sorted(logs_dir.glob("*.log")):
+    for log_file in sorted(logs_dir.rglob("*.log")):
         try:
             with log_file.open("rb") as fh:
                 fh.seek(0, os.SEEK_END)
@@ -117,9 +118,9 @@ def _read_supervisor_logs(project_root: Path, *, tail_bytes: int = 32_768) -> st
                 fh.seek(start)
                 blob = fh.read().decode("utf-8", errors="replace")
         except OSError as exc:
-            chunks.append(f"--- {log_file.name} (unreadable: {exc!r}) ---")
+            chunks.append(f"--- {log_file} (unreadable: {exc!r}) ---")
             continue
-        chunks.append(f"--- {log_file.name} (tail {len(blob)}B) ---\n{blob}")
+        chunks.append(f"--- {log_file} (tail {len(blob)}B) ---\n{blob}")
     if not chunks:
         return f"<supervisor logs dir {logs_dir} is empty>"
     return "\n".join(chunks)
@@ -237,14 +238,13 @@ def live_project(tmp_path_factory: pytest.TempPathFactory) -> Generator[LiveProj
         # before they accept connections. Poll healthz before
         # handing off to tests.
         # 60s ceiling: Vite cold start on GH-hosted runners with a
-        # first-time esbuild prebundle + uvicorn import-graph priming
-        # routinely exceeds the old 20s window. The poll cadence is
-        # 100ms, so a healthy local boot still hands off in under 2s;
-        # the budget only bites on CI cold starts. Pass
-        # ``project_root`` so timeouts dump the supervisor log tail
-        # (npm/Vite/uvicorn stderr forwarded via the supervisor) into
-        # the failure message — opaque ``ConnectionRefusedError`` is
-        # what made the original CI flake un-diagnosable.
+        # first-time esbuild + uvicorn import-graph priming routinely
+        # exceeds the old 20s window (W23b added CodeMirror + viewport
+        # persistence which lengthened first paint). The poll cadence
+        # is 100ms, so a healthy local boot still hands off in <2s;
+        # the budget only bites on CI cold starts. On timeout we dump
+        # the supervisor log tail (carrying Vite's inherited stdio)
+        # so the next failure is diagnosable rather than opaque.
         _wait_for_url(
             f"{api_url}/healthz", timeout_s=60.0, project_root=project_root
         )
