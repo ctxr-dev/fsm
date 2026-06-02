@@ -346,13 +346,16 @@ export function Runs(): JSX.Element {
   const [specResolver, setSpecResolver] = useState<Map<string, { slug: string; version: number }>>(
     new Map(),
   );
-  // Monotonic counter that bumps every time the table data could
-  // have shifted out from under the summary tiles — i.e. a
-  // successful ``fetchRuns`` OR an SSE-triggered refetch. The
-  // summary stats reloadKey threads this in, so the tiles re-fetch
-  // ONLY when there is a real reason to (not on every page change,
-  // which would burn four /runs calls for no new information since
-  // the totals are page-independent).
+  // Monotonic counter that bumps ONLY when an SSE refresh event
+  // suggests server-side run state has shifted (run started, faulted,
+  // completed, etc.). The summary stats reloadKey threads this in, so
+  // the tiles re-fetch only when there is a real reason to: not on
+  // pagination (which would burn four /runs calls for no new
+  // information since the per-status totals are page-independent), and
+  // not on the every-``fetchRuns`` path either (since ``fetchRuns``
+  // itself runs on every page/pageSize change). Status changes are
+  // already covered by the ``status`` segment of ``reloadKey``; the
+  // tile's own initial mount covers first load.
   const [statsReload, setStatsReload] = useState<number>(0);
 
   // Fetch the spec list once on mount + build a resolver map so the
@@ -398,13 +401,13 @@ export function Runs(): JSX.Element {
         setCursor((c) =>
           result.items.length === 0 ? 0 : Math.min(c, result.items.length - 1),
         );
-        // Signal the summary tiles to refresh now that the table
-        // data has just landed. Tying the tile reload to fetchRuns
-        // (rather than to ``page``) means paging doesn't waste four
-        // extra /runs calls — the per-status totals are page-
-        // independent — while SSE-driven refreshes still keep the
-        // tiles in lockstep with the table.
-        setStatsReload((n) => n + 1);
+        // NOTE: the summary tiles are NOT bumped here. ``fetchRuns``
+        // fires on every page/pageSize change too, so bumping
+        // ``statsReload`` here would burn four extra /runs calls per
+        // pagination click for no new information (the per-status
+        // totals are page-independent). The SSE effect below bumps
+        // ``statsReload`` instead, which is the only path that
+        // represents a genuine server-side change in run state.
       } catch (err) {
         const msg =
           err instanceof ApiError
@@ -439,6 +442,10 @@ export function Runs(): JSX.Element {
     lastSeenEventId.current = newest.id;
     if (REFRESH_EVENT_KINDS.has(newest.kind)) {
       void fetchRuns({ page, pageSize, status });
+      // Server-side run state has shifted (run started / faulted /
+      // completed / etc.) — bump the tile reloadKey so the four
+      // per-status totals refetch in lockstep with the table.
+      setStatsReload((n) => n + 1);
     }
   }, [fetchRuns, page, pageSize, status]);
 
@@ -691,15 +698,14 @@ export function Runs(): JSX.Element {
         {/* W22b5: four-tile glance card. The reload key is composed
             of ``status`` (so a status change refetches even when the
             cursor was already on page 1) and ``statsReload`` (a
-            counter bumped by every successful table fetch — initial,
-            manual refresh, SSE-triggered refetch). Page intentionally
-            does NOT appear here: the per-status totals are page-
-            independent, so threading ``page`` would burn four
-            extra /runs calls on every pagination click for no new
-            information. Tying the bump to fetchRuns keeps the tiles
-            in lockstep with the table without that overhead, and
-            also covers background SSE refreshes that would otherwise
-            leave the tile counts stale. */}
+            counter bumped ONLY by SSE refresh events — the path that
+            represents a genuine server-side run-state change). Page
+            intentionally does NOT appear here, and the bump is NOT
+            wired into the every-``fetchRuns`` path either: paging
+            calls ``fetchRuns`` too, so bumping there would burn four
+            extra /runs calls per pagination click for no new
+            information (the per-status totals are page-independent).
+            The tile's own initial mount covers first load. */}
         <RunsSummaryStats
           reloadKey={`${status}:${statsReload}`}
           onFilterPick={(nextStatus) => {
