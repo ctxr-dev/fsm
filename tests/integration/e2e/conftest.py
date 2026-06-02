@@ -187,9 +187,13 @@ def live_project(tmp_path_factory: pytest.TempPathFactory) -> Generator[LiveProj
         # ensure reports subsystems as "spawned" once the child
         # process is alive, but Vite + uvicorn need a moment more
         # before they accept connections. Poll healthz before
-        # handing off to tests.
-        _wait_for_url(f"{api_url}/healthz", timeout_s=20.0)
-        _wait_for_url(ui_url, timeout_s=20.0)
+        # handing off to tests. The Vite cold-start budget on a
+        # GitHub-hosted Ubuntu runner is regularly 25-40s (npm
+        # spawn + vite plugin graph + first dep-optimise pass), so
+        # the 20s budget that worked locally was racing CI. 60s
+        # gives headroom without masking a genuine launch failure.
+        _wait_for_url(f"{api_url}/healthz", timeout_s=60.0)
+        _wait_for_url(ui_url, timeout_s=60.0)
         yield LiveProject(
             project_root=project_root,
             api_url=api_url,
