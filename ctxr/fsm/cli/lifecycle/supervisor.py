@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import functools
 import os
+import shutil
 import signal
 import sys
 from contextlib import suppress
@@ -535,6 +536,26 @@ async def _boot_subsystem(
             )
             release_singleton(acq, project_root=project_root)
             return None, None, None, True
+        # Cross-client bootstrap regression: a bare Python install
+        # (no Node toolchain) used to hard-crash here because
+        # ``anyio.open_process(["npm", ...])`` raises
+        # ``FileNotFoundError`` when npm isn't on PATH, taking the
+        # whole supervisor down with it. The UI is optional — the
+        # MCP + API surfaces are what skills actually need — so we
+        # detect the missing dependency up front and skip gracefully.
+        # The downstream discovery file carries a structured
+        # ``status: "skipped"`` entry under ``subsystems.ui`` (see
+        # ``_publish_active_mcp_file``) so ``ctxr-fsm urls`` /
+        # ``doctor`` can tell operators exactly what to install to
+        # enable the dashboard.
+        if shutil.which("npm") is None:
+            _log(
+                "[ctxr-fsm supervisor] ui skipped: npm not installed "
+                "(install node + run `ctxr-fsm ensure` again to enable "
+                "the dashboard); MCP + API continue without UI."
+            )
+            release_singleton(acq, project_root=project_root)
+            return None, None, None, True
         cmd = _ui_cmd(port=port)
         cwd = ui_cwd
         env = os.environ.copy()
@@ -799,6 +820,7 @@ def _publish_active_mcp_file(
     project_root: Path,
     ports: dict[str, int | None],
     include_ui: bool,
+    ui_skip_reason: str | None = None,
 ) -> None:
     """Write the W14c discovery document for the supervisor's current state.
 
@@ -845,6 +867,23 @@ def _publish_active_mcp_file(
         )
         if ui_block is not None:
             subsystems["ui"] = ui_block
+    elif ui_skip_reason is not None:
+        # Cross-client bootstrap regression: when the supervisor
+        # intentionally skipped the UI (npm missing, ui/ directory
+        # absent in a stripped wheel, mcp-only mode), publish a
+        # structured ``status: "skipped"`` block so consumers can tell
+        # "not booted in this mode" apart from "boot crashed". The
+        # ``http_url`` is null because there is no live endpoint;
+        # ``pid`` is null for the same reason. ``reason`` carries a
+        # human-readable diagnostic the urls / doctor renderer can
+        # surface to the operator.
+        subsystems["ui"] = {
+            "status": "skipped",
+            "http_url": None,
+            "healthz_url": None,
+            "pid": None,
+            "reason": ui_skip_reason,
+        }
 
     payload: dict[str, Any] = {
         "started_at": now_iso_ms(),
@@ -977,6 +1016,7 @@ async def run_supervisor(
                 if name == "mcp":
                     mcp_healthz_ok = healthz_ok
 
+            ui_skip_reason: str | None = None
             if mode == "dev" and not mcp_only:
                 lock, port, proc, _ok = await _boot_subsystem(
                     "ui",
@@ -988,6 +1028,25 @@ async def run_supervisor(
                 children["ui"] = proc
                 locks["ui"] = lock
                 ports["ui"] = port
+                # If the UI boot returned no port we know it short-
+                # circuited before spawning. Capture the most likely
+                # actionable reason so the discovery file carries a
+                # diagnostic operators can act on (install npm, ship
+                # the ui/ subtree, etc). We check npm first because it
+                # is the single most common miss on a fresh laptop.
+                if port is None:
+                    if shutil.which("npm") is None:
+                        ui_skip_reason = (
+                            "npm not installed; install node + run "
+                            "`ctxr-fsm ensure` again to enable the "
+                            "dashboard"
+                        )
+                    elif _locate_package_ui_dir() is None:
+                        ui_skip_reason = (
+                            "package-owned ui/ directory not found "
+                            "(wheel may have been built without the ui "
+                            "subtree)"
+                        )
 
             # W14c: publish ``.ctxr-fsm/active-mcp.json`` once the MCP
             # child has answered /healthz. Skips the write when MCP
@@ -1013,6 +1072,7 @@ async def run_supervisor(
                         and not mcp_only
                         and ports["ui"] is not None
                     ),
+                    ui_skip_reason=ui_skip_reason,
                 )
 
             # Banner. We render even-when-skipped URLs because the

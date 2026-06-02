@@ -12,13 +12,15 @@ from pathlib import Path
 
 import pytest
 
-from ctxr.fsm.cli.install_mcp_cmd import run_install_mcp
+from ctxr.fsm.cli.install_mcp_cmd import _resolve_stdio_entry, run_install_mcp
 
-EXPECTED_ENTRY = {
-    "command": "ctxr-fsm",
-    "args": ["mcp", "--transport", "stdio"],
-    "env": {},
-}
+# The expected entry is resolved AT IMPORT TIME from the same helper
+# the install path uses, so this test stays valid whether the runner
+# is in a uv-managed venv (``command="uv"`` + ``args=["run", ...]``)
+# or a bare install (``command=<abs path>`` + ``args=[...]``). The
+# previous hardcoded ``"ctxr-fsm"`` literal would silently re-bake the
+# regression the fix is preventing.
+EXPECTED_ENTRY = _resolve_stdio_entry()
 
 
 def test_cursor_creates_user_config_when_absent(

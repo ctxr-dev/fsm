@@ -26,7 +26,7 @@ A run is one execution of an FSM spec against a project DB. The spec declares st
 
 ## The five things to remember
 
-1. **Bootstrap is one command, idempotent, fast.** `uv run ctxr-fsm ensure --json` returns `{status: "ready"}` in <500 ms on a warm project. Call it once per session. Do NOT skip it. See `bootstrap.md`.
+1. **Bootstrap is one command, idempotent.** `uv run ctxr-fsm ensure --json` returns `{status: "ready"}` on a warm project (measured 1.5-1.8s on cycle 1). Call it once per session. Do NOT skip it. See `bootstrap.md`.
 2. **The brief is your only input.** `brief.inputs` is what the engine resolved for you. `brief.worker.prompt_template` is what you (or the sub-agent you dispatch) consumes. If the template embeds `{{ ... }}` placeholders, the engine has already rendered them; you see the resolved string.
 3. **The schema is your only output shape.** `brief.worker.response_schema` is the contract. Validate yourself before commit. The server validates again and rejects mismatches with `error: output_schema_violation`. Fix the shape; do not work around it.
 4. **Your tool surface shrinks during a run.** `brief.allowed_tools` is the allowlist. You may also call `fsm.*`. Anything else feeds the drift detector and may auto-pause the run.

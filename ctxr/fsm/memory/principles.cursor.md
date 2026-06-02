@@ -17,15 +17,15 @@ You have access to an MCP server named "ctxr-fsm" exposing fsm.* tools (healthch
 
 ## Principle 0: Bootstrap before work
 
-Before any FSM-using skill or agent does ANYTHING else, follow the bootstrap procedure at `@.ctxr-fsm/memory/bootstrap.md` (inlined below for this client) to ensure `ctxr-fsm` is installed, the project is initialised, the MCP server is registered with the active client, and the supervisor is running. The bootstrap is idempotent and fast (<500ms) when everything is already up, so calling it once per session has negligible cost. Do NOT skip it on the assumption that "it was up yesterday" — sessions, clients, and project state drift. Principles 1 through 10 below describe how to behave once a run is active; Principle 0 is the gate that makes any of them reachable.
+Before any FSM-using skill or agent does ANYTHING else, follow the bootstrap procedure at `@.ctxr-fsm/memory/bootstrap.md` (inlined below for this client) to ensure `ctxr-fsm` is installed, the project is initialised, the MCP server is registered with the active client, and the supervisor is running. The bootstrap is idempotent and intended to be fast on the warm path (measured 1.5-1.8s on cycle 1) when everything is already up, so calling it once per session has negligible cost. Do NOT skip it on the assumption that "it was up yesterday" — sessions, clients, and project state drift. Principles 1 through 10 below describe how to behave once a run is active; Principle 0 is the gate that makes any of them reachable.
 
 <!-- bootstrap-content-begin (inlined for clients that don't follow @ imports) -->
 
 ### ctxr-fsm bootstrap: how a skill or agent ensures fsm is ready
 
-**Before any work in a skill that depends on `ctxr-fsm`, run this once per session.** It is idempotent and fast (<500ms) when the project is already initialised and the supervisor is running.
+**Before any work in a skill that depends on `ctxr-fsm`, run this once per session.** It is idempotent and intended to be fast on the warm path (measured 1.5-1.8s on cycle 1) when the project is already initialised and the supervisor is running.
 
-#### Step 1 — detect the package, then install ONCE if missing
+#### Step 1 — detect the package, then ASK ONCE before installing if missing
 
 **Decision tree (no improvising):**
 
@@ -37,6 +37,11 @@ Before any FSM-using skill or agent does ANYTHING else, follow the bootstrap pro
 ### UV_PROJECT_ENVIRONMENT cache otherwise). On miss, fall through to
 ### `command -v` (catches pipx / pip --user installs that don't live
 ### in a uv environment).
+#
+### The probe is the real `--version` flag (typer eager callback, exits
+### 0 with one line on stdout). Exit code is the only signal we read;
+### the printed version is captured for the user's confirmation message
+### in the "ASK before install" prompt below.
 #
 ### FSM_CMD captures the runner that succeeded so Step 2 invokes the
 ### same one — otherwise `uv run ctxr-fsm ensure` would fail for a
@@ -52,15 +57,15 @@ else
 fi
 ```
 
-If `PACKAGE_MISSING` is set, follow this rule **exactly once**, in this order:
+If `PACKAGE_MISSING` is set, **ASK the user before running ANY install command.** Determine which row in the table below applies, print the proposed command verbatim in chat, and wait for explicit go-ahead before executing. Do NOT auto-install. Do NOT pick a row the user did not approve. This is the standing requirement-precheck principle (Principle 1) applied to the package-missing case: the user always confirms before tools touch their environment.
 
-| Workdir state | Run THIS command (and only this command) |
+| Workdir state | Command to PROPOSE (then wait for confirmation) |
 |---|---|
 | `pyproject.toml` exists at workdir root | `uv add 'ctxr-fsm[all]'` |
 | No `pyproject.toml`, `pipx` on `PATH` | `pipx install 'ctxr-fsm[all]'` |
-| Neither | Return `MissingRequirement` and ASK the user (Principle 1). Do not pick a third path on your own. |
+| Neither | Return `MissingRequirement` and ASK the user how they want to proceed. Do not pick a third path on your own. |
 
-After the install command completes, re-run the version check from the top of this step to confirm.
+Once the user confirms, run the approved command **exactly once** in the resolved workdir. After it completes, re-run the version check from the top of this step to confirm.
 
 **Hard rules to prevent the common LLM failure modes:**
 
@@ -95,7 +100,7 @@ When the status is `missing_*` (and ONLY then), apply the changes by re-invoking
 $FSM_CMD ensure --json
 ```
 
-This is idempotent. On a cold project it: creates `.ctxr-fsm/fsm.db`, runs migrations, installs principles into CLAUDE.md/AGENTS.md/.cursor/rules, registers `ctxr-fsm` as an MCP server in the active client config(s), boots the supervisor (MCP + FastAPI + UI). On a warm project it returns in <500ms confirming everything is up.
+This is idempotent. On a cold project it: creates `.ctxr-fsm/fsm.db`, runs migrations, installs principles into CLAUDE.md/AGENTS.md/.cursor/rules, registers `ctxr-fsm` as an MCP server in the active client config(s), boots the supervisor (MCP + FastAPI + UI). On a warm project it returns quickly (measured 1.5-1.8s on cycle 1) confirming everything is up.
 
 Parse the JSON output. Capture `mcp_http_url` (the HTTP-SSE MCP endpoint for current-session use) and `api_url`.
 

@@ -10,7 +10,7 @@ You have access to an MCP server named "ctxr-fsm" exposing fsm.* tools (healthch
 
 ## Principle 0: Bootstrap before work
 
-Before any FSM-using skill or agent does ANYTHING else, follow the bootstrap procedure at @.ctxr-fsm/memory/bootstrap.md to ensure `ctxr-fsm` is installed, the project is initialised, the MCP server is registered with the active client, and the supervisor is running. The bootstrap is idempotent and fast (<500ms) when everything is already up, so calling it once per session has negligible cost. Do NOT skip it on the assumption that "it was up yesterday" — sessions, clients, and project state drift. Principles 1 through 10 below describe how to behave once a run is active; Principle 0 is the gate that makes any of them reachable.
+Before any FSM-using skill or agent does ANYTHING else, follow the bootstrap procedure at @.ctxr-fsm/memory/bootstrap.md to ensure `ctxr-fsm` is installed, the project is initialised, the MCP server is registered with the active client, and the supervisor is running. The bootstrap is idempotent and intended to be fast on the warm path (measured 1.5-1.8s on cycle 1) when everything is already up, so calling it once per session has negligible cost. Do NOT skip it on the assumption that "it was up yesterday" — sessions, clients, and project state drift. Principles 1 through 10 below describe how to behave once a run is active; Principle 0 is the gate that makes any of them reachable.
 
 ## Principle 1: pre-check before you act
 

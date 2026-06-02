@@ -22,13 +22,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ctxr.fsm.cli.install_mcp_cmd import run_install_mcp
+from ctxr.fsm.cli.install_mcp_cmd import _resolve_stdio_entry, run_install_mcp
 
-EXPECTED_ENTRY = {
-    "command": "ctxr-fsm",
-    "args": ["mcp", "--transport", "stdio"],
-    "env": {},
-}
+# Resolved AT IMPORT TIME from the same helper the install path uses;
+# stays valid for both the uv-run shape and the absolute-path shape
+# Fix 4 introduced. Hardcoding ``"ctxr-fsm"`` would silently re-bake
+# the bare-literal regression the fix prevents.
+EXPECTED_ENTRY = _resolve_stdio_entry()
 
 
 def _seed_workspace_marker(tmp_path: Path) -> None:
