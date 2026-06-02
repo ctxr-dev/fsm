@@ -346,6 +346,14 @@ export function Runs(): JSX.Element {
   const [specResolver, setSpecResolver] = useState<Map<string, { slug: string; version: number }>>(
     new Map(),
   );
+  // Monotonic counter that bumps every time the table data could
+  // have shifted out from under the summary tiles — i.e. a
+  // successful ``fetchRuns`` OR an SSE-triggered refetch. The
+  // summary stats reloadKey threads this in, so the tiles re-fetch
+  // ONLY when there is a real reason to (not on every page change,
+  // which would burn four /runs calls for no new information since
+  // the totals are page-independent).
+  const [statsReload, setStatsReload] = useState<number>(0);
 
   // Fetch the spec list once on mount + build a resolver map so the
   // Spec column on each row can render slug + version instead of a
@@ -390,6 +398,13 @@ export function Runs(): JSX.Element {
         setCursor((c) =>
           result.items.length === 0 ? 0 : Math.min(c, result.items.length - 1),
         );
+        // Signal the summary tiles to refresh now that the table
+        // data has just landed. Tying the tile reload to fetchRuns
+        // (rather than to ``page``) means paging doesn't waste four
+        // extra /runs calls — the per-status totals are page-
+        // independent — while SSE-driven refreshes still keep the
+        // tiles in lockstep with the table.
+        setStatsReload((n) => n + 1);
       } catch (err) {
         const msg =
           err instanceof ApiError
@@ -673,18 +688,20 @@ export function Runs(): JSX.Element {
             {loading ? 'Refreshing…' : `${visibleRuns.length} shown`}
           </span>
         </div>
-        {/* W22b5: four-tile glance card. Reloads in lockstep with
-            EVERY input that could shift the table's contents — page
-            AND status — so the count tiles match whatever the table
-            is showing right now. The composite key avoids a parent-
-            side reducer; the component re-runs its parallel
-            listRuns calls when any segment of the key changes.
-            Pre-fix the key was only ``page``, so a status change
-            without a page change (e.g. clicking a different status
-            chip while already on page 1) would have left stale
-            tile counts. */}
+        {/* W22b5: four-tile glance card. The reload key is composed
+            of ``status`` (so a status change refetches even when the
+            cursor was already on page 1) and ``statsReload`` (a
+            counter bumped by every successful table fetch — initial,
+            manual refresh, SSE-triggered refetch). Page intentionally
+            does NOT appear here: the per-status totals are page-
+            independent, so threading ``page`` would burn four
+            extra /runs calls on every pagination click for no new
+            information. Tying the bump to fetchRuns keeps the tiles
+            in lockstep with the table without that overhead, and
+            also covers background SSE refreshes that would otherwise
+            leave the tile counts stale. */}
         <RunsSummaryStats
-          reloadKey={`${page}:${status}`}
+          reloadKey={`${status}:${statsReload}`}
           onFilterPick={(nextStatus) => {
             setStatus(nextStatus ?? 'all');
             if (page !== 1) setPage(1);

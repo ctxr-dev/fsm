@@ -100,11 +100,14 @@ export function RunsSummaryStats({
       // around it was dead code in the pre-fix draft — a 5xx on every
       // tile would leave the component in a "loading-forever" state
       // with no error surface. We now surface a degraded mode
-      // explicitly: when ALL four tiles fail we set ``error`` so the
-      // operator sees the failure; when SOME succeed we render the
-      // partial counts with ``—`` for the failed ones and stash the
-      // first failure reason so a future "what went wrong" affordance
-      // (Cmd+K diagnostic, tooltip) can read it.
+      // explicitly: when ALL four tiles fail we set ``error`` (using
+      // the first failure reason so the operator can grep / file a
+      // bug from a single screenshot); when SOME succeed we render
+      // the partial counts with ``—`` for the failed ones. Partial
+      // failures do NOT surface the failure reason today — the
+      // ``firstFailure`` value is consumed only on the all-failed
+      // branch — so the operator sees a working subset and a dash
+      // for the broken tiles without an error banner.
       const settled = await Promise.allSettled(
         TILES.map((t) =>
           api.listRuns({
