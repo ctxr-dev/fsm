@@ -234,14 +234,15 @@ def live_project(tmp_path_factory: pytest.TempPathFactory) -> Generator[LiveProj
         # process is alive, but Vite + uvicorn need a moment more
         # before they accept connections. Poll healthz before
         # handing off to tests.
-        # 60s ceiling: Vite cold start on GH-hosted runners with a
-        # first-time esbuild + uvicorn import-graph priming routinely
-        # exceeds the old 20s window (W23b added CodeMirror + viewport
-        # persistence which lengthened first paint). The poll cadence
-        # is 100ms, so a healthy local boot still hands off in <2s;
-        # the budget only bites on CI cold starts. On timeout we dump
-        # the supervisor log tail (carrying Vite's inherited stdio)
-        # so the next failure is diagnosable rather than opaque.
+        # 60s ceiling for both probes: Vite cold start on GH-hosted
+        # runners with a first-time esbuild + uvicorn import-graph
+        # priming routinely exceeds the old 20s window (W23b added
+        # CodeMirror + viewport persistence which lengthened first
+        # paint). The poll cadence is 100ms, so a healthy local boot
+        # still hands off in <2s; the budget only bites on CI cold
+        # starts. On timeout we dump the supervisor log tail (carrying
+        # Vite's inherited stdio) so the next failure is diagnosable
+        # rather than opaque.
         _wait_for_url(
             f"{api_url}/healthz", timeout_s=60.0, project_root=project_root
         )

@@ -273,17 +273,29 @@ export const runComparisonContext: Signal<{ a: string; b: string | null } | null
 
 export const projectMetadata: Signal<ProjectMetadata | null> = signal<ProjectMetadata | null>(null);
 export const projectMetadataError: Signal<string | null> = signal<string | null>(null);
-export const projectMetadataLoading: Signal<boolean> = signal<boolean>(true);
+// Defaults to ``false`` so SSR / vitest / any environment that never
+// reaches ``wireProjectMetadata()`` does not render a permanent
+// "loading…" affordance. The wiring flips this to ``true`` immediately
+// before the first fetch and back to ``false`` in the ``finally`` block.
+export const projectMetadataLoading: Signal<boolean> = signal<boolean>(false);
 
 let _metadataWired = false;
 
 /**
  * One-shot wiring: fetches the current project metadata and refreshes
  * it whenever the browser tab regains focus. Idempotent; safe to call
- * from app boot. NO-OP in non-browser environments (SSR / tests).
+ * from app boot. NO-OP in non-browser environments (SSR / tests) — and
+ * in that no-op path we explicitly pin ``projectMetadataLoading`` to
+ * ``false`` so a caller that flipped it earlier does not leave the UI
+ * stuck on a "loading…" eyebrow.
  */
 export function wireProjectMetadata(): void {
-  if (_metadataWired || typeof window === 'undefined') return;
+  if (_metadataWired || typeof window === 'undefined') {
+    if (typeof window === 'undefined') {
+      projectMetadataLoading.value = false;
+    }
+    return;
+  }
   _metadataWired = true;
 
   const load = async (): Promise<void> => {
