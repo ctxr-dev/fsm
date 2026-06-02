@@ -241,10 +241,13 @@ def test_install_memory_is_idempotent_for_ssot_docs(tmp_target: Path) -> None:
     expected_files = sorted(_EXPECTED_STAGED_FILES)
     assert actual_files == expected_files, actual_files
 
-    # The bytes match the snapshot (no content rewrite).
+    # The bytes match the snapshot (no content rewrite) AND the mtime is
+    # unchanged (the staging path is a true no-op: we did not even
+    # re-open + rewrite identical bytes).
     for filename in _EXPECTED_STAGED_FILES:
         staged = memory_dir / filename
         assert staged.read_bytes() == snapshot[filename][0], filename
+        assert staged.stat().st_mtime == snapshot[filename][1], filename
 
     # ``--check`` reports a clean tree (no SSOT drift).
     exit_code, check_payload = _run_check(tmp_target)

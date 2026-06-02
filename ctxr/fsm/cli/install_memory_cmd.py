@@ -689,11 +689,14 @@ class _InstallResult:
     bootstrap_link_mode: str | None = None
     # ``ssot_link_modes`` records how each W23-SSOT canonical reference
     # doc was staged for this client (slug -> ``"symlink"`` / ``"copy"``).
-    # Empty dict on dry-run and on Codex / Cursor — those clients do not
-    # follow ``@`` imports and the SSOT docs are reference material, not
-    # adapter content, so we do not inline them either. Drift on these
-    # docs is hash-detected on the Claude row via
-    # :func:`_check_ssot_status` (mirrors the bootstrap.md check).
+    # Populated on Claude in every code path: real installs report the
+    # per-slug materialisation mode, and the dry-run path mirrors what
+    # would be written (one entry per slug at the implied mode).
+    # ``None`` on Codex / Cursor: those clients do not follow ``@``
+    # imports and the SSOT docs are reference material, not adapter
+    # content, so we do not inline them either. Drift on these docs is
+    # hash-detected on the Claude row via
+    # :func:`_check_ssot_statuses` (mirrors the bootstrap.md check).
     ssot_link_modes: dict[str, str] | None = None
     note: str = ""
 
