@@ -105,13 +105,36 @@ const PROBE_VARIANT: Record<ProbeStatus, PillVariant> = {
   degraded: 'danger',
 };
 
-/** Render an absolute path relative to ``$HOME`` when possible. */
+/**
+ * Render an absolute project path in a portable form for the topbar.
+ *
+ * The browser has no native ``$HOME`` introspection, but a screenshot
+ * of an absolute ``/Users/alice/...`` path leaks the operator's
+ * username + filesystem layout. We work around the missing primitive
+ * with a heuristic that recognises the macOS / Linux home prefixes
+ * and replaces the leading ``/Users/<name>`` (or ``/home/<name>``)
+ * with ``~``. An optional ``window.__FSM_HOME__`` override is honoured
+ * first for installs that set it explicitly (e.g. a future Electron
+ * shell). The pre-fix draft relied ONLY on ``__FSM_HOME__`` which
+ * nothing in the repo populated, so paths were never condensed —
+ * contradicting the screenshot-portability promise.
+ */
 function condenseHome(path: string | null | undefined): string {
   if (!path) return '';
   const home =
     typeof window !== 'undefined' &&
     (window as Window & { __FSM_HOME__?: string }).__FSM_HOME__;
   if (home && path.startsWith(home)) return `~${path.slice(home.length)}`;
+  // Heuristic fallback: ``/Users/<name>/...`` (macOS) or
+  // ``/home/<name>/...`` (most Linux distros). Both are
+  // username-prefixed so redacting to ``~/...`` removes the
+  // personally-identifying segment without losing the rest of the
+  // path. Match is anchored to the start so a project literally
+  // named ``Users/foo`` deeper in the tree isn't mangled.
+  const macMatch = /^\/Users\/[^/]+(\/.*)?$/.exec(path);
+  if (macMatch) return `~${macMatch[1] ?? ''}`;
+  const linuxMatch = /^\/home\/[^/]+(\/.*)?$/.exec(path);
+  if (linuxMatch) return `~${linuxMatch[1] ?? ''}`;
   return path;
 }
 
@@ -226,9 +249,24 @@ export function InfoTopBar(): JSX.Element {
   // is the spot to bolt on the ``mapLimited`` pattern from
   // routes/drift.tsx (the same fan-out cap). Today the simpler shape
   // is easier to read.
+  //
+  // Stale-state contract: every metadata refresh starts by REPLACING
+  // (not merging into) the probe map. Without this reset, a previous
+  // metadata that reported ``mcp``/``api``/``ui`` but a fresh one
+  // that omits ``api`` would leave the swagger/api probes "healthy"
+  // from the previous round even though the subsystems no longer
+  // exist. Same hazard when switching projects: subsystems lingering
+  // from project A would render alongside project B's set.
   useEffect(() => {
     if (!metadata) return;
     let cancelled = false;
+    // Reset to the per-subsystem ``unknown`` baseline before re-probing
+    // so any subsystem that vanished from the new metadata loses its
+    // stale healthy/degraded indicator.
+    const initial: Record<string, ProbeStatus> = {};
+    for (const name of Object.keys(metadata.subsystems)) initial[name] = 'unknown';
+    initial.swagger = 'unknown';
+    setProbes(initial);
     (async () => {
       const next: Record<string, ProbeStatus> = {};
       const subs = Object.entries(metadata.subsystems);
@@ -242,8 +280,11 @@ export function InfoTopBar(): JSX.Element {
         setProbes((prev) => ({ ...prev, [name]: next[name] }));
       }
       // Swagger inherits the API process's outcome — same Python
-      // server, same uvicorn worker.
-      if ('api' in next) {
+      // server, same uvicorn worker. Guarded by the same ``cancelled``
+      // check the inner loop uses so a fast-unmount (operator
+      // navigates away mid-probe) doesn't schedule a state update on
+      // a torn-down component.
+      if (!cancelled && 'api' in next) {
         setProbes((prev) => ({ ...prev, swagger: next.api }));
       }
     })();
@@ -308,7 +349,13 @@ export function InfoTopBar(): JSX.Element {
           Colour reflects the health probe outcome:
           neutral=probing, success=healthy, danger=degraded. */}
       <nav aria-label="Subsystem availability" class="flex flex-wrap items-center gap-1.5">
-        {views.length === 0 && metadata !== null ? (
+        {/* The empty-state branch keys off the SOURCE map size
+            (metadata.subsystems), not the synthesised views array,
+            because buildViews always appends a synthetic Swagger row.
+            Pre-fix this branch was unreachable: even with a totally
+            empty discovery doc, views.length stayed at 1 (Swagger)
+            and the "supervisor not running" hint never surfaced. */}
+        {metadata !== null && Object.keys(metadata.subsystems).length === 0 ? (
           <span class="text-[10px] text-slate-500 dark:text-slate-400 italic">
             no subsystems reported (supervisor not running)
           </span>
