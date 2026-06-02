@@ -53,8 +53,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 
 from ctxr.fsm.cli.lifecycle.primitives import write_active_run_marker
+from ctxr.fsm.core.engine import (
+    GateResolution,
+    GateResolutionError,
+    build_brief,
+    execute_inline,
+)
 from ctxr.fsm.core.engine import advance as engine_advance
-from ctxr.fsm.core.engine import build_brief, execute_inline
+from ctxr.fsm.core.engine import resolve_gate as engine_resolve_gate
 from ctxr.fsm.core.inline_registry import lookup_with_discovery
 from ctxr.fsm.core.models import (
     Brief,
@@ -62,6 +68,8 @@ from ctxr.fsm.core.models import (
     EngineAdvanceKind,
     EventKind,
     FsmSpec,
+    GateBinding,
+    GateSourceKind,
     InlineFaultReason,
     PostValidationResultEntry,
     RunCtx,
@@ -93,6 +101,8 @@ __all__ = [
     "GetRunInput",
     "JournalAction",
     "ListRunsInput",
+    "ResolveGateInput",
+    "ResolveGateResult",
     "ResumeResult",
     "ResumeRunInput",
     "RunDetail",
@@ -2744,6 +2754,485 @@ def fsm_get_run(input: GetRunInput) -> RunDetail | McpToolError:
         raise
     except Exception as exc:
         _LOG.exception("fsm.get_run failed")
+        return as_error("internal_error", detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# W23g: fsm.resolve_gate — cross-FSM gate resolution
+# ---------------------------------------------------------------------------
+
+
+def _read_run_output_value(
+    project: Project,
+    *,
+    source_run_id: str,
+    source_state_id: str,
+    source_field: str,
+) -> tuple[Any, McpToolError | None]:
+    """Read ``source_field`` from ``source_state_id``'s outputs on ``source_run_id``.
+
+    Returns ``(value, None)`` on success or ``(None, error_envelope)``
+    on every failure documented in GATE_CONTRACT.md
+    (``gate_source_run_not_found``, ``gate_source_state_not_completed``).
+    Picks the most-recent matching state entry (latest ``entry_seq``)
+    so a re-entered state's prior visit doesn't silently win.
+    """
+    source_run = project.get_run(source_run_id)
+    if source_run is None:
+        return None, as_error(
+            "gate_source_run_not_found",
+            detail=f"no run with id {source_run_id!r}",
+            run_id=source_run_id,
+        )
+
+    with project.session_factory() as session:
+        entries = project.states.list_by_run(session, source_run_id)
+    matching = [
+        e for e in entries
+        if e.state_id == source_state_id and e.status == "exited"
+    ]
+    if not matching:
+        return None, as_error(
+            "gate_source_state_not_completed",
+            detail=(
+                f"source state {source_state_id!r} on run {source_run_id!r} "
+                "has not exited with outputs yet"
+            ),
+            run_id=source_run_id,
+            state_id=source_state_id,
+        )
+    # Pick the most-recent (highest entry_seq) exit so a re-entered
+    # state's earlier visit cannot shadow the latest committed value.
+    latest = max(matching, key=lambda e: e.entry_seq)
+    outputs = dict(latest.outputs or {})
+    return outputs.get(source_field), None
+
+
+class ResolveGateInput(BaseModel):
+    """Arguments for :func:`fsm_resolve_gate`.
+
+    Either ``value`` (the LLM-supplied literal) or ``binding`` (a
+    cross-run output reference) is required; supplying both is rejected
+    with ``gate_value_and_binding_conflict``, supplying neither with
+    ``gate_value_or_binding_required``.
+    """
+
+    model_config = _IN_CFG
+
+    run_id: str
+    state_entry_seq: int
+    value: dict[str, Any] | None = None
+    binding: dict[str, Any] | None = None
+
+
+class ResolveGateResult(BaseModel):
+    """Return value of :func:`fsm_resolve_gate`.
+
+    ``resolved`` is always ``True`` on success (any failure surfaces as
+    an :class:`McpToolError` envelope instead). ``next_brief`` carries
+    the brief for the state the run transitioned to after the gate
+    resolved. ``env_update`` echoes back the dict of fields landed in
+    the run env so the caller can introspect what was persisted.
+    """
+
+    model_config = _OUT_CFG
+
+    resolved: bool = True
+    env_update: dict[str, Any] = Field(default_factory=dict)
+    next_brief: Brief | None = None
+    next_state: str | None = None
+    result_kind: str = EngineAdvanceKind.advance.value
+
+
+@mcp.tool(
+    name="fsm.resolve_gate",
+    description=(
+        "Resolve a pending gate state: validate the supplied value (or "
+        "fetch it via a GateBinding) against the gate's response_schema, "
+        "land it in the run env, persist the binding, emit gate_resolved "
+        "(+ gate_binding_recorded for run_output sources), and advance "
+        "the run to the next state. Exactly one of `value` / `binding` "
+        "is required."
+    ),
+)
+@drain_aware
+def fsm_resolve_gate(input: ResolveGateInput) -> ResolveGateResult | McpToolError:
+    """Implement ``fsm.resolve_gate`` — the W23g cross-FSM gate resolver.
+
+    Flow:
+
+    1. Look up the run + spec; reject if either is missing.
+    2. Resolve the current state and confirm it is a gate.
+    3. For the ``run_output`` path, read the source value from the
+       source run's matching state outputs.
+    4. Delegate to :func:`ctxr.fsm.core.engine.resolve_gate` for
+       validation + env-update derivation. Typed errors
+       (``gate_schema_mismatch`` / ``gate_value_or_binding_required`` /
+       ``gate_value_and_binding_conflict``) are caught and mapped onto
+       the wire envelope verbatim.
+    5. Mark the gate state exited (its outputs are the env_update),
+       emit ``gate_resolved`` (+ ``gate_binding_recorded`` for the
+       ``run_output`` path), and persist the binding row via
+       :meth:`GatesRepo.record`.
+    6. Drive the engine forward by treating the gate's env_update as
+       the worker's committed outputs; record the outgoing transition,
+       persist the next state's entry row, walk any inline chain, and
+       return the next brief.
+    """
+    try:
+        project = get_project()
+        run_id_str = input.run_id
+
+        run = project.get_run(run_id_str)
+        if run is None:
+            return as_error(
+                "run_not_found",
+                detail=f"no run with id {run_id_str!r}",
+                run_id=run_id_str,
+            )
+
+        with project.session_factory() as session:
+            registered = project.specs.get(session, run.fsm_spec_id)
+        if registered is None:
+            return as_error(
+                "spec_not_found",
+                detail=f"run references missing spec {run.fsm_spec_id!r}",
+                spec_id=run.fsm_spec_id,
+            )
+        # Side-effect import binds FsmSpec.hash / validate.
+        from ctxr.fsm.core import spec as _spec_module  # noqa: F401
+        spec = FsmSpec.model_validate(registered.definition)
+
+        current_state_id = _current_state_id(run, spec)
+        try:
+            state = spec.get_state(current_state_id)
+        except KeyError:
+            return as_error(
+                "invalid_state",
+                detail=(
+                    f"run.current_state {current_state_id!r} is not present "
+                    "in spec.states"
+                ),
+                state=current_state_id,
+            )
+
+        if state.gate is None or state.kind is not StateKind.gate:
+            return as_error(
+                "invalid_state",
+                detail=(
+                    f"state {current_state_id!r} is not a gate; "
+                    "use fsm.commit_outputs instead"
+                ),
+                state=current_state_id,
+            )
+
+        producer_id = _ensure_engine_producer(project)
+
+        # Build the typed GateBinding (when supplied). The pydantic
+        # validator rejects malformed bindings up front with a clean
+        # error message we surface as the envelope detail.
+        binding_obj: GateBinding | None = None
+        binding_value: Any = None
+        if input.binding is not None:
+            try:
+                binding_obj = GateBinding.model_validate(input.binding)
+            except Exception as exc:
+                return as_error(
+                    "gate_value_or_binding_required",
+                    detail=f"malformed binding payload: {exc}",
+                )
+            # run_output source: spec must agree; fetch the value.
+            if state.gate.source_kind is GateSourceKind.run_output:
+                if not binding_obj.source_run_id:
+                    return as_error(
+                        "gate_source_run_not_found",
+                        detail="binding.source_run_id is required for run_output gates",
+                    )
+                # Optional spec slug guard.
+                if binding_obj.source_spec_slug is not None:
+                    source_run = project.get_run(binding_obj.source_run_id)
+                    if source_run is None:
+                        return as_error(
+                            "gate_source_run_not_found",
+                            detail=f"no run with id {binding_obj.source_run_id!r}",
+                            run_id=binding_obj.source_run_id,
+                        )
+                    with project.session_factory() as session:
+                        source_spec = project.specs.get(
+                            session, source_run.fsm_spec_id
+                        )
+                    if (
+                        source_spec is None
+                        or source_spec.slug != binding_obj.source_spec_slug
+                    ):
+                        return as_error(
+                            "gate_spec_slug_mismatch",
+                            detail=(
+                                f"binding.source_spec_slug "
+                                f"{binding_obj.source_spec_slug!r} does not match "
+                                f"the source run's spec slug"
+                            ),
+                        )
+                value_or_err = _read_run_output_value(
+                    project,
+                    source_run_id=binding_obj.source_run_id,
+                    source_state_id=binding_obj.source_state_id,
+                    source_field=binding_obj.source_field,
+                )
+                binding_value, err = value_or_err
+                if err is not None:
+                    return err
+
+        # Delegate to the pure engine resolver for validation + env
+        # derivation. Maps the typed GateResolutionError codes onto the
+        # GATE_CONTRACT-vocabulary envelopes verbatim.
+        try:
+            resolution: GateResolution = engine_resolve_gate(
+                spec,
+                state,
+                _materialise_env(project, run),
+                run_id=uuid.UUID(run.id),
+                value=input.value,
+                binding=binding_obj,
+                binding_value=binding_value,
+            )
+        except GateResolutionError as exc:
+            payload: dict[str, Any] = {}
+            if exc.errors:
+                payload["errors"] = exc.errors
+            return as_error(exc.code, detail=exc.detail, **payload)
+
+        env_update = dict(resolution.env_update)
+
+        # Locate the open state-entry PK for this gate so we can mark
+        # it exited (the gate's "outputs" are the env_update) and use
+        # its PK as the transition's from_state_pk.
+        from_pk = _current_state_pk(project, run.id, current_state_id)
+        # Resolve the target state-entry seq for the binding row.
+        # ``state_entry_seq`` from the caller is the contract surface;
+        # fall back to the matching open entry's seq when the caller
+        # omits / under-specifies it.
+        with project.session_factory() as session:
+            entries = project.states.list_by_run(session, run.id)
+        gate_entry_seq = input.state_entry_seq
+        if gate_entry_seq <= 0:
+            for entry in reversed(entries):
+                if (
+                    entry.state_id == current_state_id
+                    and entry.status == "entered"
+                ):
+                    gate_entry_seq = entry.entry_seq
+                    break
+
+        # Persist the gate exit + emit gate_resolved (+
+        # gate_binding_recorded for the run_output path) + write the
+        # gate_bindings row. All in one atomic block so subscribers see
+        # them together.
+        target_field_for_event = next(iter(env_update.keys()), None)
+        with project.session_factory() as session, session.begin():
+            if from_pk is not None:
+                project.states.mark_exited(session, from_pk, env_update)
+                project.events.emit(
+                    session,
+                    producer_id=producer_id,
+                    kind=EventKind.state_exited.value,
+                    payload={"run_id": run.id, "state_pk": from_pk},
+                    run_id=run.id,
+                )
+            project.events.emit(
+                session,
+                producer_id=producer_id,
+                kind=EventKind.gate_resolved.value,
+                payload={
+                    "run_id": run.id,
+                    "state_entry_seq": gate_entry_seq,
+                    "source_kind": state.gate.source_kind.value,
+                    "target_field": target_field_for_event,
+                },
+                run_id=run.id,
+            )
+            # Persist the binding row regardless of source_kind so the
+            # dashboard's bindings panels see every resolution; the
+            # gate_binding_recorded event is only emitted for the
+            # run_output path per GATE_CONTRACT.md.
+            project.gates.record(
+                session,
+                target_run_id=run.id,
+                target_state_entry_seq=gate_entry_seq,
+                target_field=(
+                    binding_obj.target_field
+                    if binding_obj is not None
+                    else (target_field_for_event or "")
+                ),
+                source_state_id=(
+                    binding_obj.source_state_id
+                    if binding_obj is not None
+                    else state.id
+                ),
+                source_field=(
+                    binding_obj.source_field
+                    if binding_obj is not None
+                    else (target_field_for_event or "")
+                ),
+                source_kind=state.gate.source_kind.value,
+                source_run_id=(
+                    binding_obj.source_run_id
+                    if binding_obj is not None
+                    else None
+                ),
+                source_spec_slug=(
+                    binding_obj.source_spec_slug
+                    if binding_obj is not None
+                    else None
+                ),
+                resolved_value=(
+                    env_update.get(target_field_for_event)
+                    if target_field_for_event
+                    else None
+                ),
+            )
+            if binding_obj is not None:
+                project.events.emit(
+                    session,
+                    producer_id=producer_id,
+                    kind=EventKind.gate_binding_recorded.value,
+                    payload={
+                        "run_id": run.id,
+                        "state_entry_seq": gate_entry_seq,
+                        "source_run_id": binding_obj.source_run_id,
+                        "source_state_id": binding_obj.source_state_id,
+                        "source_field": binding_obj.source_field,
+                        "target_field": binding_obj.target_field,
+                    },
+                    run_id=run.id,
+                )
+
+        # Drive the engine through the gate's outgoing transitions
+        # using the env_update as the "outputs". This walks the same
+        # transition resolution + post-validation pipeline a worker
+        # commit would, so the gate's downstream transitions behave
+        # identically to a worker state's transitions.
+        env_before = _materialise_env(project, run)
+        ctx = RunCtx(
+            run_id=uuid.UUID(run.id),
+            fsm_id=spec.id,
+            current_state=current_state_id,
+            env=env_before,
+        )
+        advance_result = engine_advance(spec, ctx, dict(env_update))
+
+        if advance_result.kind is EngineAdvanceKind.fault:
+            return as_error(
+                "no_transition_matched",
+                detail=(
+                    f"gate {current_state_id!r} resolved but no outgoing "
+                    f"transition matched: {advance_result.reason}"
+                ),
+                state=current_state_id,
+            )
+
+        if advance_result.kind is EngineAdvanceKind.terminal:
+            with project.session_factory() as session, session.begin():
+                run_row = session.get(RunTable, run.id)
+                if run_row is not None:
+                    run_row.status = "completed"
+                    run_row.ended_at = _iso_now_ms()
+                    run_row.last_update_at = run_row.ended_at
+                    session.add(run_row)
+                project.events.emit(
+                    session,
+                    producer_id=producer_id,
+                    kind=EventKind.run_completed.value,
+                    payload={
+                        "run_id": run.id,
+                        "verdict": advance_result.verdict,
+                    },
+                    run_id=run.id,
+                )
+            return ResolveGateResult(
+                resolved=True,
+                env_update=env_update,
+                next_brief=None,
+                next_state=None,
+                result_kind=EngineAdvanceKind.terminal.value,
+            )
+
+        # advance or gate_pending: record the transition row + persist
+        # the next state's entry so the brief is materialised against a
+        # real DB row.
+        next_state_id = advance_result.next_state
+        assert next_state_id is not None
+        next_state = spec.get_state(next_state_id)
+        next_worker = next_state.worker or (
+            next_state.loop.worker if next_state.loop is not None else None
+        )
+        merged_env = {**env_before, **env_update}
+        next_inputs: dict[str, Any] = {}
+        if next_worker is not None:
+            next_inputs = {
+                name: merged_env.get(name) for name in next_worker.inputs
+            }
+
+        if from_pk is not None:
+            transition_eval = next(
+                iter(advance_result.evaluations or []), None
+            )
+            tkind = (
+                transition_eval.kind
+                if transition_eval is not None
+                and transition_eval.kind is not None
+                else TransitionKind.always.value
+            )
+            with project.session_factory() as session, session.begin():
+                project.transitions.create(
+                    session,
+                    run_id=run.id,
+                    from_state_pk=from_pk,
+                    to_state_id=next_state_id,
+                    kind=tkind,
+                    predicate=(
+                        transition_eval.expression
+                        if transition_eval is not None
+                        else None
+                    ),
+                    predicate_result=(
+                        transition_eval.result
+                        if transition_eval is not None
+                        else None
+                    ),
+                )
+                project.events.emit(
+                    session,
+                    producer_id=producer_id,
+                    kind=EventKind.transition_taken.value,
+                    payload={
+                        "run_id": run.id,
+                        "from_state_pk": from_pk,
+                        "to_state_id": next_state_id,
+                        "kind": tkind,
+                    },
+                    run_id=run.id,
+                )
+
+        _persist_state_entry(
+            project,
+            run_id=run.id,
+            state_id=next_state_id,
+            inputs=next_inputs,
+            producer_id=producer_id,
+        )
+
+        return ResolveGateResult(
+            resolved=True,
+            env_update=env_update,
+            next_brief=advance_result.brief,
+            next_state=next_state_id,
+            result_kind=advance_result.kind.value,
+        )
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        _LOG.exception("fsm.resolve_gate failed")
         return as_error("internal_error", detail=str(exc))
 
 

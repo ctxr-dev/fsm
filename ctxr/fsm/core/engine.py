@@ -47,6 +47,8 @@ from ctxr.fsm.core.models import (
     Brief,
     EngineAdvanceKind,
     FsmSpec,
+    Gate,
+    GateBinding,
     InlineExecutionResult,
     InlineFaultReason,
     Loop,
@@ -57,6 +59,7 @@ from ctxr.fsm.core.models import (
     ResponseSchema,
     RunCtx,
     State,
+    StateKind,
     Transition,
     TransitionEvaluation,
     TransitionKind,
@@ -78,9 +81,12 @@ from ctxr.fsm.core.prompts import (
 
 __all__ = [
     "EngineAdvanceResult",
+    "GateResolution",
+    "GateResolutionError",
     "advance",
     "build_brief",
     "execute_inline",
+    "resolve_gate",
     "resolve_transition",
     "run_post_validations",
     "validate_output",
@@ -769,6 +775,22 @@ def advance(
         env_with_outputs,
         run_id=run_ctx.run_id,
     )
+
+    # W23g: the incoming state is a gate. The engine MUST NOT invoke a
+    # worker on a gate state; the brief carries the Gate body so the
+    # orchestrator surface can recognise the gate and route the next
+    # call to fsm.resolve_gate (LLM-supplied value or run_output
+    # binding) instead of fsm.commit_outputs. The brief is still
+    # populated so the caller has the gate's response_schema +
+    # source_kind + bindings in hand without a second round-trip.
+    if next_state.kind is StateKind.gate:
+        return EngineAdvanceResult(
+            kind=EngineAdvanceKind.gate_pending,
+            next_state=next_state.id,
+            brief=next_brief,
+            evaluations=evaluations,
+        )
+
     return EngineAdvanceResult(
         kind=EngineAdvanceKind.advance,
         next_state=next_state.id,
@@ -994,4 +1016,209 @@ def execute_inline(
         post_validations=post_result,
         fault_reason=None,
         fault_detail=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# resolve_gate — W23g cross-FSM gate resolution
+# ---------------------------------------------------------------------------
+
+
+class GateResolutionError(ValueError):
+    """Typed error raised by :func:`resolve_gate` for the GATE_CONTRACT envelopes.
+
+    The ``code`` attribute is one of the snake_case envelope vocabulary
+    keys documented in ``ctxr/fsm/memory/GATE_CONTRACT.md``:
+
+    * ``gate_schema_mismatch`` — the resolved value did not validate
+      against ``Gate.response_schema``.
+    * ``gate_value_or_binding_required`` — neither ``value`` nor a
+      binding was supplied.
+    * ``gate_value_and_binding_conflict`` — both were supplied; the
+      contract requires exactly one.
+
+    The MCP tool layer (:func:`ctxr.fsm.mcp.tools_runs.fsm_resolve_gate`)
+    catches this and maps the ``code`` straight onto the wire envelope
+    so clients can branch on the same vocabulary they read in
+    GATE_CONTRACT.md.
+    """
+
+    def __init__(self, code: str, detail: str, *, errors: list[str] | None = None):
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+        self.errors: list[str] = list(errors or [])
+
+
+class GateResolution(BaseModel):
+    """The outcome of :func:`resolve_gate`.
+
+    * :attr:`env_update` — the dict of ``{target_field: resolved_value}``
+      entries the caller should merge into the run's env. For
+      ``llm_supplied`` gates this is a single entry keyed off the gate
+      state's first declared output; for ``run_output`` gates it is one
+      entry per supplied binding (each carrying its own
+      ``target_field``).
+    * :attr:`transitions` — the list of :class:`Transition` declared on
+      the gate state, surfaced for the caller so the persistence layer
+      can drive the outgoing transition without re-walking the spec.
+
+    The MCP tool body merges ``env_update`` into the run env, records
+    a ``gate_resolved`` event, persists the binding row, then advances
+    the engine through the gate's outgoing transitions.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    env_update: dict[str, Any] = Field(default_factory=dict)
+    transitions: list[Transition] = Field(default_factory=list)
+
+
+def _validate_against_gate_schema(
+    gate: Gate,
+    payload: dict[str, Any],
+) -> None:
+    """Validate ``payload`` against the gate's ``response_schema``.
+
+    Raises :class:`GateResolutionError` with ``code='gate_schema_mismatch'``
+    when validation fails. Uses the same
+    :meth:`ResponseSchema.model_validate_json_payload` helper the
+    worker-output path uses so the error vocabulary stays uniform across
+    the engine.
+    """
+    valid, errors = gate.response_schema.model_validate_json_payload(payload)
+    if not valid:
+        raise GateResolutionError(
+            "gate_schema_mismatch",
+            "resolved gate value did not match Gate.response_schema",
+            errors=errors,
+        )
+
+
+def resolve_gate(
+    spec: FsmSpec,
+    state: State,
+    env: dict[str, Any],
+    run_id: uuid.UUID,
+    *,
+    value: dict[str, Any] | None = None,
+    binding: GateBinding | None = None,
+    binding_value: Any = None,
+) -> GateResolution:
+    """Resolve a gate state's pending value and return the env delta + transitions.
+
+    Parameters
+    ----------
+    spec, state:
+        The owning :class:`FsmSpec` and the gate :class:`State`. ``state``
+        MUST have ``state.gate`` non-None — otherwise a ``TypeError``
+        surfaces immediately because the caller is feeding a non-gate
+        state into the resolver.
+    env:
+        The run env at gate-entry time. Reserved for future use (a
+        gate's ``response_schema`` could in principle reference
+        ``env``-shaped properties); currently the env is read-only.
+    run_id:
+        The run id this resolution belongs to. Currently unused in the
+        pure-engine resolver but threaded through so future telemetry
+        hooks (the event-bus payloads minted by the MCP layer) carry
+        consistent identifiers.
+    value:
+        LLM-supplied literal. Required when ``gate.source_kind`` is
+        ``llm_supplied``; validated against the gate's
+        ``response_schema`` and landed under the gate state's first
+        declared :attr:`State.outputs` entry.
+    binding:
+        :class:`GateBinding` describing where the resolved value came
+        from. Required when ``gate.source_kind`` is ``run_output``;
+        ``binding.target_field`` names the env key the resolved value
+        lands under.
+    binding_value:
+        The actual value pulled from the source run's state output
+        (only used when ``binding`` is supplied). The MCP layer reads
+        the source via :meth:`Project.runs` (or equivalent) and threads
+        the looked-up value here; the pure engine resolver itself has
+        no I/O so it cannot perform the lookup.
+
+    Returns
+    -------
+    GateResolution
+        A typed envelope carrying:
+
+        * ``env_update`` — the dict of resolved fields to merge into
+          the run env.
+        * ``transitions`` — the gate state's outgoing transitions,
+          ready for the persistence layer to walk and drive the next
+          state entry.
+
+    Raises
+    ------
+    GateResolutionError
+        On any of the GATE_CONTRACT-vocabulary envelope codes:
+
+        * ``gate_value_or_binding_required`` — neither ``value`` nor
+          ``binding`` was supplied.
+        * ``gate_value_and_binding_conflict`` — both ``value`` and
+          ``binding`` were supplied; the contract requires exactly
+          one.
+        * ``gate_schema_mismatch`` — the resolved value did not pass
+          the gate's response schema.
+    """
+    if state.gate is None:
+        raise TypeError(
+            f"resolve_gate called on state {state.id!r} which is not a gate state"
+        )
+
+    gate: Gate = state.gate
+
+    if value is None and binding is None:
+        raise GateResolutionError(
+            "gate_value_or_binding_required",
+            "fsm.resolve_gate requires exactly one of `value` or `binding`",
+        )
+    if value is not None and binding is not None:
+        raise GateResolutionError(
+            "gate_value_and_binding_conflict",
+            "fsm.resolve_gate requires exactly one of `value` or `binding`, not both",
+        )
+
+    env_update: dict[str, Any] = {}
+
+    if binding is not None:
+        # run_output path. The binding's target_field names the env
+        # key the resolved value lands under. We validate the supplied
+        # binding_value against the gate's response_schema so a
+        # spec-evolved schema cannot silently land an out-of-shape
+        # value in the downstream run's env.
+        payload = {binding.target_field: binding_value}
+        _validate_against_gate_schema(gate, payload)
+        env_update[binding.target_field] = binding_value
+    else:
+        # llm_supplied path. The LLM passes a dict that must validate
+        # against the gate's response_schema. The resolved fields land
+        # under the gate state's first declared output (GATE_CONTRACT
+        # rule: "lands in the run's environment under the gate's
+        # `target_field` (defaults to the gate state's first declared
+        # output)"). We use the whole validated value under that key,
+        # which matches what a worker's outputs would look like.
+        assert value is not None  # narrow for the type checker
+        _validate_against_gate_schema(gate, value)
+        if not state.outputs:
+            raise GateResolutionError(
+                "gate_schema_mismatch",
+                f"gate state {state.id!r} has no declared outputs to land the value under",
+            )
+        target_field = state.outputs[0]
+        if target_field in value:
+            # Common case: the gate's response_schema is shaped as
+            # {target_field: <typed value>}; we lift the inner value
+            # so downstream env reads see the same shape they would
+            # see for a worker that returned {target_field: ...}.
+            env_update[target_field] = value[target_field]
+        else:
+            env_update[target_field] = value
+
+    return GateResolution(
+        env_update=env_update,
+        transitions=list(state.transitions),
     )

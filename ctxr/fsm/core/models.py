@@ -242,6 +242,11 @@ class EngineAdvanceKind(StrEnum):
     loop_continue = "loop_continue"
     terminal = "terminal"
     fault = "fault"
+    # W23g: the current state is a gate. The engine does not invoke a
+    # worker; it returns the gate-state Brief so the orchestrator
+    # (fsm.resolve_gate) can resolve the gate via an LLM-supplied
+    # value or a run_output binding. See ctxr/fsm/memory/GATE_CONTRACT.md.
+    gate_pending = "gate_pending"
 
 
 class JournalStatus(StrEnum):
@@ -615,6 +620,29 @@ class Gate(BaseModel):
     def _max_age_positive(cls, value: int | None) -> int | None:
         if value is not None and value <= 0:
             raise ValueError("Gate.max_age_ms must be a positive integer")
+        return value
+
+    @field_validator("source_kind", mode="before")
+    @classmethod
+    def _coerce_source_kind(cls, value: Any) -> Any:
+        """Accept the JSON-wire string form alongside the enum member.
+
+        ``_DOMAIN_CFG`` uses ``strict=True``, which by default refuses
+        to coerce a plain ``str`` into a :class:`GateSourceKind` member
+        even though ``StrEnum`` makes them ``str``-compatible. Specs
+        round-trip through canonical JSON via ``register_spec`` (and the
+        MCP layer's ``FsmSpec.model_validate(registered.definition)``
+        reload), so the wire form lands here as a bare string; the
+        validator coerces it back to the enum so strict mode is
+        happy. Unknown strings fall through to the strict validator's
+        default rejection.
+        """
+
+        if isinstance(value, str) and not isinstance(value, GateSourceKind):
+            try:
+                return GateSourceKind(value)
+            except ValueError:
+                return value
         return value
 
     @model_validator(mode="after")

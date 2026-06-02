@@ -92,6 +92,7 @@ from ctxr.fsm.sqlite.repos_events import (
     EventsRepo,
     ProducersRepo,
 )
+from ctxr.fsm.sqlite.repos_gates import GatesRepo
 from ctxr.fsm.sqlite.repos_locks_journal import JournalRepo, LocksRepo
 from ctxr.fsm.sqlite.repos_states import (
     AggregatesRepo,
@@ -279,6 +280,14 @@ class Project:
         self.consumers = ConsumersRepo()
         self.events = EventsRepo()
         self.event_deliveries = EventDeliveriesRepo()
+
+        # ── W23g cross-FSM gates ──────────────────────────────────────
+        # Persistence half of the cross-FSM gate substrate. Records one
+        # row per resolved gate (`run_output` source kind populates
+        # source_run_id; `llm_supplied` leaves it NULL). See
+        # ``ctxr/fsm/memory/GATE_CONTRACT.md`` for the protocol; the
+        # repo itself is stateless and reused across requests.
+        self.gates = GatesRepo()
 
         # Cache the engine producer's id lazily — many openings of a
         # Project will never emit events at all (e.g. read-only tools),
