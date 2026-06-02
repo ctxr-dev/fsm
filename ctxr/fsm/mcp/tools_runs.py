@@ -2911,7 +2911,8 @@ def fsm_resolve_gate(input: ResolveGateInput) -> ResolveGateResult | McpToolErro
     4. Delegate to :func:`ctxr.fsm.core.engine.resolve_gate` for
        validation + env-update derivation. Typed errors
        (``gate_schema_mismatch`` / ``gate_value_or_binding_required`` /
-       ``gate_value_and_binding_conflict``) are caught and mapped onto
+       ``gate_value_and_binding_conflict`` /
+       ``gate_source_kind_mismatch``) are caught and mapped onto
        the wire envelope verbatim.
     5. Mark the gate state exited (its outputs are the env_update),
        emit ``gate_resolved`` (+ ``gate_binding_recorded`` for the

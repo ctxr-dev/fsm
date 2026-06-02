@@ -124,6 +124,7 @@ The two indexes power the dashboard's Bindings panels:
 | `gate_value_required` | Brief is a gate; you called `commit_outputs`. | Call `fsm.resolve_gate` instead. |
 | `gate_value_or_binding_required` | Neither `value` nor `binding` supplied. | Provide exactly one. |
 | `gate_value_and_binding_conflict` | Both supplied. | Provide exactly one. |
+| `gate_source_kind_mismatch` | Resolution shape disagrees with `Gate.source_kind` (a `binding` was passed for an `llm_supplied` gate, or a literal `value` was passed for a `run_output` gate). | Use the shape matching the gate's declared `source_kind`. |
 | `gate_schema_mismatch` | Resolved value fails `Gate.response_schema`. | Fix shape. |
 | `gate_source_run_not_found` | `binding.source_run_id` does not exist. | Verify run id. |
 | `gate_source_state_not_completed` | Source state has not produced outputs yet. | Wait, or pick a different source. |

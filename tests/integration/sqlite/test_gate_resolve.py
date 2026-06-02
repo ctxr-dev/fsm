@@ -432,6 +432,70 @@ def test_value_or_binding_required_rejects(project: Project) -> None:
     assert bad.error == "gate_value_or_binding_required"
 
 
+def test_binding_on_llm_supplied_gate_rejects_with_source_kind_mismatch(
+    project: Project,
+) -> None:
+    """A `binding` on an ``llm_supplied`` gate rejects with the typed code.
+
+    Without source_kind enforcement, this path would persist an
+    unintended cross-run dependency in the ``gate_bindings`` topology
+    index.
+    """
+
+    spec = _llm_supplied_spec()
+    registered = project.register_spec(spec)
+    started = fsm_start_run(StartRunInput(spec_id=registered.spec.id, args={}))
+    run_id = str(started.run_id)
+    _advance_entry_to_gate(project, run_id)
+
+    binding = GateBinding(
+        source_run_id=str(uuid.uuid4()),
+        source_state_id="qa",
+        source_field="review_verdict",
+        target_field="review_verdict",
+    )
+    bad = fsm_resolve_gate(
+        ResolveGateInput(
+            run_id=run_id,
+            state_entry_seq=0,
+            binding=binding.model_dump(),
+        )
+    )
+    assert hasattr(bad, "error"), f"expected error envelope, got: {bad!r}"
+    assert bad.error == "gate_source_kind_mismatch"
+
+    # The rejected resolution must not leak a binding row.
+    with project.session_factory() as session:
+        records = project.gates.by_target_run(session, run_id)
+    assert records == []
+
+
+def test_value_on_run_output_gate_rejects_with_source_kind_mismatch(
+    project: Project,
+) -> None:
+    """A literal `value` on a ``run_output`` gate rejects with the typed code.
+
+    Without source_kind enforcement, this path would bypass the
+    binding-lookup + ``max_age_ms`` staleness semantics.
+    """
+
+    spec = _run_output_spec()
+    registered = project.register_spec(spec)
+    started = fsm_start_run(StartRunInput(spec_id=registered.spec.id, args={}))
+    run_id = str(started.run_id)
+    _advance_entry_to_gate(project, run_id)
+
+    bad = fsm_resolve_gate(
+        ResolveGateInput(
+            run_id=run_id,
+            state_entry_seq=0,
+            value={"review_verdict": "GO"},
+        )
+    )
+    assert hasattr(bad, "error"), f"expected error envelope, got: {bad!r}"
+    assert bad.error == "gate_source_kind_mismatch"
+
+
 # ---------------------------------------------------------------------------
 # state_entry_seq contract
 # ---------------------------------------------------------------------------
