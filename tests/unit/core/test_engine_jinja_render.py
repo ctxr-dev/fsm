@@ -343,7 +343,11 @@ def test_unknown_jinja_variable_raises_prompt_render_error() -> None:
 
 
 def test_same_state_re_entered_with_different_env_reflects_new_env() -> None:
-    template = "args.user={{ args.user }} iter={{ iteration_n }}"
+    # Use args.get('user') rather than args.user so the template would
+    # also pass register-time smoke validation (PromptContext.args
+    # defaults to {}, and under StrictUndefined args.user would fire
+    # there even though build_brief always supplies a populated env).
+    template = "args.user={{ args.get('user') }} iter={{ iteration_n }}"
     worker = Worker(
         role="reviewer",
         prompt_template=template,

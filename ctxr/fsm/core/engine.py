@@ -73,6 +73,7 @@ from ctxr.fsm.core.predicates import (
 from ctxr.fsm.core.prompts import (
     PromptContext,
     PromptRenderer,
+    PromptRenderError,
     needs_rendering,
 )
 
@@ -166,7 +167,18 @@ def _maybe_render_prompt(
         args=dict(env),
         metadata={},
     )
-    rendered = renderer.render(template, context)
+    try:
+        rendered = renderer.render(template, context)
+    except PromptRenderError as exc:
+        # Re-raise with the state id attached so engine-time render
+        # failures carry the same diagnostic context register-time
+        # PromptRenderError already provides. Preserve line + message
+        # so the upstream envelope can keep pointing at the right spot.
+        raise PromptRenderError(
+            exc.message,
+            state_id=state.id,
+            line=exc.line,
+        ) from exc
     return worker.model_copy(update={"prompt_template": rendered})
 
 
