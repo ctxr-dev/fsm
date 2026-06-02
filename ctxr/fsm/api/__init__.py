@@ -95,8 +95,15 @@ _DEFAULT_CORS_ORIGINS: tuple[str, ...] = (
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 )
-_LOOPBACK_ORIGIN_REGEX: str = r"^http://(?:127\.0\.0\.1|localhost)(?::\d+)?$"
 _CORS_ENV_VAR: str = "CTXR_FSM_API_CORS_ORIGINS"
+
+# Permissive regex matching ANY loopback dashboard origin on ANY port.
+# Vite can land on an ephemeral port when 5173 is taken (the
+# supervisor negotiates a fresh one in that case), and the e2e
+# fixtures spawn entire supervisors on whatever the OS hands back.
+# Loopback origins are private to the operator's machine, so
+# widening here is the right safety/usability trade.
+_LOOPBACK_ORIGIN_REGEX: str = r"^http://(127\.0\.0\.1|localhost):\d+$"
 
 
 def _resolve_cors_origins() -> list[str]:

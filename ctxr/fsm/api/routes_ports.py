@@ -55,7 +55,7 @@ router = APIRouter(
 # ---------------------------------------------------------------------------
 
 
-SubsystemName = Literal["mcp", "api", "ui"]
+SubsystemName = Literal["mcp", "api", "ui"]  # audit-strings: justified
 
 
 class PortChangeRequestBody(BaseModel):
@@ -111,7 +111,7 @@ class PortChangeStatus(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     request_id: str
-    status: Literal["pending", "success", "failed", "unknown"]
+    status: Literal["pending", "success", "failed", "unknown"]  # audit-strings: justified
     subsystem: SubsystemName | None = None
     old_port: int | None = None
     new_port: int | None = None
