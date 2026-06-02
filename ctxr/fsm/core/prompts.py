@@ -119,7 +119,9 @@ class PromptContext(BaseModel):
     iteration_n: int | None = None
     args: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
-    model_allowlist: tuple[str, ...] = ()
+    # NOTE: sandboxing is configured on PromptRenderer(model_allowlist=...),
+    # not on the per-call context. Keeping a no-op field here would mislead
+    # callers into thinking they can tighten the sandbox at call time.
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +273,12 @@ class PromptRenderer:
     string.
     """
 
-    def __init__(self, *, model_allowlist: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        model_allowlist: tuple[str, ...] = (),
+        allow_model_import: bool = True,
+    ) -> None:
         self._env = SandboxedEnvironment(
             undefined=StrictUndefined,
             autoescape=False,
@@ -281,6 +288,7 @@ class PromptRenderer:
         self._env.filters["typescript"] = _filter_typescript
         self._env.filters["fields_table"] = _filter_fields_table
         self._model_allowlist = tuple(model_allowlist)
+        self._allow_model_import = allow_model_import
 
     # ------------------------------------------------------------------
     # Context construction
@@ -288,7 +296,15 @@ class PromptRenderer:
 
     def _resolve_model(self, path: str) -> Any:
         if not isinstance(path, str) or not path:
-            raise PromptRenderError("spec.model(path=…) requires a non-empty string")
+            raise PromptRenderError("spec.model(path=...) requires a non-empty string")
+        if not self._allow_model_import:
+            # Register-time validation paths construct renderers with
+            # allow_model_import=False so an untrusted spec cannot trigger
+            # importlib.import_module() during fsm.register_spec.
+            raise PromptRenderError(
+                "spec.model(path=...) is disabled in this renderer "
+                "(register-time validation does not import user modules)"
+            )
         module_path, _, attr = path.rpartition(".")
         if not module_path or not attr:
             raise PromptRenderError(
@@ -382,17 +398,25 @@ class PromptRenderer:
             ) from exc
 
     def validate(self, template: str, *, state_id: str | None = None) -> None:
-        """Smoke-render ``template`` with an empty context.
+        """Smoke-render ``template`` with a dummy context.
 
-        Surfaces Jinja syntax errors + obvious model-resolution failures
-        at register time. Templates that legitimately reference run-time
-        values pass (the StrictUndefined check is per-access and an
-        empty context still satisfies tokens like ``allowed_tools``,
-        which default to an empty list).
+        Surfaces Jinja syntax errors and unknown-token references at
+        register time. The smoke context fills every optional scalar
+        with a non-empty placeholder so templates that legitimately
+        call string methods at runtime (``{{ spec.slug.upper() }}``,
+        ``{{ state.id | length }}``) are not rejected against a ``None``
+        value the validator constructed.
         """
 
+        smoke_context = PromptContext(
+            spec_slug=state_id or "smoke",
+            spec_version=0,
+            state_id=state_id or "smoke",
+            state_kind="worker",
+            iteration_n=0,
+        )
         try:
-            self.render(template, PromptContext())
+            self.render(template, smoke_context)
         except PromptRenderError as exc:
             # Re-raise with the state id attached so the spec-level
             # validator can roll multiple state failures into one
