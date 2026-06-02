@@ -1054,11 +1054,13 @@ class GateResolution(BaseModel):
     """The outcome of :func:`resolve_gate`.
 
     * :attr:`env_update` — the dict of ``{target_field: resolved_value}``
-      entries the caller should merge into the run's env. For
-      ``llm_supplied`` gates this is a single entry keyed off the gate
-      state's first declared output; for ``run_output`` gates it is one
-      entry per supplied binding (each carrying its own
-      ``target_field``).
+      entries the caller should merge into the run's env. The current
+      :func:`resolve_gate` API accepts a single optional
+      :class:`GateBinding` and a single optional ``value``, so
+      ``env_update`` always carries exactly one entry: for
+      ``llm_supplied`` gates it is keyed off the gate state's first
+      declared output; for ``run_output`` gates it is keyed off the
+      supplied binding's ``target_field``.
     * :attr:`transitions` — the list of :class:`Transition` declared on
       the gate state, surfaced for the caller so the persistence layer
       can drive the outgoing transition without re-walking the spec.
