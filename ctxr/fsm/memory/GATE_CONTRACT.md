@@ -6,14 +6,17 @@ audience: ai-agents
 
 # ctxr-fsm: cross-FSM gate contract
 
+> **Status: forward-looking (W23g, planned).** Gates are NOT yet shipped. As of this PR, `StateKind` is `worker | loop | inline | terminal` (no `gate`), and neither `Gate` / `GateBinding` types nor the `fsm.resolve_gate` MCP tool exist in the codebase. This document is the design contract that W23g will implement; do not assume any of the symbols below are importable or callable today.
+
 A **gate** is a state kind that pauses a run waiting for a value supplied from outside the run's own state environment. The value may be an LLM-supplied literal, or a binding that pulls another run's state output. Gates make M:N fan-in/fan-out trivially expressible without bespoke orchestrator stitching.
 
-This document specifies the protocol. The engine model lives in [`ctxr/fsm/core/models.py`](../core/models.py); the resolver MCP tool lives in [`ctxr/fsm/mcp/tools_runs.py`](../mcp/tools_runs.py).
+This document specifies the protocol. Once W23g lands, the engine model will live in [`ctxr/fsm/core/models.py`](../core/models.py) and the resolver MCP tool in [`ctxr/fsm/mcp/tools_runs.py`](../mcp/tools_runs.py).
 
 ## State shape
 
 ```python
-from ctxr.fsm.core.models import State, Gate, GateBinding, ResponseSchema, StateKind
+# W23g pseudocode — the Gate / GateBinding symbols below do not yet exist:
+# from ctxr.fsm.core.models import State, Gate, GateBinding, ResponseSchema, StateKind
 
 State(
     id="await_review",

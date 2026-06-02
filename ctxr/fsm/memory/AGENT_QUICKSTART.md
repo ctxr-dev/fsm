@@ -10,7 +10,7 @@ You are an AI agent driving an FSM-managed workflow. This is the five-minute ver
 
 ## What an FSM run is
 
-A run is one execution of an FSM spec against a project DB. The spec declares states (worker / loop / inline / gate / terminal) and the transitions between them. The engine sequences advance; you (the LLM) supply only the worker outputs the engine asks for. You never decide what state runs next.
+A run is one execution of an FSM spec against a project DB. The spec declares states (worker / loop / inline / terminal; `gate` is planned for W23g) and the transitions between them. The engine sequences advance; you (the LLM) supply only the worker outputs the engine asks for. You never decide what state runs next.
 
 ## Lifecycle on the happy path
 
@@ -45,9 +45,9 @@ Run faulted? Do NOT improvise a retry. Call `fsm.inspect_journal(run_id)`, then 
 - `fsm.resume_run(run_id, from_state=…)` if a specific state needs re-entry, or
 - escalate to a human via `fsm.abort_run(run_id, reason=…)`.
 
-## What to do on a gate
+## What to do on a gate (planned: W23g)
 
-A gate state (`state.kind == 'gate'`) pauses the run waiting for cross-run data. Call `fsm.resolve_gate(run_id, state_entry_seq, value=...)` with an inline value OR `binding=...` referencing another run's state output. See [`GATE_CONTRACT.md`](./GATE_CONTRACT.md) for the full protocol.
+Gates are not yet shipped. Once W23g lands, a gate state (`state.kind == 'gate'`) will pause the run waiting for cross-run data, and you will call `fsm.resolve_gate(run_id, state_entry_seq, value=...)` with an inline value OR `binding=...` referencing another run's state output. Until then, the `fsm.resolve_gate` MCP tool does not exist; do not attempt to call it. See [`GATE_CONTRACT.md`](./GATE_CONTRACT.md) for the design contract.
 
 ## What to do if you want to AUTHOR a skill that uses fsm
 

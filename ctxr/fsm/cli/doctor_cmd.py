@@ -348,7 +348,7 @@ def _skill_consumer_report() -> dict[str, Any]:
 
     A skill consumer asks: "is everything I need to drive an FSM run
     actually present in this install?" The answer is yes when each of
-    the four pillar docs (principles, bootstrap, AGENT_QUICKSTART,
+    the five pillar docs (principles, bootstrap, AGENT_QUICKSTART,
     SKILL_TEMPLATE, GATE_CONTRACT) is readable inside the installed
     package. We resolve each via the public ``ctxr.fsm.memory``
     helpers so this check exercises the SAME code path skills use at
@@ -359,9 +359,9 @@ def _skill_consumer_report() -> dict[str, Any]:
 
         {
           "status": "ok" | "missing_docs",
-          "principles_path": str,
-          "bootstrap_path": str,
-          "ssot_docs": {<slug>: {"path": str, "exists": bool}, ...},
+          "principles_path": str | None,   # None when the pillar is missing
+          "bootstrap_path": str | None,    # None when the pillar is missing
+          "ssot_docs": {<slug>: {"path": str | None, "exists": bool}, ...},
           "missing": [<slug>, ...],   # slugs only, e.g. "principles",
                                       # "bootstrap", "agent_quickstart"
         }
