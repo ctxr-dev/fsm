@@ -92,13 +92,56 @@ def _run_ensure(project_root: Path, timeout_s: float = 60.0) -> dict:
     return json.loads(result.stdout)
 
 
-def _wait_for_url(url: str, *, timeout_s: float, accept_status_below: int = 500) -> None:
+def _collect_supervisor_log_tails(project_root: Path) -> str:
+    """Return a multi-block string with the tail of every supervisor log.
+
+    Used as diagnostics when a healthz / Vite readiness poll times out:
+    if the supervisor's npm child crashed mid-prebundle, the relevant
+    error lives in the date-sharded logs under
+    ``.ctxr-fsm/logs/<category>/YYYY/MM/DD/...`` and is otherwise
+    invisible to the test runner. Best-effort: returns an empty string
+    if the logs tree is absent or unreadable.
+    """
+    logs_root = project_root / ".ctxr-fsm" / "logs"
+    if not logs_root.is_dir():
+        return ""
+    blocks: list[str] = []
+    # Cap at the 5 most recently modified .log files anywhere under
+    # the logs tree; a healthy run typically has a handful, but a
+    # supervisor crash loop can spew dozens.
+    log_files = sorted(
+        logs_root.rglob("*.log"),
+        key=lambda p: p.stat().st_mtime if p.exists() else 0,
+        reverse=True,
+    )[:5]
+    for path in log_files:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        tail = data[-4096:].decode("utf-8", errors="replace")
+        blocks.append(f"--- tail of {path} ---\n{tail}")
+    return "\n".join(blocks)
+
+
+def _wait_for_url(
+    url: str,
+    *,
+    timeout_s: float,
+    accept_status_below: int = 500,
+    diag_project_root: Path | None = None,
+) -> None:
     """Poll ``url`` until it returns < ``accept_status_below`` or timeout.
 
     Vite's dev server and uvicorn typically need 1-3s after the
     supervisor reports them as "spawned" before they actually accept
     sockets. The Vite ready signal in particular is asynchronous to
-    the child-process PID being live. We poll on a 100ms cadence.
+    the child-process PID being live, and on CI cold-start (npm ci +
+    esbuild prebundle) the dev server routinely needs 30-60s before
+    it binds the port. We poll on a 100ms cadence and, on timeout,
+    tail the last few KB of every supervisor log under
+    ``<diag_project_root>/.ctxr-fsm/logs/`` into the raised error so
+    a real Vite crash is distinguishable from a slow cold-start.
     """
     deadline = time.monotonic() + timeout_s
     last_error: Exception | None = None
@@ -110,9 +153,14 @@ def _wait_for_url(url: str, *, timeout_s: float, accept_status_below: int = 500)
         except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
             last_error = exc
         time.sleep(0.1)
+    diag = ""
+    if diag_project_root is not None:
+        tails = _collect_supervisor_log_tails(diag_project_root)
+        if tails:
+            diag = "\n" + tails
     raise TimeoutError(
         f"timed out after {timeout_s}s waiting for {url} "
-        f"(last error: {last_error!r})"
+        f"(last error: {last_error!r}){diag}"
     )
 
 
@@ -186,10 +234,23 @@ def live_project(tmp_path_factory: pytest.TempPathFactory) -> Generator[LiveProj
             )
         # ensure reports subsystems as "spawned" once the child
         # process is alive, but Vite + uvicorn need a moment more
-        # before they accept connections. Poll healthz before
-        # handing off to tests.
-        _wait_for_url(f"{api_url}/healthz", timeout_s=20.0)
-        _wait_for_url(ui_url, timeout_s=20.0)
+        # before they accept connections. On CI cold-start Vite's
+        # npm child has to run ``npm ci`` + the esbuild dependency
+        # prebundle before binding its port, which routinely takes
+        # 30-60s; bump the UI budget to 90s and surface the
+        # supervisor log tails in the timeout error so a real Vite
+        # crash is visible in the failure diagnostics (rather than
+        # just a generic ConnectionRefused).
+        _wait_for_url(
+            f"{api_url}/healthz",
+            timeout_s=60.0,
+            diag_project_root=project_root,
+        )
+        _wait_for_url(
+            ui_url,
+            timeout_s=90.0,
+            diag_project_root=project_root,
+        )
         yield LiveProject(
             project_root=project_root,
             api_url=api_url,

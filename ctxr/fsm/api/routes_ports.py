@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -119,6 +119,17 @@ class PortChangeStatus(BaseModel):
     error: dict[str, object] | None = None
     started_at: str | None = None
     finished_at: str | None = None
+
+
+# Runtime tuple form of ``PortChangeStatus.status`` for the on-disk
+# coercion check in ``get_port_change_status``. Kept beside the model
+# so a future status-vocabulary change touches both sites.
+_PORT_CHANGE_STATUS_VALUES: tuple[str, ...] = (
+    "pending",
+    "success",
+    "failed",
+    "unknown",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +236,13 @@ async def submit_port_change(
         )
     # Cross-subsystem collision: reject before queueing so the operator
     # doesn't sit through a 5-second overlay only to see a failure toast.
+    # Soft check: ``recall_port`` only knows ports the supervisor has
+    # already published, so a brand-new install or a never-started
+    # mcp/ui returns None and a future bring-up can still race onto the
+    # same port. True bind failures are surfaced by the supervisor as
+    # ``status='failed'`` (with structured ``error`` describing the bind
+    # collision) via the status document, and the overlay poller picks
+    # them up that way.
     for other in ("mcp", "api", "ui"):
         if other == body.subsystem:
             continue
@@ -252,8 +270,9 @@ async def submit_port_change(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                "another port-change is already in flight; wait for it "
-                "to settle or DELETE /api/v1/admin/ports/inflight to "
+                "another port-change is already in flight; wait for the "
+                "supervisor to consume it (typically a few seconds), or "
+                "remove .ctxr-fsm/control/port-change.json manually to "
                 "clear an orphaned request"
             ),
         )
@@ -294,9 +313,20 @@ async def get_port_change_status(
     doc = read_port_change_status(project_root)
     if doc is None or doc.get("request_id") != request_id:
         return PortChangeStatus(request_id=request_id, status="unknown")
+    # Coerce any unrecognised on-disk ``status`` value to ``"unknown"``
+    # so a malformed (or future-version) status document cannot escape
+    # as a 500 to the poller. ``PortChangeStatus.status`` is a strict
+    # ``Literal`` and would otherwise raise ``ValidationError`` on a
+    # forwarded arbitrary string; that 500 falls outside the overlay's
+    # 5xx-tolerant retry budget and surfaces as a hard error toast.
+    raw_status = doc.get("status")
+    coerced_status = cast(
+        Literal["pending", "success", "failed", "unknown"],  # audit-strings: justified
+        raw_status if raw_status in _PORT_CHANGE_STATUS_VALUES else "unknown",
+    )
     return PortChangeStatus(
         request_id=request_id,
-        status=doc.get("status", "unknown"),
+        status=coerced_status,
         subsystem=doc.get("subsystem"),
         old_port=doc.get("old_port"),
         new_port=doc.get("new_port"),
