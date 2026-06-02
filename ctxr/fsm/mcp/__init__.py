@@ -123,8 +123,8 @@ mcp: FastMCP = FastMCP(
 # transport is stdio).
 
 
-@mcp.custom_route("/healthz", methods=["GET"])  # type: ignore[untyped-decorator]
-async def _healthz(_request: object) -> object:  # pragma: no cover - trivial
+@mcp.custom_route("/healthz", methods=["GET", "OPTIONS"])  # type: ignore[untyped-decorator]
+async def _healthz(request: object) -> object:  # pragma: no cover - trivial
     """Return 200 OK; the W7 supervisor probes this to gate readiness.
 
     Body is the same one-word ``"ok"`` the FastAPI side returns so a
@@ -133,14 +133,36 @@ async def _healthz(_request: object) -> object:  # pragma: no cover - trivial
     we import lazily so a CLI invocation that never boots the HTTP
     transport doesn't pay the import cost.
 
-    ``type: ignore[untyped-decorator]`` on the decorator: FastMCP's
-    ``custom_route`` is typed loosely (it accepts Any callable) and
-    mypy flags it as an untyped decorator. The body itself is fully
-    typed; the ignore is purely about FastMCP's decorator signature.
+    The response carries CORS headers reflecting any loopback
+    ``Origin`` (localhost or 127.0.0.1 on any port). FastMCP does not
+    install a CORS middleware of its own, and the UI's InfoTopBar
+    polls this route cross-origin from the Vite dev server. Without
+    these headers the browser logs a CORS failure that the autouse
+    console-audit fixture turns into an e2e teardown error. We mirror
+    the FastAPI-side regex so dev-loop ephemeral ports stay covered.
     """
+    import re
+
     from starlette.responses import PlainTextResponse
 
-    return PlainTextResponse("ok", status_code=200)
+    origin = getattr(request, "headers", {}).get("origin", "") if request else ""
+    cors_headers: dict[str, str] = {}
+    if origin and re.match(r"^http://(?:localhost|127\.0\.0\.1)(?::\d+)?$", origin):
+        cors_headers = {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Vary": "Origin",
+        }
+
+    # Preflight: 204 No Content with the CORS headers so the browser
+    # accepts the follow-up GET. GETs without special headers do not
+    # normally trigger preflight, but adding the OPTIONS handler keeps
+    # us robust against any future client that adds custom headers.
+    method = getattr(request, "method", "GET") if request else "GET"
+    if method == "OPTIONS":
+        return PlainTextResponse("", status_code=204, headers=cors_headers)
+    return PlainTextResponse("ok", status_code=200, headers=cors_headers)
 
 
 # Import the tools module for its decorator side effects. This must

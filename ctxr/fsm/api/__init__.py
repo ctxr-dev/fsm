@@ -184,9 +184,21 @@ app: FastAPI = FastAPI(
 # OPTIONS without the ``Authorization`` header, which would otherwise
 # trip ``require_auth`` and respond with 401 / 403 instead of the
 # expected CORS headers).
+#
+# ``allow_origin_regex`` covers any loopback host on any port so the
+# supervisor's ephemeral-port boots (Vite picks a random port when
+# 5173 is taken by another dev process, common in e2e parallel runs)
+# stay reachable from the InfoTopBar's ``/healthz`` probes. The dev
+# API already trusts every request when ``CTXR_FSM_API_TOKEN`` is
+# unset, so widening the CORS allowlist to loopback origins matches
+# the existing dev-trust posture rather than relaxing the production
+# bearer-auth one. The e2e harness benefits too: it spawns the UI on
+# an ephemeral port and the browser reaches ``/healthz`` without each
+# test having to wire ``$CTXR_FSM_API_CORS_ORIGINS`` per-port.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_resolve_cors_origins(),
+    allow_origin_regex=r"^http://(?:localhost|127\.0\.0\.1)(?::\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

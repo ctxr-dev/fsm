@@ -406,10 +406,27 @@ def _api_cmd(*, port: int, db_path: Path | None) -> list[str]:
 def _ui_cmd(*, port: int) -> list[str]:
     """Build the argv for the UI child (Vite dev server).
 
-    The leading ``--`` is npm's pass-through marker — everything after
+    The leading ``--`` is npm's pass-through marker; everything after
     it is handed verbatim to the underlying ``vite`` invocation.
+
+    ``--host 127.0.0.1`` pins the bind to IPv4 loopback so it matches
+    the supervisor's probe URL (``_probe_url_for`` returns
+    ``http://127.0.0.1:<port>``) and the e2e fixture's poll target.
+    Vite's default bind is ``localhost``, which on Linux CI runners
+    resolves first to ``::1`` (IPv6) and rejects IPv4 connections with
+    ConnectionRefused, leaving the e2e fixture waiting on a port the
+    child never opened on that address.
     """
-    return ["npm", "run", "dev", "--", "--port", str(port)]
+    return [
+        "npm",
+        "run",
+        "dev",
+        "--",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+    ]
 
 
 # ---------------------------------------------------------------------------

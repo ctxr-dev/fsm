@@ -135,3 +135,13 @@ body {
 .dark {
   --xy-label-bg: #1e293b;
 }
+
+/* JsonViewer search highlight overlay: wraps matched substrings in
+   <mark class="jv-match"> so the eye lands on the search hit even
+   inside the @uiw/react-json-view colour scheme. */
+.jv-match {
+  background: rgba(250, 204, 21, 0.45);
+  border-radius: 2px;
+  padding: 0 1px;
+  color: inherit;
+}

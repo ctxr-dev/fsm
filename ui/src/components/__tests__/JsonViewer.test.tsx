@@ -35,10 +35,15 @@ describe('JsonViewer toolbar', () => {
   });
 
   test('toolbar exposes Copy / DL / Expand / fullscreen buttons', () => {
-    const { getByLabelText } = render(<JsonViewer value={{ a: 1 }} />);
+    // The "Expand" button is only rendered when more levels exist
+    // below the current expansion depth. A deeply-nested fixture makes
+    // sure it shows up while we assert the rest of the toolbar.
+    const { getByLabelText } = render(
+      <JsonViewer value={{ a: { b: { c: { d: 1 } } } }} />,
+    );
     expect(getByLabelText('Copy JSON')).toBeInTheDocument();
     expect(getByLabelText('Download JSON')).toBeInTheDocument();
-    expect(getByLabelText(/Switch to/)).toBeInTheDocument();
+    expect(getByLabelText('Expand all levels')).toBeInTheDocument();
     expect(getByLabelText('Open in full-screen sheet')).toBeInTheDocument();
   });
 
@@ -72,11 +77,64 @@ describe('JsonViewer toolbar', () => {
     createSpy.mockRestore();
   });
 
-  test('Mode cycle button toggles between inline and expanded labels', () => {
-    const { getByLabelText } = render(<JsonViewer value={{ a: 1 }} mode="inline" />);
-    expect(getByLabelText('Switch to expanded mode')).toBeInTheDocument();
-    fireEvent.click(getByLabelText('Switch to expanded mode'));
-    expect(getByLabelText('Switch to inline mode')).toBeInTheDocument();
+  test('Expand button reveals all levels then a Collapse button replaces it', () => {
+    // Deep tree so "Expand" stays visible until the user clicks it.
+    const { getByLabelText, queryByLabelText } = render(
+      <JsonViewer value={{ a: { b: { c: { d: 1 } } } }} mode="inline" />,
+    );
+    expect(getByLabelText('Expand all levels')).toBeInTheDocument();
+    fireEvent.click(getByLabelText('Expand all levels'));
+    // After expand-all, there is nothing more to reveal so Expand hides
+    // and the Collapse mirror appears.
+    expect(queryByLabelText('Expand all levels')).toBeNull();
+    expect(getByLabelText('Collapse to default')).toBeInTheDocument();
+    fireEvent.click(getByLabelText('Collapse to default'));
+    expect(getByLabelText('Expand all levels')).toBeInTheDocument();
+  });
+
+  test('Expand button is hidden when the tree is already fully revealed', () => {
+    // Primitive value (depth 0) — there is nothing more to expand
+    // below the inline mode's already-revealed root, so the Expand
+    // affordance must not render. (For object values with any nesting,
+    // inline mode keeps Expand available because depth-0 collapse means
+    // there ARE more levels to reveal.)
+    const { queryByLabelText } = render(<JsonViewer value={42} />);
+    expect(queryByLabelText('Expand all levels')).toBeNull();
+  });
+
+  test('search prunes the tree to only matching subtrees', async () => {
+    const { container, getByLabelText } = render(
+      <JsonViewer
+        value={{ greet: 'hello world', list: [{ kind: 'foo' }, { kind: 'bar' }] }}
+        mode="expanded"
+      />,
+    );
+    const search = getByLabelText('Search inside JSON') as HTMLInputElement;
+    search.value = 'foo';
+    fireEvent.input(search, { target: { value: 'foo' } });
+    await Promise.resolve();
+    // The rendered tree text should now mention foo but not the
+    // unrelated "hello world" string from the pruned subtree.
+    const txt = container.textContent ?? '';
+    expect(txt).toContain('foo');
+    expect(txt).not.toContain('hello world');
+  });
+
+  test('multi-term search uses OR semantics', async () => {
+    const { container, getByLabelText } = render(
+      <JsonViewer
+        value={{ list: [{ kind: 'foo' }, { kind: 'bar' }, { kind: 'baz' }] }}
+        mode="expanded"
+      />,
+    );
+    const search = getByLabelText('Search inside JSON') as HTMLInputElement;
+    search.value = 'foo bar';
+    fireEvent.input(search, { target: { value: 'foo bar' } });
+    await Promise.resolve();
+    const txt = container.textContent ?? '';
+    expect(txt).toContain('foo');
+    expect(txt).toContain('bar');
+    expect(txt).not.toContain('baz');
   });
 
   test('Search input has accessible label', () => {

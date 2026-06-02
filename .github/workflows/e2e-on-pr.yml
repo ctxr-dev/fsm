@@ -1,0 +1,92 @@
+# W23a — Playwright E2E gate on every PR that touches UI / API / e2e.
+#
+# Triggered on PRs targeting `main` (or any branch) when the diff
+# includes `ui/src/**`, `ctxr/fsm/api/**`, or `tests/integration/e2e/**`.
+# Doc-only PRs and changes outside those paths skip this workflow
+# (no false-positive runs, no wasted CI budget).
+#
+# This is the "no regression" gate the W23a-deep plan requires after
+# the /specs TypeError surprise: the autouse console-audit fixture
+# defined in tests/integration/e2e/conftest.py asserts ZERO unhandled
+# JS errors during every e2e test body, so the bug class that bit
+# users (a wire-format mismatch crashing every consumer with a raw
+# TypeError) cannot land again without failing CI.
+#
+# Single-OS (Linux) for speed. Chromium-only — Firefox/WebKit add ~3 min
+# each for marginal coverage at this UI's scope; revisit if cross-browser
+# regressions surface.
+
+name: E2E — Playwright
+
+on:
+  pull_request:
+    paths:
+      - 'ui/src/**'
+      - 'ctxr/fsm/api/**'
+      - 'tests/integration/e2e/**'
+      - '.github/workflows/e2e-on-pr.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: E2E (Playwright Chromium)
+    runs-on: ubuntu-latest
+    # 25min ceiling: ``playwright install --with-deps chromium`` runs
+    # ``apt-get update`` + a ~200 MB browser download, which on a cold
+    # hosted runner with a slow azure apt mirror routinely consumes
+    # 8-10 minutes by itself. The prior 12min cap killed the job mid
+    # apt download with the actual e2e suite still pending; the tests
+    # themselves complete in under 2 minutes locally, so 25min is the
+    # smallest budget that absorbs the install jitter without hiding
+    # genuine test hangs.
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: '0.5.11'
+          enable-cache: true
+          cache-dependency-glob: 'uv.lock'
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: 'ui/package-lock.json'
+
+      # Install UI deps + build the production bundle. Vite dev server
+      # is what ``ctxr-fsm ensure`` spins up at e2e time, so we don't
+      # need ``npm run build`` for the e2e itself — but caching the
+      # node_modules makes the supervisor's UI spawn fast.
+      - name: Install UI deps
+        run: npm ci
+        working-directory: ui
+
+      - name: Install Python deps (incl. e2e group)
+        run: uv sync --all-extras --group e2e
+
+      - name: Install Playwright browsers
+        run: uv run playwright install --with-deps chromium
+
+      - name: Run e2e suite
+        run: uv run pytest tests/integration/e2e/ --run-e2e -v --tb=short
+        env:
+          # Cap concurrent Playwright workers to keep memory + supervisor
+          # spin-up time bounded. The session-scoped ``live_project``
+          # fixture means each xdist worker would spawn its own
+          # supervisor; one worker keeps the run hermetic.
+          PYTEST_ADDOPTS: '--maxfail=5'
