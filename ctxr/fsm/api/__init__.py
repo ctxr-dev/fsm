@@ -188,7 +188,9 @@ app: FastAPI = FastAPI(
 # API already trusts every request when ``CTXR_FSM_API_TOKEN`` is
 # unset, so widening the CORS allowlist to loopback origins matches
 # the existing dev-trust posture rather than relaxing the production
-# bearer-auth one.
+# bearer-auth one. The e2e harness benefits too: it spawns the UI on
+# an ephemeral port and the browser reaches ``/healthz`` without each
+# test having to wire ``$CTXR_FSM_API_CORS_ORIGINS`` per-port.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_resolve_cors_origins(),
