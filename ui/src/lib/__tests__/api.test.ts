@@ -5,6 +5,7 @@ import {
   ApiResponseShapeError,
   isPageEnvelope,
   walkAllPages,
+  type ListRunsParams,
   type Page,
   type RunSummary,
 } from '../api';
@@ -207,7 +208,12 @@ describe('walkAllPages — envelope-shape guard (W23a)', () => {
       .fn()
       .mockResolvedValueOnce({ items: [row(1), row(2)], page: 1, page_size: 2, total: 4, has_next: true, sort: 'x' } as Page<RunSummary>)
       .mockResolvedValueOnce({ items: [row(3), row(4)], page: 2, page_size: 2, total: 4, has_next: false, sort: 'x' } as Page<RunSummary>);
-    const all = (await walkAllPages(fetcher as never, {})) as RunSummary[];
+    const all = await walkAllPages<RunSummary, ListRunsParams>(
+      fetcher as unknown as (
+        params: ListRunsParams,
+      ) => Promise<Page<RunSummary>>,
+      {},
+    );
     expect(all.map((r) => r.id)).toEqual(['r1', 'r2', 'r3', 'r4']);
   });
 

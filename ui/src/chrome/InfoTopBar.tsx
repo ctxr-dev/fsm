@@ -59,13 +59,10 @@ import { useEffect, useMemo, useState } from 'preact/hooks';
 
 import { Pill, type PillVariant } from '../components';
 import { connectionPillProps } from '../lib/connectionPill';
-import { projectNameFromRoot } from '../lib/projectName';
+import { connectionState } from '../lib/store';
 import {
-  connectionState,
-  projectMetadata,
-  projectMetadataError,
-} from '../lib/store';
-import {
+  api,
+  ApiError,
   type ProjectMetadata,
   type SubsystemInfo,
 } from '../lib/api';
@@ -108,13 +105,36 @@ const PROBE_VARIANT: Record<ProbeStatus, PillVariant> = {
   degraded: 'danger',
 };
 
-/** Render an absolute path relative to ``$HOME`` when possible. */
+/**
+ * Render an absolute project path in a portable form for the topbar.
+ *
+ * The browser has no native ``$HOME`` introspection, but a screenshot
+ * of an absolute ``/Users/alice/...`` path leaks the operator's
+ * username + filesystem layout. We work around the missing primitive
+ * with a heuristic that recognises the macOS / Linux home prefixes
+ * and replaces the leading ``/Users/<name>`` (or ``/home/<name>``)
+ * with ``~``. An optional ``window.__FSM_HOME__`` override is honoured
+ * first for installs that set it explicitly (e.g. a future Electron
+ * shell). The pre-fix draft relied ONLY on ``__FSM_HOME__`` which
+ * nothing in the repo populated, so paths were never condensed —
+ * contradicting the screenshot-portability promise.
+ */
 function condenseHome(path: string | null | undefined): string {
   if (!path) return '';
   const home =
     typeof window !== 'undefined' &&
     (window as Window & { __FSM_HOME__?: string }).__FSM_HOME__;
   if (home && path.startsWith(home)) return `~${path.slice(home.length)}`;
+  // Heuristic fallback: ``/Users/<name>/...`` (macOS) or
+  // ``/home/<name>/...`` (most Linux distros). Both are
+  // username-prefixed so redacting to ``~/...`` removes the
+  // personally-identifying segment without losing the rest of the
+  // path. Match is anchored to the start so a project literally
+  // named ``Users/foo`` deeper in the tree isn't mangled.
+  const macMatch = /^\/Users\/[^/]+(\/.*)?$/.exec(path);
+  if (macMatch) return `~${macMatch[1] ?? ''}`;
+  const linuxMatch = /^\/home\/[^/]+(\/.*)?$/.exec(path);
+  if (linuxMatch) return `~${linuxMatch[1] ?? ''}`;
   return path;
 }
 
@@ -190,15 +210,36 @@ function buildViews(metadata: ProjectMetadata): SubsystemView[] {
 }
 
 export function InfoTopBar(): JSX.Element {
-  // W23c: read from the hoisted store signal that ``wireProjectMetadata()``
-  // populates at boot. Pre-W23c this component owned its own fetch +
-  // focus-refetch state machine; now Settings, PageHeader, and every
-  // future consumer share the same value via the same signal. Local
-  // probe state stays here because health-probe results are presentation,
-  // not application metadata.
-  const metadata = projectMetadata.value;
-  const error = projectMetadataError.value;
+  const [metadata, setMetadata] = useState<ProjectMetadata | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [probes, setProbes] = useState<Record<string, ProbeStatus>>({});
+
+  // Initial fetch + re-fetch on focus.
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const m = await api.getCurrentProject();
+        if (cancelled) return;
+        setMetadata(m);
+        setError(null);
+      } catch (err) {
+        if (cancelled) return;
+        setError(err instanceof ApiError ? err.message : String(err));
+      }
+    };
+    load();
+    const onFocus = () => { void load(); };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('focus', onFocus);
+    }
+    return () => {
+      cancelled = true;
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('focus', onFocus);
+      }
+    };
+  }, []);
 
   // Health probes whenever the metadata refreshes. Issued SERIALLY
   // (one ``await`` per iteration) — the canonical subsystem count is
@@ -208,9 +249,24 @@ export function InfoTopBar(): JSX.Element {
   // is the spot to bolt on the ``mapLimited`` pattern from
   // routes/drift.tsx (the same fan-out cap). Today the simpler shape
   // is easier to read.
+  //
+  // Stale-state contract: every metadata refresh starts by REPLACING
+  // (not merging into) the probe map. Without this reset, a previous
+  // metadata that reported ``mcp``/``api``/``ui`` but a fresh one
+  // that omits ``api`` would leave the swagger/api probes "healthy"
+  // from the previous round even though the subsystems no longer
+  // exist. Same hazard when switching projects: subsystems lingering
+  // from project A would render alongside project B's set.
   useEffect(() => {
     if (!metadata) return;
     let cancelled = false;
+    // Reset to the per-subsystem ``unknown`` baseline before re-probing
+    // so any subsystem that vanished from the new metadata loses its
+    // stale healthy/degraded indicator.
+    const initial: Record<string, ProbeStatus> = {};
+    for (const name of Object.keys(metadata.subsystems)) initial[name] = 'unknown';
+    initial.swagger = 'unknown';
+    setProbes(initial);
     (async () => {
       const next: Record<string, ProbeStatus> = {};
       const subs = Object.entries(metadata.subsystems);
@@ -224,8 +280,11 @@ export function InfoTopBar(): JSX.Element {
         setProbes((prev) => ({ ...prev, [name]: next[name] }));
       }
       // Swagger inherits the API process's outcome — same Python
-      // server, same uvicorn worker.
-      if ('api' in next) {
+      // server, same uvicorn worker. Guarded by the same ``cancelled``
+      // check the inner loop uses so a fast-unmount (operator
+      // navigates away mid-probe) doesn't schedule a state update on
+      // a torn-down component.
+      if (!cancelled && 'api' in next) {
         setProbes((prev) => ({ ...prev, swagger: next.api }));
       }
     })();
@@ -239,16 +298,6 @@ export function InfoTopBar(): JSX.Element {
 
   const connection = connectionPillProps(connectionState.value);
   const projectRoot = condenseHome(metadata?.project_root);
-  // W23c: derive the human-readable project NAME from the last path
-  // segment of project_root (e.g. /Users/dev/work/dummy-fsm-test ->
-  // "dummy-fsm-test"). Fall back to project_slug for in-memory
-  // backends that have no filesystem path. This is the dominant
-  // identifier the user wanted everywhere; ctxr-fsm is the tool
-  // wordmark, the project name tells you WHICH project you're
-  // looking at.
-  const projectName = metadata
-    ? (projectNameFromRoot(metadata.project_root) ?? metadata.project_slug)
-    : null;
 
   return (
     <header
@@ -260,12 +309,12 @@ export function InfoTopBar(): JSX.Element {
         'flex flex-wrap items-center gap-x-6 gap-y-2 px-6 py-2'
       }
     >
-      {/* Band 1: branding. Demoted to secondary weight post-W23c so
-          the project name (Band 2) dominates the header. The tagline
-          stays so a first-time visitor still understands what tool
-          this is. */}
+      {/* Band 1: branding. The two-line treatment communicates "what
+          tool is this" at first glance — the wordmark is the slug,
+          the tagline names the substrate in plain English so a
+          newcomer who lands on the dashboard isn't left guessing. */}
       <div class="flex flex-col leading-tight">
-        <span class="text-sm font-medium tracking-tight text-slate-700 dark:text-slate-300">
+        <span class="text-base font-semibold tracking-tight text-slate-900 dark:text-slate-100">
           ctxr-fsm
         </span>
         <span class="text-[10px] uppercase tracking-wider text-slate-500 dark:text-slate-400">
@@ -273,24 +322,21 @@ export function InfoTopBar(): JSX.Element {
         </span>
       </div>
 
-      {/* Band 2: project. W23c puts the project NAME (last segment of
-          project_root) front and centre — it's the dominant identifier
-          on every page. Path on a second line below, condensed via
-          $HOME / macOS / Linux heuristics so screenshots don't leak
-          the operator's username. Full absolute path on hover. When
-          the API is older / the DB is in-memory, project name + root
-          fall through to "no project bound" so the operator doesn't
-          read "blank" as a bug. */}
+      {/* Band 2: project. ``project_slug`` answers "which project?";
+          the home-condensed root answers "where on disk?". When the
+          API is older / the DB is in-memory, ``project_slug`` and
+          ``project_root`` are null — render an explicit "no project
+          bound" label so the operator doesn't read "blank" as a bug. */}
       {metadata ? (
         <div class="flex flex-col leading-tight min-w-0">
           <span
-            class="text-xl md:text-2xl font-bold tracking-tight text-slate-900 dark:text-slate-100 truncate max-w-[20rem] md:max-w-[28rem]"
-            title={metadata.project_root ?? metadata.project_slug ?? 'no project bound'}
+            class="text-sm font-medium text-slate-900 dark:text-slate-100 truncate max-w-[24rem]"
+            title={metadata.project_slug ?? 'no project bound'}
           >
-            {projectName ?? <em class="text-base font-medium text-slate-500 dark:text-slate-400">no project bound</em>}
+            {metadata.project_slug ?? <em class="text-slate-500 dark:text-slate-400">no project bound</em>}
           </span>
           <span
-            class="text-[10px] font-mono text-slate-500 dark:text-slate-400 truncate max-w-[20rem] md:max-w-[28rem]"
+            class="text-[10px] font-mono text-slate-500 dark:text-slate-400 truncate max-w-[24rem]"
             title={metadata.project_root ?? ''}
           >
             {projectRoot || <span class="italic">project root unknown</span>}
@@ -303,7 +349,13 @@ export function InfoTopBar(): JSX.Element {
           Colour reflects the health probe outcome:
           neutral=probing, success=healthy, danger=degraded. */}
       <nav aria-label="Subsystem availability" class="flex flex-wrap items-center gap-1.5">
-        {views.length === 0 && metadata !== null ? (
+        {/* The empty-state branch keys off the SOURCE map size
+            (metadata.subsystems), not the synthesised views array,
+            because buildViews always appends a synthetic Swagger row.
+            Pre-fix this branch was unreachable: even with a totally
+            empty discovery doc, views.length stayed at 1 (Swagger)
+            and the "supervisor not running" hint never surfaced. */}
+        {metadata !== null && Object.keys(metadata.subsystems).length === 0 ? (
           <span class="text-[10px] text-slate-500 dark:text-slate-400 italic">
             no subsystems reported (supervisor not running)
           </span>

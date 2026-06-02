@@ -95,14 +95,15 @@ def _run_ensure(project_root: Path, timeout_s: float = 60.0) -> dict:
 def _read_supervisor_logs(project_root: Path, *, tail_bytes: int = 32_768) -> str:
     """Return the tail of the supervisor log dir, joined for diagnostics.
 
-    The supervisor's own stdout/stderr (and the UI child's inherited
-    stdio — Vite's banner, dep-optimise progress, any startup error
-    trace) is captured by ``ensure_cmd._spawn_supervisor`` into a
-    date-sharded log under ``<project_root>/.ctxr-fsm/logs/``. On CI
-    we can only see what we print, so when a wait-for-url times out
-    we dump the tail of every file there so the next failure surfaces
-    the real Vite/uvicorn error rather than a bare
-    ``ConnectionRefused``.
+    The supervisor forwards each child's stdout/stderr (the UI
+    child's inherited stdio — Vite's banner, dep-optimise progress,
+    any startup error trace) into a date-sharded log under
+    ``<project_root>/.ctxr-fsm/logs/``. On CI we can only see what we
+    print, so when a wait-for-url times out we dump the tail of every
+    file there so the failure is diagnosable instead of opaque (the
+    symptom was ``ConnectionRefusedError`` without any hint about
+    whether npm crashed, Vite was still pre-bundling, or the port was
+    simply taken).
     """
     logs_dir = project_root / ".ctxr-fsm" / "logs"
     if not logs_dir.is_dir():
@@ -137,11 +138,13 @@ def _wait_for_url(
     Vite's dev server and uvicorn typically need 1-3s after the
     supervisor reports them as "spawned" before they actually accept
     sockets. The Vite ready signal in particular is asynchronous to
-    the child-process PID being live. We poll on a 100ms cadence.
+    the child-process PID being live, and on a GH-hosted runner cold
+    start (first esbuild prebundle + uvicorn import-graph priming)
+    the wait can routinely exceed 20s. We poll on a 100ms cadence.
 
     On timeout, if ``project_root`` is provided, dump the tail of the
-    supervisor log files so CI failures surface the real cause rather
-    than an opaque ``ConnectionRefusedError``.
+    supervisor log files so a CI failure is diagnosable instead of
+    surfacing only ``ConnectionRefusedError``.
     """
     deadline = time.monotonic() + timeout_s
     last_error: Exception | None = None
@@ -234,15 +237,14 @@ def live_project(tmp_path_factory: pytest.TempPathFactory) -> Generator[LiveProj
         # process is alive, but Vite + uvicorn need a moment more
         # before they accept connections. Poll healthz before
         # handing off to tests.
-        # 60s ceiling for both probes: Vite cold start on GH-hosted
-        # runners with a first-time esbuild + uvicorn import-graph
-        # priming routinely exceeds the old 20s window (W23b added
-        # CodeMirror + viewport persistence which lengthened first
-        # paint). The poll cadence is 100ms, so a healthy local boot
-        # still hands off in <2s; the budget only bites on CI cold
-        # starts. On timeout we dump the supervisor log tail (carrying
-        # Vite's inherited stdio) so the next failure is diagnosable
-        # rather than opaque.
+        # 60s ceiling: Vite cold start on GH-hosted runners with a
+        # first-time esbuild + uvicorn import-graph priming routinely
+        # exceeds the old 20s window (W23b added CodeMirror + viewport
+        # persistence which lengthened first paint). The poll cadence
+        # is 100ms, so a healthy local boot still hands off in <2s;
+        # the budget only bites on CI cold starts. On timeout we dump
+        # the supervisor log tail (carrying Vite's inherited stdio)
+        # so the next failure is diagnosable rather than opaque.
         _wait_for_url(
             f"{api_url}/healthz", timeout_s=60.0, project_root=project_root
         )
