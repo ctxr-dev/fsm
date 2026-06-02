@@ -542,6 +542,33 @@ def _materialise_package_file(
     dest = target / relative_dest
     dest.parent.mkdir(parents=True, exist_ok=True)
 
+    # Idempotency early-exit: if the destination is already in the
+    # desired state, return without touching it. This keeps inode
+    # ctime/mtime stable across repeated install-memory runs, which
+    # the no-rewrite test in this module enforces.
+    #
+    # Symlink-mode requested + dest is the right symlink: keep it.
+    # Copy-mode requested + dest is a regular file with the same
+    # bytes: keep it. Any other shape (wrong symlink target, file
+    # when symlink was requested, symlink when copy was requested,
+    # mismatched bytes) falls through and gets re-materialised so
+    # the destination converges on the requested shape.
+    desired_symlink_target = Path(package_file).resolve()
+    if not no_symlink and dest.is_symlink():
+        try:
+            current_target: Path | None = dest.readlink()
+        except OSError:
+            current_target = None
+        if current_target == desired_symlink_target:
+            return dest, "symlink"
+    elif no_symlink and dest.is_file() and not dest.is_symlink():
+        try:
+            same_bytes = dest.read_bytes() == package_file.read_bytes()
+        except OSError:
+            same_bytes = False
+        if same_bytes:
+            return dest, "copy"
+
     # Remove any pre-existing entry (file, symlink, or broken symlink)
     # before re-materialising. ``Path.unlink`` with ``missing_ok=True``
     # handles all three cleanly without an explicit ``exists()`` race.
@@ -557,14 +584,13 @@ def _materialise_package_file(
         # outside the project dir (it's inside the installed package),
         # so a relative path across that boundary would be cosmetically
         # ugly. Resolving here also makes the symlink stable across a
-        # ``git mv`` of the project — the link always points back at
+        # ``git mv`` of the project, the link always points back at
         # the installed package.
-        rel_target = Path(package_file).resolve()
-        dest.symlink_to(rel_target)
+        dest.symlink_to(desired_symlink_target)
         return dest, "symlink"
     except (OSError, NotImplementedError):
         # Filesystem or platform doesn't support symlinks (Windows
-        # without dev mode, some FUSE mounts) — fall back to copy.
+        # without dev mode, some FUSE mounts), fall back to copy.
         shutil.copy2(package_file, dest)
         return dest, "copy"
 

@@ -223,12 +223,21 @@ def test_install_memory_is_idempotent_for_ssot_docs(tmp_target: Path) -> None:
     _install_claude(tmp_target)
     memory_dir = _staged_memory_dir(tmp_target)
 
-    # Snapshot every staged file's bytes + mtime so we can detect any
-    # rewrite or duplication on the second pass.
-    snapshot: dict[str, tuple[bytes, float]] = {}
+    # Snapshot every staged file's bytes, mtime, and ctime_ns so we
+    # can detect any rewrite or duplication on the second pass.
+    #
+    # We MUST include ``st_ctime_ns`` (and not rely on ``st_mtime``
+    # alone). The staging copy path uses ``shutil.copy2``, which
+    # PRESERVES the source file's mtime, so a rewrite of identical
+    # bytes leaves ``st_mtime`` unchanged and the test would silently
+    # pass. ``st_ctime`` (inode change time) is NOT preserved by
+    # ``copy2`` and bumps on every replacement, so it is the metadata
+    # field that actually proves "no rewrite happened".
+    snapshot: dict[str, tuple[bytes, float, int]] = {}
     for filename in _EXPECTED_STAGED_FILES:
         staged = memory_dir / filename
-        snapshot[filename] = (staged.read_bytes(), staged.stat().st_mtime)
+        st = staged.stat()
+        snapshot[filename] = (staged.read_bytes(), st.st_mtime, st.st_ctime_ns)
 
     # Run install-memory again. The host CLAUDE.md already imports the
     # principles file via the marker block, so the patch is a no-op;
@@ -241,13 +250,16 @@ def test_install_memory_is_idempotent_for_ssot_docs(tmp_target: Path) -> None:
     expected_files = sorted(_EXPECTED_STAGED_FILES)
     assert actual_files == expected_files, actual_files
 
-    # The bytes match the snapshot (no content rewrite) AND the mtime is
-    # unchanged (the staging path is a true no-op: we did not even
-    # re-open + rewrite identical bytes).
+    # The bytes match the snapshot (no content rewrite), the mtime is
+    # unchanged (consistent with the source mtime not changing), and
+    # the ctime_ns is unchanged (the staging path is a true no-op: we
+    # did not even re-open + rewrite identical bytes).
     for filename in _EXPECTED_STAGED_FILES:
         staged = memory_dir / filename
+        st = staged.stat()
         assert staged.read_bytes() == snapshot[filename][0], filename
-        assert staged.stat().st_mtime == snapshot[filename][1], filename
+        assert st.st_mtime == snapshot[filename][1], filename
+        assert st.st_ctime_ns == snapshot[filename][2], filename
 
     # ``--check`` reports a clean tree (no SSOT drift).
     exit_code, check_payload = _run_check(tmp_target)
