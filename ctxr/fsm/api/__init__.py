@@ -180,9 +180,16 @@ app: FastAPI = FastAPI(
 # OPTIONS without the ``Authorization`` header, which would otherwise
 # trip ``require_auth`` and respond with 401 / 403 instead of the
 # expected CORS headers).
+#
+# ``allow_origin_regex`` covers every loopback dev origin (any port on
+# ``localhost`` / ``127.0.0.1``) so the e2e harness, which spawns the
+# UI on an ephemeral port, can reach the API's ``/healthz`` from the
+# browser without each test having to wire ``$CTXR_FSM_API_CORS_ORIGINS``
+# per-port. Production stays locked down to the explicit allowlist.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_resolve_cors_origins(),
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
