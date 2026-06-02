@@ -37,6 +37,7 @@ Design notes:
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import os
@@ -53,12 +54,17 @@ __all__ = [
     "ReusedSubsystem",
     "acquire_singleton",
     "active_mcp_file_path",
+    "consume_port_change_request",
     "now_iso_ms",
     "pick_port",
     "pid_file_for",
     "pid_is_alive",
+    "port_change_request_path",
+    "port_change_status_path",
     "read_active_mcp_file",
     "read_pid_file",
+    "read_port_change_request",
+    "read_port_change_status",
     "recall_port",
     "release_singleton",
     "remember_active_mcp_file",
@@ -67,6 +73,8 @@ __all__ = [
     "sharded_log_path",
     "write_active_run_marker",
     "write_pid_file",
+    "write_port_change_request",
+    "write_port_change_status",
 ]
 
 
@@ -665,6 +673,120 @@ def remove_active_mcp_file(project_root: Path) -> None:
         path.unlink()
     except FileNotFoundError:
         return
+
+
+# ---------------------------------------------------------------------------
+# W23e — port-change control channel (API ↔ supervisor IPC)
+# ---------------------------------------------------------------------------
+#
+# The HTTP API and the supervisor are separate processes; the API
+# cannot directly call supervisor methods. We bridge with a control
+# file under .ctxr-fsm/control/ that the supervisor's watcher loop
+# picks up. Two documents:
+#
+#   port-change.json         — single in-flight request (API writes,
+#                              supervisor consumes-then-unlinks).
+#   port-change-status.json  — request_id-keyed result (supervisor
+#                              writes, API reads when polling).
+#
+# Both go through ``_atomic_write_text`` so a poller mid-update sees
+# the previous version or the new one, never a partial.
+
+_CONTROL_DIR_NAME: str = "control"
+_PORT_CHANGE_REQUEST_NAME: str = "port-change.json"
+_PORT_CHANGE_STATUS_NAME: str = "port-change-status.json"
+
+
+def _control_dir(project_root: Path) -> Path:
+    """Return ``<project_root>/.ctxr-fsm/control``, creating if missing."""
+    target = _state_dir(project_root) / _CONTROL_DIR_NAME
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def port_change_request_path(project_root: Path) -> Path:
+    """Canonical path for the in-flight port-change request file."""
+    return _control_dir(project_root) / _PORT_CHANGE_REQUEST_NAME
+
+
+def port_change_status_path(project_root: Path) -> Path:
+    """Canonical path for the per-request status file."""
+    return _control_dir(project_root) / _PORT_CHANGE_STATUS_NAME
+
+
+def write_port_change_request(
+    payload: dict[str, Any], *, project_root: Path
+) -> bool:
+    """Atomically queue a port-change request for the supervisor.
+
+    Returns ``True`` when the file was written, ``False`` when a
+    previous request is still in flight (the file already exists).
+    Callers expecting exclusivity should return HTTP 409 on False so
+    operators in two browser tabs don't queue overlapping changes.
+    """
+    path = port_change_request_path(project_root)
+    if path.exists():
+        return False
+    _atomic_write_text(path, json.dumps(payload, sort_keys=True, indent=2))
+    return True
+
+
+def read_port_change_request(project_root: Path) -> dict[str, Any] | None:
+    """Return the parsed in-flight request, or ``None`` if absent / bad."""
+    path = port_change_request_path(project_root)
+    if not path.exists():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def consume_port_change_request(project_root: Path) -> dict[str, Any] | None:
+    """Atomic read-then-unlink — supervisor's claim primitive.
+
+    Returning the parsed payload (or ``None`` for missing / malformed)
+    means a crash mid-processing cannot loop the supervisor on the
+    same request: by the time we begin draining the subsystem the
+    control file is already gone.
+    """
+    path = port_change_request_path(project_root)
+    if not path.exists():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        loaded = None
+    with contextlib.suppress(FileNotFoundError):
+        # Another watcher iteration already consumed it.
+        path.unlink()
+    return loaded if isinstance(loaded, dict) else None
+
+
+def write_port_change_status(
+    payload: dict[str, Any], *, project_root: Path
+) -> None:
+    """Overwrite the per-request status document.
+
+    Called by the supervisor at each lifecycle step (pending →
+    success / failed) so the UI's poller sees forward progress
+    before the actual drain + respawn completes.
+    """
+    path = port_change_status_path(project_root)
+    _atomic_write_text(path, json.dumps(payload, sort_keys=True, indent=2))
+
+
+def read_port_change_status(project_root: Path) -> dict[str, Any] | None:
+    """Return the latest status document, or ``None`` if absent / bad."""
+    path = port_change_status_path(project_root)
+    if not path.exists():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
 
 
 def write_active_run_marker(

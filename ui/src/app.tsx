@@ -59,6 +59,7 @@ import { SheetHost } from './chrome/SheetHost';
 import { CommandPalette } from './chrome/CommandPalette';
 import { KeyboardHelp } from './chrome/KeyboardHelp';
 import { NotificationCentre } from './chrome/NotificationCentre';
+import { ReconnectingOverlay } from './chrome/ReconnectingOverlay';
 import { ThemeApplier } from './chrome/ThemeApplier';
 import { InfoTopBar } from './chrome/InfoTopBar';
 
@@ -306,6 +307,7 @@ function Shell(): JSX.Element {
       <CommandPalette />
       <KeyboardHelp />
       <NotificationCentre />
+      <ReconnectingOverlay />
       <ThemeApplier />
     </div>
   );

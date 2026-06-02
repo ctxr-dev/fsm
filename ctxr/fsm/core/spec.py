@@ -152,6 +152,28 @@ def _iter_predicate_expressions(
     return out
 
 
+def _iter_prompt_templates(state: State) -> list[tuple[str, str]]:
+    """Collect every Jinja-renderable prompt template attached to ``state``.
+
+    Returns a list of ``(location, template)`` pairs. The W23f
+    register-time validator iterates this to smoke-render each one.
+    Worker and Loop-worker prompts are inspected; verifier specs would
+    be a natural future extension but their prompts today are
+    spec-author-supplied free text only validated at LLM dispatch.
+    """
+    out: list[tuple[str, str]] = []
+    if state.worker is not None:
+        out.append((f"state:{state.id}/worker.prompt_template", state.worker.prompt_template))
+    if state.loop is not None and state.loop.worker is not None:
+        out.append(
+            (
+                f"state:{state.id}/loop.worker.prompt_template",
+                state.loop.worker.prompt_template,
+            )
+        )
+    return out
+
+
 def _bfs_reachable(spec: FsmSpec) -> set[str]:
     """Return the set of state ids reachable from :attr:`FsmSpec.entry`.
 
@@ -275,6 +297,17 @@ def validate_fsm_spec(spec: FsmSpec) -> FsmValidationResult:
        :func:`ctxr.fsm.core.predicates.validate_expression`. If the
        predicates module is not importable in the current environment
        (e.g. early bootstrap), this check is skipped silently.
+    6. **Prompt template parsability (W23f).** Every worker
+       ``prompt_template`` that contains a Jinja construct
+       (``{{`` or ``{%``) is smoke-rendered through the sandboxed
+       :class:`~ctxr.fsm.core.prompts.PromptRenderer` so syntax
+       errors and unknown tokens fail at register time rather than at
+       ``build_brief`` time. The renderer is constructed with
+       ``allow_model_import=False`` so an untrusted spec cannot trigger
+       arbitrary ``importlib.import_module`` calls during validation;
+       templates that rely on ``spec.model(...)`` must therefore be
+       wired with a renderer at run time. The check is skipped silently
+       if ``jinja2`` is not installed in the current environment.
 
     What is **not** validated here:
 
@@ -340,6 +373,40 @@ def validate_fsm_spec(spec: FsmSpec) -> FsmValidationResult:
                     f"{location}: predicate expression {expression!r} failed to "
                     f"parse: {exc}"
                 )
+
+    # --- (6) Prompt template parsability (W23f) -----------------------------
+    # Workers whose prompt_template embeds Jinja constructs ({{ }} or
+    # {% %}) get a register-time smoke render so syntax errors and
+    # obviously-bad model references fail fast rather than at
+    # build_brief time. Templates without Jinja markers skip the check
+    # entirely so the overwhelming majority of existing specs pay zero
+    # cost. The PromptRenderer is imported lazily so a missing jinja2
+    # at runtime cannot break this validator for non-templated specs.
+    try:
+        from ctxr.fsm.core.prompts import (
+            PromptRenderer,
+            PromptRenderError,
+            needs_rendering,
+        )
+    except ImportError:
+        # jinja2 not installed at runtime; skip template validation.
+        pass
+    else:
+        # allow_model_import=False so a register-time smoke render of a
+        # user-supplied spec cannot trigger arbitrary importlib calls
+        # (e.g. spec.model(path='os.environ') leaking host env).
+        renderer = PromptRenderer(allow_model_import=False)
+        for state in spec.states:
+            for location, template in _iter_prompt_templates(state):
+                if not needs_rendering(template):
+                    continue
+                try:
+                    renderer.validate(template, state_id=state.id)
+                except PromptRenderError as exc:
+                    line_suffix = f" (line {exc.line})" if exc.line is not None else ""
+                    errors.append(
+                        f"{location}: {exc.message}{line_suffix}"
+                    )
 
     return FsmValidationResult(
         valid=not errors,
