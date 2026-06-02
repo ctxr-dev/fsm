@@ -132,11 +132,16 @@ def _clear_project(db_path) -> None:
 
 
 def _seed_spec(db_path, slug: str) -> str:
-    """Register a single spec; return its registered spec_id."""
+    """Register a single spec; return its registered spec_id.
+
+    ``SpecRegistered`` is the envelope (``spec`` + ``created``) — the
+    primary key the UI routes to lives on ``registered.spec.id`` (the
+    versioned spec row ID), not on the envelope itself.
+    """
     project = Project.open(db_path)
     try:
         registered = project.register_spec(_spec(slug))
-        return registered.id
+        return registered.spec.id
     finally:
         project.close()
 
@@ -185,7 +190,11 @@ def test_specs_route_empty_state_no_js_errors(
         f"expected empty items[] after clear, got {body[:200]}"
     )
 
-    page.goto(f"{live_project.ui_url}/specs", wait_until="networkidle")
+    # ``domcontentloaded`` + a headline wait — the /specs route opens an
+    # SSE stream (and the InfoTopBar polls /healthz) so ``networkidle``
+    # never settles inside Playwright's 30s default window.
+    page.goto(f"{live_project.ui_url}/specs", wait_until="domcontentloaded")
+    page.get_by_role("heading", name="Specs", exact=True).wait_for(timeout=10000)
 
     # The empty-state copy from specs.tsx — "No specs registered" /
     # "ctxr-fsm spec register". Either substring is fine; we want the
@@ -215,7 +224,11 @@ def test_specs_route_seeded_renders_specs_with_run_counts(
     _seed_run(db_path, "e2e-specs-alpha")
     _seed_run(db_path, "e2e-specs-beta")
 
-    page.goto(f"{live_project.ui_url}/specs", wait_until="networkidle")
+    # ``domcontentloaded`` + a headline wait — the /specs route opens an
+    # SSE stream (and the InfoTopBar polls /healthz) so ``networkidle``
+    # never settles inside Playwright's 30s default window.
+    page.goto(f"{live_project.ui_url}/specs", wait_until="domcontentloaded")
+    page.get_by_role("heading", name="Specs", exact=True).wait_for(timeout=10000)
 
     body_text = page.locator("body").inner_text(timeout=5000)
     assert "e2e-specs-alpha" in body_text, (
@@ -235,7 +248,11 @@ def test_specs_route_row_click_navigates_to_detail(
     _clear_project(db_path)
     spec_id = _seed_spec(db_path, "e2e-specs-navtest")
 
-    page.goto(f"{live_project.ui_url}/specs", wait_until="networkidle")
+    # ``domcontentloaded`` + a headline wait — the /specs route opens an
+    # SSE stream (and the InfoTopBar polls /healthz) so ``networkidle``
+    # never settles inside Playwright's 30s default window.
+    page.goto(f"{live_project.ui_url}/specs", wait_until="domcontentloaded")
+    page.get_by_role("heading", name="Specs", exact=True).wait_for(timeout=10000)
 
     # Find the row that contains the slug text and click it. The
     # Table component (ui/src/components/Table.tsx) renders each row
@@ -251,7 +268,6 @@ def test_specs_route_row_click_navigates_to_detail(
 
     # Detail header should render the slug as part of its title; the
     # exact copy lives in specDetail.tsx and may carry a version pill.
-    body_text = page.locator("body").inner_text(timeout=5000)
-    assert "e2e-specs-navtest" in body_text, (
-        f"detail page should show the slug; got: {body_text[:500]}"
-    )
+    # Wait for the slug text to render rather than reading body once —
+    # the route shows "Loading spec" until the API roundtrip completes.
+    page.get_by_text("e2e-specs-navtest").first.wait_for(timeout=10000)

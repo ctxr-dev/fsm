@@ -81,10 +81,21 @@ __all__ = ["ProjectMetadata", "app", "lifespan_handler"]
 # Operators extend the list via ``$CTXR_FSM_API_CORS_ORIGINS`` as a
 # comma-separated string — wildcards are not honoured (see module
 # docstring).
+#
+# Loopback regex coverage: the W7 supervisor binds Vite to an
+# ephemeral port whenever 5173 is occupied (the e2e harness always
+# lands on a random port to avoid colliding with a developer's local
+# session). A fixed ``:5173`` allowlist would miss every CI run, so
+# we ALSO accept any ``http://127.0.0.1:<port>`` /
+# ``http://localhost:<port>`` origin via Starlette's
+# ``allow_origin_regex``. This is loopback-only — the server binds
+# exclusively to ``127.0.0.1``, so the only callers that can reach
+# this route are local browsers.
 _DEFAULT_CORS_ORIGINS: tuple[str, ...] = (
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 )
+_LOOPBACK_ORIGIN_REGEX: str = r"^http://(?:127\.0\.0\.1|localhost)(?::\d+)?$"
 _CORS_ENV_VAR: str = "CTXR_FSM_API_CORS_ORIGINS"
 
 
@@ -183,6 +194,7 @@ app: FastAPI = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_resolve_cors_origins(),
+    allow_origin_regex=_LOOPBACK_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

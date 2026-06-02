@@ -85,9 +85,64 @@ entry point.
 
 from __future__ import annotations
 
+import os
+import re
+
 from mcp.server.fastmcp import FastMCP
 
 __all__ = ["mcp"]
+
+
+# ----------------------------------------------------------------------
+# CORS allowlist for /healthz (browser-side probes from the UI)
+# ----------------------------------------------------------------------
+#
+# The Vite dev UI (InfoTopBar) probes every subsystem's ``healthz_url``
+# cross-origin from http://127.0.0.1:5173 (or http://localhost:5173).
+# Without CORS headers on the MCP /healthz response, the browser blocks
+# the read and the test harness sees a console.error which W23a treats
+# as a hard failure. The W7 supervisor binds the UI to an ephemeral
+# port when 5173 is occupied (the e2e harness always lands on a random
+# port to avoid colliding with a developer's own session), so a fixed
+# allowlist of just ``:5173`` would miss every CI run.
+#
+# Loopback-only relaxation: we accept any ``http://127.0.0.1:<port>``
+# or ``http://localhost:<port>`` origin. Both the MCP and API servers
+# bind exclusively to ``127.0.0.1`` (see supervisor + api.server), so
+# the only callers that can reach this route at all are local browsers.
+# Operators who terminate TLS in front of the dev server extend the
+# allowlist via ``$CTXR_FSM_API_CORS_ORIGINS`` (comma-separated).
+_LOOPBACK_ORIGIN_RE: re.Pattern[str] = re.compile(
+    r"^http://(?:127\.0\.0\.1|localhost)(?::\d+)?$"
+)
+_HEALTHZ_CORS_ENV_VAR: str = "CTXR_FSM_API_CORS_ORIGINS"
+
+
+def _origin_is_allowed(origin: str) -> bool:
+    """Return True for loopback origins or any explicit env extension."""
+    if _LOOPBACK_ORIGIN_RE.match(origin):
+        return True
+    extra = os.environ.get(_HEALTHZ_CORS_ENV_VAR, "")
+    return origin in {o.strip() for o in extra.split(",") if o.strip()}
+
+
+def _cors_headers_for(origin: str | None) -> dict[str, str]:
+    """Echo the request origin back if it's allowed.
+
+    Returning the exact origin (rather than ``*``) keeps the response
+    compatible with credentialed requests should the UI ever switch
+    away from ``credentials: 'omit'``. The Vary header is required so
+    intermediary caches don't serve a response with the wrong origin
+    to a different caller.
+    """
+    if origin is None or not _origin_is_allowed(origin):
+        return {}
+    return {
+        "access-control-allow-origin": origin,
+        "access-control-allow-methods": "GET, OPTIONS",
+        "access-control-allow-headers": "*",
+        "vary": "Origin",
+    }
 
 
 # The single FastMCP instance. Module-level so the ``@mcp.tool()``
@@ -123,8 +178,8 @@ mcp: FastMCP = FastMCP(
 # transport is stdio).
 
 
-@mcp.custom_route("/healthz", methods=["GET"])  # type: ignore[untyped-decorator]
-async def _healthz(_request: object) -> object:  # pragma: no cover - trivial
+@mcp.custom_route("/healthz", methods=["GET", "OPTIONS"])  # type: ignore[untyped-decorator]
+async def _healthz(request: object) -> object:  # pragma: no cover - trivial
     """Return 200 OK; the W7 supervisor probes this to gate readiness.
 
     Body is the same one-word ``"ok"`` the FastAPI side returns so a
@@ -137,10 +192,26 @@ async def _healthz(_request: object) -> object:  # pragma: no cover - trivial
     ``custom_route`` is typed loosely (it accepts Any callable) and
     mypy flags it as an untyped decorator. The body itself is fully
     typed; the ignore is purely about FastMCP's decorator signature.
-    """
-    from starlette.responses import PlainTextResponse
 
-    return PlainTextResponse("ok", status_code=200)
+    The route ALSO responds to ``OPTIONS`` and emits CORS headers when
+    the request origin is on the allowlist — the Vite dev UI's
+    InfoTopBar probes this URL cross-origin from
+    ``http://127.0.0.1:5173`` and the browser will block the read
+    otherwise. FastMCP doesn't accept arbitrary middleware on its
+    Starlette sub-app, so we add the headers inline on the response.
+    """
+    from starlette.requests import Request
+    from starlette.responses import PlainTextResponse, Response
+
+    origin: str | None = None
+    if isinstance(request, Request):
+        origin = request.headers.get("origin")
+    cors_headers = _cors_headers_for(origin)
+
+    method = request.method if isinstance(request, Request) else "GET"
+    if method == "OPTIONS":
+        return Response(status_code=204, headers=cors_headers)
+    return PlainTextResponse("ok", status_code=200, headers=cors_headers)
 
 
 # Import the tools module for its decorator side effects. This must
