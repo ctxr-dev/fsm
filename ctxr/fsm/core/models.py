@@ -380,6 +380,7 @@ class Worker(BaseModel):
     prompt_template_language: str | None = None
     inputs: list[str] = Field(default_factory=list)
     response_schema: ResponseSchema | None = None
+    inputs_schema: ResponseSchema | None = None
 
     @field_validator("role", "prompt_template")
     @classmethod

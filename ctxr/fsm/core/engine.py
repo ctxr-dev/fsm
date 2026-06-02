@@ -70,6 +70,11 @@ from ctxr.fsm.core.predicates import (
     evaluate_expression,
     validate_expression,
 )
+from ctxr.fsm.core.prompts import (
+    PromptContext,
+    PromptRenderer,
+    needs_rendering,
+)
 
 __all__ = [
     "EngineAdvanceResult",
@@ -85,6 +90,84 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # UUIDv7 helper (graceful fallback)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Prompt rendering (W23f integration)
+# ---------------------------------------------------------------------------
+
+
+# Cache of rendered prompt strings keyed by (spec.id, state.id, iteration?).
+# The cache exists so re-entering a state (or iterating a loop) does not
+# re-parse the same template. We key on the raw template text under the
+# (spec, state) tuple so a spec mutation that swaps the template body
+# automatically invalidates the cached entry. Loop bodies share their
+# loop state's id, so per-iteration env differences are reflected by
+# always recomputing the runtime context but only re-using the parsed
+# Jinja template; the renderer itself owns Jinja parsing reuse via its
+# SandboxedEnvironment cache, so this dict is a lightweight per-state
+# guard against re-walking the needs_rendering precheck or re-allocating
+# the PromptRenderer.
+_PROMPT_RENDERER: PromptRenderer | None = None
+_RENDER_CACHE: dict[tuple[str, str, str], str] = {}
+
+
+def _get_prompt_renderer() -> PromptRenderer:
+    """Return the module-level :class:`PromptRenderer` (lazy init)."""
+    global _PROMPT_RENDERER
+    if _PROMPT_RENDERER is None:
+        _PROMPT_RENDERER = PromptRenderer()
+    return _PROMPT_RENDERER
+
+
+def _maybe_render_prompt(
+    spec: FsmSpec,
+    state: State,
+    worker: Worker,
+    env: dict[str, Any],
+    iteration_n: int | None,
+) -> Worker:
+    """Return ``worker`` with a rendered ``prompt_template`` if needed.
+
+    A worker whose template contains no Jinja markers passes through
+    untouched (the renderer is never invoked). Otherwise, the template
+    is rendered through the shared :class:`PromptRenderer` with a
+    :class:`PromptContext` populated from the spec, state, worker, and
+    runtime env. The rendered string replaces the template on a
+    ``model_copy`` clone so the original spec object remains immutable.
+    """
+    template = worker.prompt_template
+    if not needs_rendering(template):
+        return worker
+
+    cache_key = (spec.id, state.id, template)
+    cached = _RENDER_CACHE.get(cache_key)
+    if cached is None:
+        renderer = _get_prompt_renderer()
+        context = PromptContext(
+            spec_slug=spec.id,
+            spec_version=spec.version,
+            state_id=state.id,
+            state_kind=state.kind.value,
+            response_schema=(
+                worker.response_schema.schema_
+                if worker.response_schema is not None
+                else None
+            ),
+            inputs_schema=(
+                worker.inputs_schema.schema_
+                if worker.inputs_schema is not None
+                else None
+            ),
+            allowed_tools=list(state.allowed_tools),
+            iteration_n=iteration_n,
+            args=dict(env),
+            metadata={},
+        )
+        cached = renderer.render(template, context)
+        _RENDER_CACHE[cache_key] = cached
+
+    return worker.model_copy(update={"prompt_template": cached})
 
 
 def _new_brief_id() -> uuid.UUID:
@@ -201,6 +284,7 @@ def build_brief(
     inputs: dict[str, Any]
     outputs_path: str | None = None
     effective_iteration: int | None = None
+    loop_for_brief: Loop | None = state.loop
 
     if is_loop:
         loop: Loop = state.loop  # type: ignore[assignment]
@@ -218,6 +302,23 @@ def build_brief(
             inputs = {}
             has_worker = False
 
+    # W23f: render the worker's prompt template through the sandboxed
+    # PromptRenderer when it carries Jinja constructs. Plain prompts
+    # pass through verbatim with zero overhead. For loop states the
+    # rendered worker is mirrored back onto a Loop.model_copy clone so
+    # the brief's `loop` field exposes the same rendered prompt as its
+    # top-level `worker` field, so consumers reading either surface see a
+    # consistent rendered template.
+    if worker is not None:
+        rendered_worker = _maybe_render_prompt(
+            spec, state, worker, env, effective_iteration
+        )
+        worker = rendered_worker
+        if is_loop and loop_for_brief is not None:
+            loop_for_brief = loop_for_brief.model_copy(
+                update={"worker": rendered_worker}
+            )
+
     return Brief(
         run_id=run_id,
         fsm_id=spec.id,
@@ -232,7 +333,7 @@ def build_brief(
         has_loop=is_loop,
         allowed_tools=list(state.allowed_tools),
         worker=worker,
-        loop=state.loop,
+        loop=loop_for_brief,
         # W23g: surface the gate body when this state is a gate state.
         # The engine pause-on-gate dispatch + fsm.resolve_gate MCP tool
         # consume this in a follow-up commit; the brief surface is
