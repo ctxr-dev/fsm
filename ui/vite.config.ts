@@ -7,6 +7,11 @@ const apiPort = process.env.VITE_API_PORT ?? '8765';
 export default defineConfig({
   plugins: [preact(), tailwindcss()],
   server: {
+    // Vite 8's default bind on GitHub Ubuntu runners can advertise
+    // 'localhost' as IPv6 ::1 only, while the supervisor + Playwright
+    // probe 127.0.0.1. Pin to IPv4 loopback so all readiness checks
+    // hit the same socket the dev server is actually listening on.
+    host: '127.0.0.1',
     port: 5173,
     proxy: {
       '/api/v1': {
