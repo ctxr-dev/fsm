@@ -469,15 +469,33 @@ export function Runs(): JSX.Element {
   );
 
   // Options for the multiselect: every spec in the resolver, sorted
-  // by slug + version desc. We derive afresh whenever the resolver
-  // populates so the dropdown reflects every spec the project has
-  // registered.
+  // by slug asc + numeric version desc. We derive afresh whenever the
+  // resolver populates so the dropdown reflects every spec the project
+  // has registered. Sorting on the rendered label string would
+  // lexicographically order "v10" before "v2"; sort on (slug, version)
+  // primitives so "code-reviewer v10" sits above "code-reviewer v2".
   const specOptions = useMemo(() => {
-    const out: Array<{ id: string; label: string; sub: string }> = [];
+    const out: Array<{
+      id: string;
+      label: string;
+      sub: string;
+      slug: string;
+      version: number;
+    }> = [];
     for (const [id, { slug, version }] of specResolver.entries()) {
-      out.push({ id, label: `${slug} v${version}`, sub: id.slice(0, 12) + '…' });
+      out.push({
+        id,
+        label: `${slug} v${version}`,
+        sub: id.slice(0, 12) + '…',
+        slug,
+        version,
+      });
     }
-    out.sort((a, b) => a.label.localeCompare(b.label));
+    out.sort((a, b) => {
+      const bySlug = a.slug.localeCompare(b.slug);
+      if (bySlug !== 0) return bySlug;
+      return b.version - a.version;
+    });
     return out;
   }, [specResolver]);
 

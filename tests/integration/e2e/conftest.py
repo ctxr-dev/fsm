@@ -187,16 +187,12 @@ def live_project(tmp_path_factory: pytest.TempPathFactory) -> Generator[LiveProj
         # ensure reports subsystems as "spawned" once the child
         # process is alive, but Vite + uvicorn need a moment more
         # before they accept connections. Poll healthz before
-        # handing off to tests.
-        #
-        # 60s for the Vite probe: cold first-request compile on a
-        # GH-hosted runner (no warmed Vite optimise cache, no mmap
-        # warm on node_modules) routinely exceeds the old 20s window;
-        # the workflow ran into ConnectionRefusedError at exactly the
-        # 20s mark across all 5 e2e tests. Poll cadence is 100ms, so
-        # a healthy local boot still hands off in <2s — the new
-        # budget only bites on cold CI starts.
-        _wait_for_url(f"{api_url}/healthz", timeout_s=30.0)
+        # handing off to tests. The Vite cold-start budget on a
+        # GitHub-hosted Ubuntu runner is regularly 25 to 40 seconds
+        # (npm spawn + vite plugin graph + first dep-optimise pass),
+        # so the 20s budget that worked locally was racing CI. 60s
+        # gives headroom without masking a genuine launch failure.
+        _wait_for_url(f"{api_url}/healthz", timeout_s=60.0)
         _wait_for_url(ui_url, timeout_s=60.0)
         yield LiveProject(
             project_root=project_root,
