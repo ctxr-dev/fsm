@@ -20,8 +20,9 @@ This module lets a spec author embed typed references inside the prompt:
 
 The renderer runs inside :class:`jinja2.sandbox.SandboxedEnvironment` so
 arbitrary attribute traversal and Python-eval style escapes are blocked.
-Templates that do NOT contain ``{{`` skip the renderer entirely, so the
-overwhelming majority of existing specs pay zero overhead.
+Templates that do NOT contain either ``{{`` or ``{%`` skip the renderer
+entirely (see :func:`needs_rendering`), so the overwhelming majority of
+existing specs pay zero overhead.
 
 The same renderer powers register-time validation: every Jinja template
 in a spec is parsed (Jinja syntax errors surface immediately) and
@@ -132,7 +133,14 @@ def _filter_json(value: Any) -> str:
     if value is None:
         return "null"
     if isinstance(value, BaseModel):
-        return value.model_dump_json(indent=2)
+        # model_dump_json does not sort keys; route through model_dump so
+        # the BaseModel branch matches the dict branch byte-for-byte.
+        return json.dumps(
+            value.model_dump(mode="json"),
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
     return json.dumps(value, indent=2, sort_keys=True, default=str)
 
 
@@ -222,8 +230,12 @@ def _filter_fields_table(value: Any) -> str:
     else:
         return "| (no fields available) |\n| --- |"
 
-    if "schema_" in schema and isinstance(schema["schema_"], Mapping):
-        schema = schema["schema_"]
+    # Match _filter_typescript: ResponseSchema serialises to ``schema_``
+    # with by_alias=False and ``schema`` with by_alias=True.
+    for key in ("schema_", "schema"):
+        if key in schema and isinstance(schema[key], Mapping):
+            schema = schema[key]
+            break
 
     props: Mapping[str, Any] = schema.get("properties") or {}
     required: set[str] = set(schema.get("required") or [])
@@ -297,12 +309,22 @@ class PromptRenderer:
                 f"spec.model could not import '{module_path}': {exc}"
             ) from exc
         try:
-            return getattr(module, attr)
+            obj = getattr(module, attr)
         except AttributeError as exc:
             raise PromptRenderError(
                 f"spec.model('{path}') resolved module '{module_path}' but it has no "
                 f"attribute '{attr}'"
             ) from exc
+        # Without this guard spec.model() is a general-purpose import
+        # primitive (e.g. ``spec.model(path='os.environ')`` leaks process
+        # env). Constrain the surface to Pydantic model classes, which is
+        # the only shape the registered filters know how to render.
+        if not (isinstance(obj, type) and issubclass(obj, BaseModel)):
+            raise PromptRenderError(
+                f"spec.model('{path}') resolved to {type(obj).__name__!s}, "
+                "but only pydantic BaseModel subclasses are allowed"
+            )
+        return obj
 
     def _build_jinja_context(self, context: PromptContext) -> dict[str, Any]:
         spec_ns = {
