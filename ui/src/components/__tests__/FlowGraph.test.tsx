@@ -30,6 +30,7 @@ vi.mock('@xyflow/react', () => ({
   Position: { Left: 'left', Right: 'right', Top: 'top', Bottom: 'bottom' },
   BackgroundVariant: { Dots: 'dots', Lines: 'lines', Cross: 'cross' },
   MarkerType: { ArrowClosed: 'arrowclosed', Arrow: 'arrow' },
+  PanOnScrollMode: { Free: 'free', Vertical: 'vertical', Horizontal: 'horizontal' },
 }));
 vi.mock('@xyflow/react/dist/style.css', () => ({}));
 
@@ -136,7 +137,15 @@ describe('FlowGraph', () => {
     expect(queryByTestId('controls')).toBeNull();
   });
 
-  test('decorateEdges truncates labels longer than LABEL_MAX_CHARS', () => {
+  test('W23b: decorateEdges preserves full label text (FsmEdge handles wrap + tooltip)', () => {
+    // Pre-W23b, FlowGraph pre-truncated visible edge labels to 28
+    // chars with an ellipsis. The user flagged the truncation as a
+    // regression (long predicates rendered as "tier == 'trivial' AND
+    // l..." with no way to read the rest without opening the
+    // inspector). The fix moves visual presentation responsibility to
+    // FsmEdge: a 280px max-width pill with break-words wrapping, plus
+    // a hover Tooltip for the full text. decorateEdges therefore now
+    // passes the original label through unchanged.
     const nodes: Node<FlowNodeData>[] = [
       { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
       { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
@@ -147,9 +156,9 @@ describe('FlowGraph', () => {
     render(<FlowGraph nodes={nodes} edges={edges} autoLayout={false} />);
     const decorated = lastReactFlowProps!.edges as Edge[];
     const lbl = decorated[0].label as string;
-    expect(lbl.length).toBeLessThanOrEqual(28);
-    expect(lbl.endsWith('…')).toBe(true);
-    expect(longLabel.startsWith(lbl.slice(0, -1))).toBe(true);
+    expect(lbl).toBe(longLabel);
+    // Confirm the legacy ellipsis suffix (U+2026) is no longer applied.
+    expect(lbl.endsWith('…')).toBe(false);
   });
 
   test('decorateEdges leaves short labels untouched', () => {
@@ -254,8 +263,9 @@ describe('FlowGraph', () => {
     expect(decorated[0].data?.fullLabel).toBe(fullPredicate);
     expect(decorated[0].data?.sourceId).toBe('a');
     expect(decorated[0].data?.targetId).toBe('b');
-    // The visible label is truncated but the full text is preserved on data.
-    expect((decorated[0].label as string).length).toBeLessThanOrEqual(28);
+    // W23b: full text is preserved on BOTH the visible label and
+    // data.fullLabel; FsmEdge handles wrap + tooltip.
+    expect(decorated[0].label).toBe(fullPredicate);
   });
 
   test('W21: FlowGraph registers fsmEdge as a custom edge type', () => {
