@@ -237,10 +237,10 @@ def live_project(tmp_path_factory: pytest.TempPathFactory) -> Generator[LiveProj
         # before they accept connections. On CI cold-start Vite's
         # npm child has to run ``npm ci`` + the esbuild dependency
         # prebundle before binding its port, which routinely takes
-        # 30-60s; bump the UI budget to 90s and surface the
-        # supervisor log tails in the timeout error so a real Vite
-        # crash is visible in the failure diagnostics (rather than
-        # just a generic ConnectionRefused).
+        # 30 to 60 seconds; bump the UI budget to 90s and surface
+        # the supervisor log tails in the timeout error so a real
+        # Vite crash is visible in the failure diagnostics (rather
+        # than just a generic ConnectionRefused).
         _wait_for_url(
             f"{api_url}/healthz",
             timeout_s=60.0,
