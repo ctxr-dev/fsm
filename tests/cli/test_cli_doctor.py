@@ -358,3 +358,25 @@ def test_doctor_with_skill_consumer_flag_reports_all_docs_present() -> None:
             entry = section["ssot_docs"][slug]
             assert entry["exists"] is True
             assert entry["path"].endswith(".md")
+
+
+def test_doctor_pretty_with_skill_consumer_flag_renders_summary_line() -> None:
+    """Pretty mode must surface the ``skill_consumer`` readiness line.
+
+    Without this assertion, ``--skill-consumer`` would silently no-op
+    outside ``--json`` mode — exactly the regression the W23-SSOT
+    review flagged. The happy-path install has every pillar present,
+    so the line reads ``skill_consumer: OK (N/N pillars resolved)``.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "fsm.db"
+        _init_project(db_path)
+
+        result = runner.invoke(
+            app, ["doctor", "--db", str(db_path), "--skill-consumer"]
+        )
+
+        assert result.exit_code == 0, result.stderr
+        assert "skill_consumer" in result.stdout
+        assert "OK" in result.stdout
+        assert "pillars resolved" in result.stdout

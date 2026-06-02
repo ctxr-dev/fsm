@@ -362,8 +362,18 @@ def _skill_consumer_report() -> dict[str, Any]:
           "principles_path": str,
           "bootstrap_path": str,
           "ssot_docs": {<slug>: {"path": str, "exists": bool}, ...},
-          "missing": [<slug>, ...],
+          "missing": [<slug>, ...],   # slugs only, e.g. "principles",
+                                      # "bootstrap", "agent_quickstart"
         }
+
+    The ``missing`` list is uniform: every entry is a short slug, not a
+    filename. Skills script against this list (``if "agent_quickstart"
+    in section["missing"]: ...``) so mixing slug + filename vocabularies
+    would make consumers special-case the "principles" / "bootstrap"
+    entries. The two non-SSOT pillars use the slugs ``"principles"`` and
+    ``"bootstrap"``; the SSOT pillars use whatever
+    :func:`list_ssot_doc_slugs` returns (``"agent_quickstart"``,
+    ``"skill_template"``, ``"gate_contract"``).
     """
 
     missing: list[str] = []
@@ -376,11 +386,11 @@ def _skill_consumer_report() -> dict[str, Any]:
     try:
         out["principles_path"] = str(get_principles_path("claude"))
     except FileNotFoundError:
-        missing.append("principles.claude.md")
+        missing.append("principles")
     try:
         out["bootstrap_path"] = str(get_bootstrap_path())
     except FileNotFoundError:
-        missing.append("bootstrap.md")
+        missing.append("bootstrap")
 
     for slug in list_ssot_doc_slugs():
         entry: dict[str, Any] = {"path": None, "exists": False}
@@ -404,6 +414,7 @@ def _print_pretty_report(
     revision: str | None,
     supervisor: dict[str, Any],
     supervisor_root: Path,
+    skill_consumer: dict[str, Any] | None = None,
 ) -> None:
     """Render the W14j Rich panel + subsystem table to stdout.
 
@@ -412,6 +423,13 @@ def _print_pretty_report(
     and that migrations are current. The table below sources its
     rows from :func:`_active_mcp_for_table` so the column shape is
     byte-identical to ``ctxr-fsm ensure`` and the supervisor banner.
+
+    When ``skill_consumer`` is provided (operator passed
+    ``--skill-consumer``), a one-line readiness summary is printed
+    underneath the subsystem table so the pretty surface mirrors the
+    information already in the ``--json`` envelope. Without this the
+    flag would be a silent no-op outside JSON mode — surfacing a stale
+    install only when an operator happens to inspect the JSON.
     """
     console = Console()
     db_repr = portable_project_repr(db_path)
@@ -430,6 +448,26 @@ def _print_pretty_report(
             project_root=supervisor_root,
         )
     )
+    if skill_consumer is not None:
+        # Total pillars = principles + bootstrap + every SSOT slug. We
+        # count from the section payload itself (rather than re-deriving)
+        # so the line stays in sync if the SSOT slug list grows.
+        ssot_docs = skill_consumer.get("ssot_docs") or {}
+        total = 2 + len(ssot_docs)
+        missing = skill_consumer.get("missing") or []
+        resolved = total - len(missing)
+        status = skill_consumer.get("status") or "unknown"
+        if status == "ok":
+            console.print(
+                f"[green]skill_consumer:[/green] OK "
+                f"({resolved}/{total} pillars resolved)"
+            )
+        else:
+            slug_list = ", ".join(missing) if missing else "(unknown)"
+            console.print(
+                f"[red]skill_consumer:[/red] missing_docs "
+                f"({resolved}/{total} pillars resolved; missing: {slug_list})"
+            )
 
 
 def doctor(
@@ -513,4 +551,5 @@ def doctor(
         revision=revision,
         supervisor=supervisor,
         supervisor_root=supervisor_root,
+        skill_consumer=report.get("skill_consumer") if skill_consumer else None,
     )

@@ -123,7 +123,9 @@ Run via `uv run python -m my_skill.install`. Idempotent (registering the same sp
 
 ## SKILL.md — orchestrator preamble
 
-```markdown
+The outer fence below uses four backticks so the inner ```bash``` block (and the YAML frontmatter delimiters) render verbatim inside the example. Reduce to three backticks only after stripping every nested fenced block.
+
+````markdown
 ---
 name: my-skill
 requires:
@@ -152,7 +154,7 @@ Drive the run via the fsm.* MCP tool family per [`@.ctxr-fsm/memory/AGENT_QUICKS
 2. Loop: if `brief.terminal == true`, stop. Otherwise dispatch a sub-agent with `brief.worker.prompt_template` + `brief.inputs`; call `fsm.commit_outputs(run_id, outputs, signature)`; repeat.
 3. Inline states advance server-side without a brief surfacing to you.
 4. On error envelopes, follow Principle 4 in `principles.md`.
-```
+````
 
 ## tests/
 
