@@ -106,8 +106,22 @@ def _resolve_stdio_entry() -> dict[str, Any]:
        launches with a different cwd / PATH still ends up running the
        correct binary against the project's pinned environment.
     2. Otherwise, write the absolute resolved path of the current
-       ``ctxr-fsm`` console script (``sys.argv[0]``), so clients can
-       launch it regardless of their inherited PATH.
+       ``ctxr-fsm`` console script. We use ``sys.argv[0]`` only when
+       it already points at an existing file (e.g. a uv-run invocation
+       that bypassed the ``uv`` branch above, or a direct call against
+       the venv's ``.venv/bin/ctxr-fsm``). For the common pipx /
+       global-install case, ``sys.argv[0]`` is the bare name
+       ``ctxr-fsm`` — resolving that with :meth:`Path.resolve` would
+       produce ``<cwd>/ctxr-fsm``, a path that does not exist on the
+       operator's machine. To avoid persisting that broken absolute
+       path into long-lived client configs (which would reintroduce
+       the unreachable-MCP regression this whole resolver guards
+       against), we fall back to :func:`shutil.which` to discover
+       where the installed console script actually lives.
+    3. If neither path produces a real file, raise
+       :class:`FileNotFoundError` — silently persisting an unreachable
+       command into Claude / Codex / Cursor configs is much worse than
+       a loud failure at install time.
 
     The Codex TOML emitter derives its own block from the returned
     dict so the two surfaces stay in lockstep.
@@ -124,13 +138,40 @@ def _resolve_stdio_entry() -> dict[str, Any]:
             "args": ["run", "ctxr-fsm", "mcp", "--transport", "stdio"],
             "env": {},
         }
-    # Fall back to the absolute resolved script path. ``sys.argv[0]``
-    # is the entry point name Typer was launched with; we resolve it
-    # so symlinks / relative invocations land on a canonical absolute
-    # location persisted into client configs.
-    argv0 = Path(sys.argv[0]).resolve() if sys.argv else Path("ctxr-fsm")
+
+    # Fall back to the absolute resolved script path.
+    resolved: Path | None = None
+    argv0_raw = sys.argv[0] if sys.argv else ""
+    if argv0_raw:
+        candidate = Path(argv0_raw)
+        # ``Path.is_file()`` against a relative path resolves against
+        # cwd, but we ONLY accept it when it is a real file at that
+        # location — for a bare console-script name like ``ctxr-fsm``
+        # this almost always returns False (no ``./ctxr-fsm`` in cwd),
+        # which is precisely the case that must fall through to
+        # ``shutil.which``.
+        if candidate.is_file():
+            resolved = candidate.resolve()
+
+    if resolved is None:
+        which_hit = shutil.which("ctxr-fsm")
+        if which_hit is not None:
+            resolved = Path(which_hit).resolve()
+
+    if resolved is None:
+        raise FileNotFoundError(
+            "Could not resolve a real filesystem path for the "
+            "ctxr-fsm console script — sys.argv[0]="
+            f"{argv0_raw!r} is not an existing file and "
+            "shutil.which('ctxr-fsm') returned None. Refusing to "
+            "persist an unreachable command into client MCP configs. "
+            "Install ctxr-fsm so the console script is on PATH "
+            "(e.g. `pipx install ctxr-fsm` or `uv tool install "
+            "ctxr-fsm`) and retry."
+        )
+
     return {
-        "command": str(argv0),
+        "command": str(resolved),
         "args": ["mcp", "--transport", "stdio"],
         "env": {},
     }

@@ -52,11 +52,18 @@ def test_find_alembic_ini_prefers_bundled_copy_when_present(
     bundled = tmp_path / "ctxr" / "fsm" / "_alembic" / "alembic.ini"
     bundled.parent.mkdir(parents=True)
     bundled.write_text("[alembic]\nscript_location = %(here)s/migrations\n")
+    # alembic.ini's script_location points at a sibling migrations/
+    # directory — without it the resolver MUST refuse the bundled copy
+    # (otherwise Alembic would fail later, defeating the purpose of
+    # this resolver). Pin the real runtime requirement by creating it.
+    (bundled.parent / "migrations").mkdir()
 
     # Also place a decoy alembic.ini up the walk-up tree so the test
-    # proves the bundled copy is checked FIRST.
+    # proves the bundled copy is checked FIRST even when the walk-up
+    # candidate is otherwise valid (has its own sibling migrations/).
     decoy = tmp_path / "alembic.ini"
     decoy.write_text("[alembic]\n# decoy\n")
+    (tmp_path / "migrations").mkdir()
 
     monkeypatch.setattr(
         "ctxr.fsm.sqlite.project.__file__", str(fake_project_py)
