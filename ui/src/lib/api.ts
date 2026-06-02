@@ -618,8 +618,9 @@ export class ApiClient {
       try {
         parsed = JSON.parse(rawText);
       } catch {
-        // Non-JSON body — keep ``parsed`` as undefined and surface the
-        // raw text via the error path below if the response failed.
+        // Non-JSON body: assign the raw text to ``parsed`` (as a string) so the
+        // error path below can surface it via ApiError when the response failed,
+        // and flip ``parseFailed`` so success-path callers can shape-guard.
         parsed = rawText;
         parseFailed = true;
       }
