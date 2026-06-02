@@ -92,13 +92,58 @@ def _run_ensure(project_root: Path, timeout_s: float = 60.0) -> dict:
     return json.loads(result.stdout)
 
 
-def _wait_for_url(url: str, *, timeout_s: float, accept_status_below: int = 500) -> None:
+def _read_supervisor_logs(project_root: Path, *, tail_bytes: int = 32_768) -> str:
+    """Return the tail of the supervisor log dir, joined for diagnostics.
+
+    The supervisor forwards each child's stdout/stderr to its own
+    stderr with a ``[ctxr-fsm supervisor]`` / ``[<child>]`` prefix and
+    persists rotating files under ``.ctxr-fsm/logs/``. On CI we can
+    only see what we print, so when a wait-for-url times out we dump
+    the tail of every log file so the failure is diagnosable instead
+    of opaque (the symptom was ``ConnectionRefusedError`` without any
+    hint about whether npm crashed, Vite was still pre-bundling, or
+    the port was simply taken).
+    """
+    logs_dir = project_root / ".ctxr-fsm" / "logs"
+    if not logs_dir.is_dir():
+        return f"<no supervisor logs at {logs_dir}>"
+    chunks: list[str] = []
+    for log_file in sorted(logs_dir.glob("*.log")):
+        try:
+            with log_file.open("rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                start = max(0, size - tail_bytes)
+                fh.seek(start)
+                blob = fh.read().decode("utf-8", errors="replace")
+        except OSError as exc:
+            chunks.append(f"--- {log_file.name} (unreadable: {exc!r}) ---")
+            continue
+        chunks.append(f"--- {log_file.name} (tail {len(blob)}B) ---\n{blob}")
+    if not chunks:
+        return f"<supervisor logs dir {logs_dir} is empty>"
+    return "\n".join(chunks)
+
+
+def _wait_for_url(
+    url: str,
+    *,
+    timeout_s: float,
+    accept_status_below: int = 500,
+    project_root: Path | None = None,
+) -> None:
     """Poll ``url`` until it returns < ``accept_status_below`` or timeout.
 
     Vite's dev server and uvicorn typically need 1-3s after the
     supervisor reports them as "spawned" before they actually accept
     sockets. The Vite ready signal in particular is asynchronous to
-    the child-process PID being live. We poll on a 100ms cadence.
+    the child-process PID being live, and on a GH-hosted runner cold
+    start (first esbuild prebundle + uvicorn import-graph priming)
+    the wait can routinely exceed 20s. We poll on a 100ms cadence.
+
+    On timeout, if ``project_root`` is provided, dump the tail of the
+    supervisor log files so a CI failure is diagnosable instead of
+    surfacing only ``ConnectionRefusedError``.
     """
     deadline = time.monotonic() + timeout_s
     last_error: Exception | None = None
@@ -110,9 +155,12 @@ def _wait_for_url(url: str, *, timeout_s: float, accept_status_below: int = 500)
         except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
             last_error = exc
         time.sleep(0.1)
+    diag = ""
+    if project_root is not None:
+        diag = "\n--- supervisor logs ---\n" + _read_supervisor_logs(project_root)
     raise TimeoutError(
         f"timed out after {timeout_s}s waiting for {url} "
-        f"(last error: {last_error!r})"
+        f"(last error: {last_error!r}){diag}"
     )
 
 
@@ -188,8 +236,19 @@ def live_project(tmp_path_factory: pytest.TempPathFactory) -> Generator[LiveProj
         # process is alive, but Vite + uvicorn need a moment more
         # before they accept connections. Poll healthz before
         # handing off to tests.
-        _wait_for_url(f"{api_url}/healthz", timeout_s=20.0)
-        _wait_for_url(ui_url, timeout_s=20.0)
+        # 60s ceiling: Vite cold start on GH-hosted runners with a
+        # first-time esbuild prebundle + uvicorn import-graph priming
+        # routinely exceeds the old 20s window. The poll cadence is
+        # 100ms, so a healthy local boot still hands off in under 2s;
+        # the budget only bites on CI cold starts. Pass
+        # ``project_root`` so timeouts dump the supervisor log tail
+        # (npm/Vite/uvicorn stderr forwarded via the supervisor) into
+        # the failure message — opaque ``ConnectionRefusedError`` is
+        # what made the original CI flake un-diagnosable.
+        _wait_for_url(
+            f"{api_url}/healthz", timeout_s=60.0, project_root=project_root
+        )
+        _wait_for_url(ui_url, timeout_s=60.0, project_root=project_root)
         yield LiveProject(
             project_root=project_root,
             api_url=api_url,
