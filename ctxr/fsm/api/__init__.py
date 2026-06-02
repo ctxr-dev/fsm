@@ -185,11 +185,19 @@ app: FastAPI = FastAPI(
 # ``localhost`` / ``127.0.0.1``) so the e2e harness, which spawns the
 # UI on an ephemeral port, can reach the API's ``/healthz`` from the
 # browser without each test having to wire ``$CTXR_FSM_API_CORS_ORIGINS``
-# per-port. Production stays locked down to the explicit allowlist.
+# per-port. The regex is enabled only when ``CTXR_FSM_API_TOKEN`` is
+# unset (dev mode) so production — which always sets the token — stays
+# locked down to the explicit allowlist and does not silently broaden
+# its CORS policy to every loopback caller.
+_loopback_regex: str | None = (
+    r"^http://(localhost|127\.0\.0\.1)(:\d+)?$"
+    if not os.environ.get("CTXR_FSM_API_TOKEN")
+    else None
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_resolve_cors_origins(),
-    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_origin_regex=_loopback_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
