@@ -55,6 +55,7 @@ import {
   FilterChips,
   JsonViewer,
   Pill,
+  RunProgressGraph,
   Spinner,
   Timeline,
   Tree,
@@ -815,6 +816,25 @@ export function RunDetailRoute(): JSX.Element {
         onClear={clearAllFilters}
         ariaLabel="Run filters"
       />
+
+      {/* ----------------------------------------------------------------
+          Progress graph (W22b4) — spec topology overlaid with the
+          run's actual traversal. Lives above the three-pane grid so it
+          gets full viewport width on every breakpoint. When the run
+          hasn't entered any states yet, the graph renders the full
+          spec topology with every node tagged ``not_visited`` (greyed)
+          so the operator sees what the run is ABOUT to do rather
+          than a blank pane. The only EmptyState branch inside
+          RunProgressGraph fires when the spec itself declares zero
+          states.
+          ---------------------------------------------------------------- */}
+      {run ? (
+        <RunProgressGraph
+          manifest={run.manifest}
+          stateTree={stateTree}
+          events={events}
+        />
+      ) : null}
 
       {/* ----------------------------------------------------------------
           Three-pane grid

@@ -62,3 +62,6 @@ export type { TooltipProps, TooltipPlacement } from './Tooltip';
 
 export { Pagination } from './Pagination';
 export type { PaginationPage, PaginationProps } from './Pagination';
+
+export { RunProgressGraph } from './RunProgressGraph';
+export type { RunProgressGraphProps } from './RunProgressGraph';
