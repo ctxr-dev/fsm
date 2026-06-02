@@ -136,7 +136,9 @@ def _seed_spec(db_path, slug: str) -> str:
     project = Project.open(db_path)
     try:
         registered = project.register_spec(_spec(slug))
-        return registered.id
+        # SpecRegistered wraps RegisteredSpec under .spec — the .id is
+        # the row id used by the UI router (specs.tsx onRowClick).
+        return registered.spec.id
     finally:
         project.close()
 
@@ -185,11 +187,13 @@ def test_specs_route_empty_state_no_js_errors(
         f"expected empty items[] after clear, got {body[:200]}"
     )
 
-    page.goto(f"{live_project.ui_url}/specs", wait_until="networkidle")
+    # networkidle is unreliable here: InfoTopBar polls /healthz and the
+    # specs hook can fire follow-up paginated requests, so the network
+    # never quiesces inside Playwright's 30s budget. Wait for DOM ready
+    # and then for the route headline to be visible.
+    page.goto(f"{live_project.ui_url}/specs", wait_until="domcontentloaded")
+    page.locator("h1", has_text="Specs").wait_for(timeout=15000)
 
-    # The empty-state copy from specs.tsx — "No specs registered" /
-    # "ctxr-fsm spec register". Either substring is fine; we want the
-    # operator-facing hint visible, not a stack trace.
     body_text = page.locator("body").inner_text(timeout=5000)
     assert "No specs registered" in body_text or "spec register" in body_text, (
         f"expected empty-state copy on /specs; got body:\n{body_text[:500]}"
@@ -215,7 +219,11 @@ def test_specs_route_seeded_renders_specs_with_run_counts(
     _seed_run(db_path, "e2e-specs-alpha")
     _seed_run(db_path, "e2e-specs-beta")
 
-    page.goto(f"{live_project.ui_url}/specs", wait_until="networkidle")
+    page.goto(f"{live_project.ui_url}/specs", wait_until="domcontentloaded")
+    page.locator("h1", has_text="Specs").wait_for(timeout=15000)
+    # Wait for at least one seeded row to render so we don't race the
+    # async list fetch; InfoTopBar polling keeps networkidle out of reach.
+    page.locator("tr", has_text="e2e-specs-alpha").first.wait_for(timeout=10000)
 
     body_text = page.locator("body").inner_text(timeout=5000)
     assert "e2e-specs-alpha" in body_text, (
@@ -235,7 +243,8 @@ def test_specs_route_row_click_navigates_to_detail(
     _clear_project(db_path)
     spec_id = _seed_spec(db_path, "e2e-specs-navtest")
 
-    page.goto(f"{live_project.ui_url}/specs", wait_until="networkidle")
+    page.goto(f"{live_project.ui_url}/specs", wait_until="domcontentloaded")
+    page.locator("h1", has_text="Specs").wait_for(timeout=15000)
 
     # Find the row that contains the slug text and click it. The
     # Table component (ui/src/components/Table.tsx) renders each row
@@ -246,11 +255,13 @@ def test_specs_route_row_click_navigates_to_detail(
 
     # After click the route navigates via navigateTo() at specs.tsx:125
     # which does pushState + dispatch popstate. Wait for the URL to
-    # change rather than the body — body has loading shim first.
+    # change rather than the body; body has a "Loading spec" shim first.
     page.wait_for_url(f"**/specs/{spec_id}", timeout=5000)
 
-    # Detail header should render the slug as part of its title; the
-    # exact copy lives in specDetail.tsx and may carry a version pill.
+    # Wait for the slug to actually appear (detail finished loading);
+    # otherwise we race the async spec fetch and read the loading shim.
+    page.locator("body", has_text="e2e-specs-navtest").wait_for(timeout=10000)
+
     body_text = page.locator("body").inner_text(timeout=5000)
     assert "e2e-specs-navtest" in body_text, (
         f"detail page should show the slug; got: {body_text[:500]}"

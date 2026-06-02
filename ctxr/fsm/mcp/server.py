@@ -377,6 +377,13 @@ def main(
                     "http://localhost:5173",
                     "http://127.0.0.1:5173",
                 ],
+                # Supervisor-launched Vite uses an ephemeral port
+                # (e2e always does), so the static 5173 allowlist
+                # misses every local UI run that picked a different
+                # port. Match any loopback origin on any port so
+                # InfoTopBar's /healthz probe never console-errors.
+                # Remote origins remain off-limits.
+                allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
                 allow_credentials=True,
                 allow_methods=["*"],
                 allow_headers=["*"],

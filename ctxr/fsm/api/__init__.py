@@ -183,6 +183,12 @@ app: FastAPI = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_resolve_cors_origins(),
+    # Supervisor-launched Vite uses an ephemeral port (and e2e
+    # always does), so the static 5173 allowlist would miss every
+    # local UI run that picked a different port. Match any loopback
+    # origin on any port; remote origins still have to be on the
+    # explicit allowlist above.
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
