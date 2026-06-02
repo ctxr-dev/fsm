@@ -121,15 +121,21 @@ export function buildRunOverlay(
   for (const entry of entries) {
     const stateId = entry.state_id;
     const prev = statusByStateId.get(stateId) ?? 'not_visited';
-    // StateNode.status is one of "entered" / "exited" / "faulted"
-    // (StateStatus enum). Fall back to "entered" on unknown values so
-    // the visualisation still renders something.
+    // Derive entered/exited from ``exited_at`` (the timestamp is the
+    // engine's source of truth: null = still active; non-null = the
+    // engine has moved on). Only the ``faulted`` status string is
+    // treated as a special case because the engine flags it
+    // explicitly and a faulted entry typically also carries a
+    // non-null exited_at. The earlier "fall back to entered on
+    // unknown values" shortcut misclassified any unrecognised /
+    // future status string as still-active (Copilot review on
+    // PR #62).
     const status: RunNodeStatus =
-      entry.status === 'exited'
-        ? 'exited'
-        : entry.status === 'faulted'
+      entry.status === 'faulted'
         ? 'faulted'
-        : 'entered';
+        : entry.exited_at === null
+        ? 'entered'
+        : 'exited';
     if (status === 'faulted' && faultedStateId === null) {
       faultedStateId = stateId;
     }
@@ -162,25 +168,14 @@ export function buildRunOverlay(
   };
 }
 
-/** Per-status visual treatment (border + background tints). */
-const STATUS_COLOURS: Record<RunNodeStatus, { border: string; bg: string }> = {
-  not_visited: {
-    border: '#94a3b8',
-    bg: 'rgba(241, 245, 249, 0.6)',
-  },
-  entered: {
-    border: '#f59e0b',
-    bg: 'rgba(254, 243, 199, 0.85)',
-  },
-  exited: {
-    border: '#10b981',
-    bg: 'rgba(209, 250, 229, 0.85)',
-  },
-  faulted: {
-    border: '#ef4444',
-    bg: 'rgba(254, 202, 202, 0.9)',
-  },
-};
+/**
+ * Per-status edge stroke colours. Node colours are owned by FsmNode
+ * (which switches Tailwind classes off ``data.runStatus`` /
+ * ``data.isCurrent``); this single source for the taken/untaken edge
+ * stroke means we don't have to duplicate the Tailwind class map.
+ */
+const TAKEN_EDGE_STROKE = '#10b981';
+const UNTAKEN_EDGE_STROKE = '#cbd5e1';
 
 /**
  * Apply the overlay to the base spec graph and return a new
@@ -203,7 +198,6 @@ export function overlayRunOnSpecGraph(
       overlay.currentStateId === stateId && baseStatus !== 'faulted'
         ? 'entered'
         : baseStatus;
-    const colours = STATUS_COLOURS[status];
     const isCurrent = overlay.currentStateId === stateId;
 
     // Compose the per-status badge prefix INTO ``data.label`` rather
@@ -226,6 +220,13 @@ export function overlayRunOnSpecGraph(
     const originalLabel =
       typeof node.data.label === 'string' ? node.data.label : '';
     const decoratedLabel = badge ? `${badge}${originalLabel}` : originalLabel;
+    // Status is conveyed via ``data.runStatus`` / ``data.isCurrent``
+    // — FsmNode (in FlowGraph.tsx) switches its Tailwind palette off
+    // them. We deliberately do NOT set ``node.style`` here: FsmNode
+    // renders its own padded/rounded card inside the React Flow node
+    // wrapper and ignores wrapper-level inline styles, so the earlier
+    // border/background/boxShadow on node.style produced no visible
+    // overlay (Copilot review on PR #62).
     return {
       ...node,
       data: {
@@ -237,14 +238,6 @@ export function overlayRunOnSpecGraph(
         runStatus?: RunNodeStatus;
         isCurrent?: boolean;
       },
-      style: {
-        ...(node.style ?? {}),
-        border: `2px solid ${colours.border}`,
-        background: colours.bg,
-        boxShadow: isCurrent
-          ? `0 0 0 4px ${colours.border}33, 0 8px 16px rgba(0,0,0,0.10)`
-          : '0 2px 6px rgba(0,0,0,0.06)',
-      },
     };
   });
 
@@ -255,7 +248,7 @@ export function overlayRunOnSpecGraph(
       animated: taken && overlay.currentStateId === edge.source,
       style: {
         ...(edge.style ?? {}),
-        stroke: taken ? '#10b981' : '#cbd5e1',
+        stroke: taken ? TAKEN_EDGE_STROKE : UNTAKEN_EDGE_STROKE,
         strokeWidth: taken ? 2.2 : 1.4,
         opacity: taken ? 1 : 0.55,
       },

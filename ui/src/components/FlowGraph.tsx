@@ -62,6 +62,15 @@ export interface FlowNodeData extends Record<string, unknown> {
    *  domain-agnostic for Topology / Drift consumers). Surfaced to
    *  onNodeClick so the caller can render an inspector Sheet. */
   state?: Record<string, unknown>;
+  /** W22b4 run-progress overlay: per-state run status set by
+   *  ``lib/runGraph.ts`` overlayRunOnSpecGraph. When present, FsmNode
+   *  switches its palette from NODE_KIND_CLASSES to NODE_STATUS_CLASSES
+   *  so the run-progress colour-coding reaches the rendered card.
+   *  Optional so Spec / Topology callers don't need to set it. */
+  runStatus?: 'not_visited' | 'entered' | 'exited' | 'faulted';
+  /** W22b4 run-progress overlay: true on the spec state the run is
+   *  currently sitting on. Adds an amber focus ring around the card. */
+  isCurrent?: boolean;
 }
 
 export interface FlowGraphProps {
@@ -116,6 +125,25 @@ const NODE_KIND_CLASSES: Record<FlowNodeKind, string> = {
     'border-cyan-500 bg-cyan-50 dark:bg-cyan-900/30 text-cyan-900 dark:text-cyan-100',
 };
 
+// W22b4 run-progress overlay palette. When a node carries
+// ``data.runStatus`` (set by ``lib/runGraph.ts``
+// overlayRunOnSpecGraph), this palette REPLACES NODE_KIND_CLASSES on
+// the inner card so the run-status colour-coding (amber = current /
+// entered, emerald = exited, red = fault, slate = pending) reaches
+// the rendered DOM. The kind chip at the top of the card stays so
+// worker / inline / terminal context is still visible. Mirrors the
+// RunProgressGraph legend pills.
+const NODE_STATUS_CLASSES: Record<string, string> = {
+  not_visited:
+    'border-slate-400 bg-slate-100 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 opacity-70',
+  entered:
+    'border-amber-500 bg-amber-50 dark:bg-amber-900/40 text-amber-900 dark:text-amber-100',
+  exited:
+    'border-emerald-500 bg-emerald-50 dark:bg-emerald-900/40 text-emerald-900 dark:text-emerald-100',
+  faulted:
+    'border-red-500 bg-red-50 dark:bg-red-900/40 text-red-900 dark:text-red-100',
+};
+
 function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<Node<FlowNodeData>>): JSX.Element {
   const kind = data.kind;
   // Handles are the connection anchors xyflow draws edges into.
@@ -140,6 +168,22 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
   // node shape, not going outside of it". Long ids (>~32 chars) still
   // truncate visually but their full text remains reachable via the
   // Tooltip wrapper.
+  //
+  // W22b4 overlay: when ``data.runStatus`` is set, NODE_STATUS_CLASSES
+  // takes precedence over NODE_KIND_CLASSES so the run-progress
+  // overlay's colour-coding actually reaches the rendered card.
+  // ``data.isCurrent`` adds an amber focus ring around the active
+  // state so it pops at any zoom level. Both fields are populated by
+  // ``lib/runGraph.ts``; spec / topology callers never set them, so
+  // the kind palette stays in charge there.
+  const runStatus = typeof data.runStatus === 'string' ? data.runStatus : undefined;
+  const isCurrent = data.isCurrent === true;
+  const paletteClass = runStatus
+    ? NODE_STATUS_CLASSES[runStatus] ?? NODE_KIND_CLASSES[kind]
+    : NODE_KIND_CLASSES[kind];
+  const currentRing = isCurrent
+    ? 'ring-2 ring-amber-400 ring-offset-2 ring-offset-white dark:ring-offset-slate-900'
+    : '';
   return (
     <div
       class={[
@@ -149,8 +193,9 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
         // three rows even breathing room instead of the previous
         // gap-0.5 which clustered them too tightly at the top.
         'flex flex-col gap-1 justify-center overflow-hidden',
-        NODE_KIND_CLASSES[kind],
+        paletteClass,
         selected ? 'ring-2 ring-emerald-400 ring-offset-1' : '',
+        currentRing,
       ].join(' ')}
       style={{ width: `${NODE_WIDTH}px`, minHeight: `${NODE_HEIGHT}px` }}
     >

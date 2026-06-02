@@ -87,15 +87,21 @@ export function RunProgressGraph({
 
   const specId = readSpecId(manifest);
 
-  // Spec fetch — once per (run, spec_id) tuple. The spec is immutable
-  // post-registration so we never need to re-fetch unless the run
-  // changes underneath us. Stale-state contract: when ``specId``
-  // changes (e.g. operator navigated to a different run via the
-  // sidebar), we CLEAR the previous spec immediately so the component
-  // re-renders the Spinner instead of briefly showing run B's
-  // topology overlaid on run A's spec. The fetch then resolves into
-  // the freshly-cleared state. The pre-fix draft kept the previous
-  // spec in state during the fetch, producing a wrong-run flash.
+  // Spec fetch — once per spec_id. The effect depends ONLY on
+  // ``specId``; listing ``spec?.spec_id`` in the deps would re-run
+  // the effect every time setSpec lands a new cache entry (which
+  // mutates spec?.spec_id), firing a redundant api.getSpec(specId)
+  // call for the same id we just fetched (Copilot review on PR #62).
+  // The early-return guard reads spec?.spec_id via closure but does
+  // NOT contribute to the dependency array — it's a no-op
+  // short-circuit, not a recompute trigger.
+  //
+  // Stale-state contract: when ``specId`` changes (e.g. operator
+  // navigated to a different run via the sidebar), we CLEAR the
+  // previous spec immediately so the component re-renders the
+  // Spinner instead of briefly showing run B's topology overlaid on
+  // run A's spec. The fetch then resolves into the freshly-cleared
+  // state.
   useEffect(() => {
     if (specId === null) return;
     if (spec?.spec_id === specId) return;
@@ -117,7 +123,8 @@ export function RunProgressGraph({
     return () => {
       cancelled = true;
     };
-  }, [specId, spec?.spec_id]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally exclude spec?.spec_id; see comment above
+  }, [specId]);
 
   const baseGraph = useMemo(() => {
     if (!spec) return null;
