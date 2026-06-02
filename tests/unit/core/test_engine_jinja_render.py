@@ -21,7 +21,6 @@ from uuid import uuid4
 
 import pytest
 
-from ctxr.fsm.core import engine as engine_mod
 from ctxr.fsm.core.engine import build_brief
 from ctxr.fsm.core.models import (
     FsmSpec,
@@ -95,17 +94,6 @@ def _spec_with_state(state: State) -> FsmSpec:
     return FsmSpec(id="render_spec", version=2, entry=state.id, states=[state])
 
 
-@pytest.fixture(autouse=True)
-def _reset_render_cache() -> None:
-    """Clear the engine's module-level render cache between tests.
-
-    The cache is keyed on (spec_id, state_id, template_text) so test
-    isolation is robust, but reusing identical (id, state, template)
-    triples across tests would otherwise leak rendered strings.
-    """
-    engine_mod._RENDER_CACHE.clear()
-
-
 # ---------------------------------------------------------------------------
 # Plain templates: renderer is never invoked
 # ---------------------------------------------------------------------------
@@ -148,10 +136,11 @@ def test_plain_template_passes_through_verbatim(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_plain_template_with_double_brace_lookalike_skipped() -> None:
-    # ``{{`` is the only Jinja marker we use to gate rendering. A
-    # template that lacks it (even with stray braces) bypasses the
-    # renderer, so a deliberately-broken Jinja-looking string still
-    # round-trips when needs_rendering says "no".
+    # ``needs_rendering`` opts in on either ``{{`` (expression) or
+    # ``{%`` (statement) — see ctxr.fsm.core.prompts._JINJA_OPENERS.
+    # A template that has neither marker (even with stray single
+    # braces) bypasses the renderer, so a deliberately-broken
+    # Jinja-looking string still round-trips.
     plain_template = "Single { brace } only, no Jinja"
     worker = Worker(
         role="reviewer",
@@ -344,3 +333,64 @@ def test_unknown_jinja_variable_raises_prompt_render_error() -> None:
 
     with pytest.raises(PromptRenderError):
         build_brief(spec, state, env={}, run_id=uuid4())
+
+
+# ---------------------------------------------------------------------------
+# Regression: same (spec, state, template) with a different env must
+# re-render. The earlier W23f cut memoised on (spec.id, state.id, template)
+# which would have served a stale prompt on the second call here.
+# ---------------------------------------------------------------------------
+
+
+def test_same_state_re_entered_with_different_env_reflects_new_env() -> None:
+    template = "args.user={{ args.user }} iter={{ iteration_n }}"
+    worker = Worker(
+        role="reviewer",
+        prompt_template=template,
+        inputs=[],
+        response_schema=_response_schema(),
+    )
+    state = State(
+        id="qa",
+        worker=worker,
+        outputs=["verdict"],
+        transitions=[Transition(to="qa", when="always")],
+    )
+    spec = _spec_with_state(state)
+    run_id = uuid4()
+
+    first = build_brief(spec, state, env={"user": "alice"}, run_id=run_id)
+    second = build_brief(spec, state, env={"user": "bob"}, run_id=run_id)
+
+    assert first.worker is not None
+    assert second.worker is not None
+    assert "args.user=alice" in first.worker.prompt_template
+    assert "args.user=bob" in second.worker.prompt_template
+    assert first.worker.prompt_template != second.worker.prompt_template
+
+
+def test_loop_body_re_render_per_iteration_reflects_iteration_n() -> None:
+    template = "iter={{ iteration_n }}"
+    loop_worker = Worker(
+        role="iterator",
+        prompt_template=template,
+        inputs=[],
+        response_schema=_loop_response_schema(),
+    )
+    loop = Loop(worker=loop_worker, max_iterations=5, done_field="done")
+    state = State(
+        id="looping",
+        loop=loop,
+        outputs=["done"],
+        transitions=[Transition(to="looping", when="always")],
+    )
+    spec = _spec_with_state(state)
+    run_id = uuid4()
+
+    brief_iter_1 = build_brief(spec, state, env={}, run_id=run_id, iteration_n=1)
+    brief_iter_3 = build_brief(spec, state, env={}, run_id=run_id, iteration_n=3)
+
+    assert brief_iter_1.worker is not None
+    assert brief_iter_3.worker is not None
+    assert "iter=1" in brief_iter_1.worker.prompt_template
+    assert "iter=3" in brief_iter_3.worker.prompt_template

@@ -97,19 +97,18 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-# Cache of rendered prompt strings keyed by (spec.id, state.id, iteration?).
-# The cache exists so re-entering a state (or iterating a loop) does not
-# re-parse the same template. We key on the raw template text under the
-# (spec, state) tuple so a spec mutation that swaps the template body
-# automatically invalidates the cached entry. Loop bodies share their
-# loop state's id, so per-iteration env differences are reflected by
-# always recomputing the runtime context but only re-using the parsed
-# Jinja template; the renderer itself owns Jinja parsing reuse via its
-# SandboxedEnvironment cache, so this dict is a lightweight per-state
-# guard against re-walking the needs_rendering precheck or re-allocating
-# the PromptRenderer.
+# The PromptRenderer is the only piece we cache at module scope. It
+# owns its own jinja2 SandboxedEnvironment, which carries a per-instance
+# parse cache so repeated calls against the same template text do not
+# re-tokenise. The previous incarnation of this module also memoised
+# the rendered output keyed on (spec.id, state.id, template), which was
+# unsound: the rendered prompt depends on runtime context (iteration_n,
+# env / args), so a state re-entered with a different env (or a loop
+# body on its Nth iteration) would have served a stale prompt from a
+# prior render. The result cache has therefore been removed; we pay one
+# Jinja .render() per build_brief and lean on the renderer's internal
+# parse cache for the reuse story.
 _PROMPT_RENDERER: PromptRenderer | None = None
-_RENDER_CACHE: dict[tuple[str, str, str], str] = {}
 
 
 def _get_prompt_renderer() -> PromptRenderer:
@@ -135,39 +134,40 @@ def _maybe_render_prompt(
     :class:`PromptContext` populated from the spec, state, worker, and
     runtime env. The rendered string replaces the template on a
     ``model_copy`` clone so the original spec object remains immutable.
+
+    Every call performs a fresh render: the prompt depends on the
+    current ``env`` and ``iteration_n`` and must reflect them on each
+    invocation (e.g. loop bodies on different iterations, or a state
+    re-entered with a different env). Reuse comes from the renderer's
+    own Jinja parse cache, not from a result cache at this layer.
     """
     template = worker.prompt_template
     if not needs_rendering(template):
         return worker
 
-    cache_key = (spec.id, state.id, template)
-    cached = _RENDER_CACHE.get(cache_key)
-    if cached is None:
-        renderer = _get_prompt_renderer()
-        context = PromptContext(
-            spec_slug=spec.id,
-            spec_version=spec.version,
-            state_id=state.id,
-            state_kind=state.kind.value,
-            response_schema=(
-                worker.response_schema.schema_
-                if worker.response_schema is not None
-                else None
-            ),
-            inputs_schema=(
-                worker.inputs_schema.schema_
-                if worker.inputs_schema is not None
-                else None
-            ),
-            allowed_tools=list(state.allowed_tools),
-            iteration_n=iteration_n,
-            args=dict(env),
-            metadata={},
-        )
-        cached = renderer.render(template, context)
-        _RENDER_CACHE[cache_key] = cached
-
-    return worker.model_copy(update={"prompt_template": cached})
+    renderer = _get_prompt_renderer()
+    context = PromptContext(
+        spec_slug=spec.id,
+        spec_version=spec.version,
+        state_id=state.id,
+        state_kind=state.kind.value,
+        response_schema=(
+            worker.response_schema.schema_
+            if worker.response_schema is not None
+            else None
+        ),
+        inputs_schema=(
+            worker.inputs_schema.schema_
+            if worker.inputs_schema is not None
+            else None
+        ),
+        allowed_tools=list(state.allowed_tools),
+        iteration_n=iteration_n,
+        args=dict(env),
+        metadata={},
+    )
+    rendered = renderer.render(template, context)
+    return worker.model_copy(update={"prompt_template": rendered})
 
 
 def _new_brief_id() -> uuid.UUID:
