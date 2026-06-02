@@ -49,11 +49,9 @@ import { effect } from '@preact/signals';
 import { LocationProvider, Router, Route, useLocation } from 'preact-iso';
 
 import { ToastContainer } from './components';
-import { Pill } from './components';
-import { EventStream, type ConnectionState } from './lib/sse';
+import { EventStream } from './lib/sse';
 import {
   appendEvent,
-  connectionState,
   setConnectionState,
 } from './lib/store';
 import { ROUTES } from './routes';
@@ -62,7 +60,7 @@ import { CommandPalette } from './chrome/CommandPalette';
 import { KeyboardHelp } from './chrome/KeyboardHelp';
 import { NotificationCentre } from './chrome/NotificationCentre';
 import { ThemeApplier } from './chrome/ThemeApplier';
-import { TopBarExtras } from './chrome/TopBarExtras';
+import { InfoTopBar } from './chrome/InfoTopBar';
 
 // ---------------------------------------------------------------------------
 // SSE wiring
@@ -227,88 +225,11 @@ function Sidebar(): JSX.Element {
   );
 }
 
-/**
- * Map an SSE connection state to a Pill variant + human label.
- *
- * The mapping intentionally collapses ``'closed'`` into the danger
- * variant alongside ``'error'``: from the user's perspective both mean
- * "we are not getting live updates". The distinction matters only to
- * the SSE wrapper itself.
- */
-function connectionPillProps(state: ConnectionState): {
-  variant: 'success' | 'warning' | 'danger';
-  label: string;
-  title: string;
-} {
-  switch (state) {
-    case 'open':
-      return {
-        variant: 'success',
-        label: 'Live',
-        title: 'Connected to the event stream',
-      };
-    case 'connecting':
-      return {
-        variant: 'warning',
-        label: 'Reconnecting',
-        title: 'Re-establishing the event stream',
-      };
-    case 'error':
-    case 'closed':
-    default:
-      return {
-        variant: 'danger',
-        label: 'Offline',
-        title: 'Event stream disconnected — retrying',
-      };
-  }
-}
-
-/**
- * Top bar — currently just hosts the connection-state pill on the right.
- *
- * Wrapped in a ``<header role="banner">`` so it appears as a landmark
- * and is announced as the page banner. The pill is given a live region
- * (``aria-live="polite"``) so screen-reader users hear the transition
- * once it settles rather than on every intermediate flicker.
- */
-function TopBar(): JSX.Element {
-  const state = connectionState.value;
-  const { variant, label, title } = connectionPillProps(state);
-  return (
-    <header
-      role="banner"
-      class="flex h-14 items-center justify-end border-b border-slate-200 bg-white px-6 dark:border-slate-700 dark:bg-slate-800"
-    >
-      <div
-        aria-live="polite"
-        aria-atomic="true"
-        class="flex items-center gap-2"
-      >
-        <span class="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
-          Stream
-        </span>
-        <Pill variant={variant} title={title} aria-label={`Event stream: ${label}`}>
-          <span
-            aria-hidden="true"
-            class={[
-              'inline-block h-2 w-2 rounded-full',
-              variant === 'success' && 'bg-emerald-500',
-              variant === 'warning' && 'bg-amber-500',
-              variant === 'danger' && 'bg-red-500',
-            ]
-              .filter(Boolean)
-              .join(' ')}
-          />
-          {label}
-        </Pill>
-      </div>
-      <div class="ml-3 pl-3 border-l border-slate-200 dark:border-slate-700">
-        <TopBarExtras />
-      </div>
-    </header>
-  );
-}
+// connectionPillProps was extracted to ``ui/src/lib/connectionPill.ts``
+// in W22b3 so the new InfoTopBar can share the same mapping with the
+// rest of the chrome surface. The inline TopBar component was retired
+// in the same wave; InfoTopBar (chrome/InfoTopBar.tsx) renders the
+// info-rich sticky header end-to-end.
 
 // ---------------------------------------------------------------------------
 // Route stubs
@@ -370,7 +291,7 @@ function Shell(): JSX.Element {
     <div class="flex h-screen w-screen overflow-hidden bg-slate-50 text-slate-900 dark:bg-slate-900 dark:text-slate-100">
       <Sidebar />
       <div class="flex min-w-0 flex-1 flex-col">
-        <TopBar />
+        <InfoTopBar />
         <main id="main" class="min-h-0 flex-1 overflow-auto" tabIndex={-1}>
           <Router>
             {ROUTES.map((r) => (
