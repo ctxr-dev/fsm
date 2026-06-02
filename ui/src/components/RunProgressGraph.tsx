@@ -185,7 +185,7 @@ export function RunProgressGraph({
         </div>
         {overlay.faultedStateId ? (
           <span class="text-red-700 dark:text-red-300 font-mono">
-            ⚠ fault at <code>{overlay.faultedStateId}</code>
+            fault at <code>{overlay.faultedStateId}</code>
           </span>
         ) : null}
         {overlay.currentStateId ? (

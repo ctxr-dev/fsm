@@ -16,7 +16,7 @@
  * recomputing the static layer.
  */
 
-import type { Edge, Node } from '@xyflow/react';
+import { MarkerType, type Edge, type Node } from '@xyflow/react';
 
 import type { FlowNodeData } from '../components/FlowGraph';
 import type { Event as FsmEvent, RunManifest, StateNode } from './api';
@@ -134,26 +134,6 @@ export function buildRunOverlay(
   };
 }
 
-/** Per-status visual treatment (border + background tints). */
-const STATUS_COLOURS: Record<RunNodeStatus, { border: string; bg: string }> = {
-  not_visited: {
-    border: '#94a3b8',
-    bg: 'rgba(241, 245, 249, 0.6)',
-  },
-  entered: {
-    border: '#f59e0b',
-    bg: 'rgba(254, 243, 199, 0.85)',
-  },
-  exited: {
-    border: '#10b981',
-    bg: 'rgba(209, 250, 229, 0.85)',
-  },
-  faulted: {
-    border: '#ef4444',
-    bg: 'rgba(254, 202, 202, 0.9)',
-  },
-};
-
 /**
  * Apply the overlay to the base spec graph and return a new
  * ``{nodes, edges}`` pair suitable for handing straight to FlowGraph.
@@ -175,24 +155,27 @@ export function overlayRunOnSpecGraph(
       overlay.currentStateId === stateId && baseStatus !== 'faulted'
         ? 'entered'
         : baseStatus;
-    const colours = STATUS_COLOURS[status];
     const isCurrent = overlay.currentStateId === stateId;
 
+    // W23b regression fix: status is conveyed ONLY through fields on
+    // ``data`` so the inner FsmNode component owns the colour-mapping
+    // via its STATUS_CLASSES palette + currentRing. Setting an outer
+    // wrapper ``style`` here would double-render (kind palette on the
+    // card, status palette on the wrapper) and produce the nested-box
+    // effect the user flagged. The inner card now shows the status
+    // colour directly, the ring marks the current node, and the
+    // labelPrefix prepends the textual badge.
     return {
       ...node,
       data: {
         ...node.data,
-        // Decorate the node label with a per-status badge prefix so
-        // the colour-coded view also reads correctly under reduced-
-        // motion / dark-mode mode tweaks where the background may
-        // be desaturated.
         labelPrefix:
           status === 'faulted'
-            ? '⚠ '
+            ? 'fault: '
             : status === 'entered'
-            ? '▸ '
+            ? '> '
             : status === 'exited'
-            ? '✓ '
+            ? 'ok: '
             : '',
         runStatus: status,
         isCurrent,
@@ -201,27 +184,31 @@ export function overlayRunOnSpecGraph(
         runStatus?: RunNodeStatus;
         isCurrent?: boolean;
       },
-      style: {
-        ...(node.style ?? {}),
-        border: `2px solid ${colours.border}`,
-        background: colours.bg,
-        boxShadow: isCurrent
-          ? `0 0 0 4px ${colours.border}33, 0 8px 16px rgba(0,0,0,0.10)`
-          : '0 2px 6px rgba(0,0,0,0.06)',
-      },
     };
   });
 
+  // W23b regression fix: edges set both stroke AND markerEnd colour so
+  // taken-edge arrowheads match their stroke (no more green line with
+  // grey arrow). Plain ``Edge.markerEnd`` is a {type, color, width,
+  // height} object which FlowGraph.decorateEdges then preserves via
+  // ``e.markerEnd ?? {...}``.
   const edges = base.edges.map((edge) => {
     const taken = overlay.takenTransitions.has(`${edge.source}::${edge.target}`);
+    const stroke = taken ? '#10b981' : '#94a3b8';
     return {
       ...edge,
       animated: taken && overlay.currentStateId === edge.source,
       style: {
         ...(edge.style ?? {}),
-        stroke: taken ? '#10b981' : '#cbd5e1',
+        stroke,
         strokeWidth: taken ? 2.2 : 1.4,
         opacity: taken ? 1 : 0.55,
+      },
+      markerEnd: {
+        type: MarkerType.ArrowClosed,
+        color: stroke,
+        width: 18,
+        height: 18,
       },
       labelStyle: {
         ...((edge.labelStyle as object) ?? {}),
