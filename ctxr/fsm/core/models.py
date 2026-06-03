@@ -103,12 +103,32 @@ class StateKind(StrEnum):
     engine, the SQLite materialisation layer, and the brief serialiser.
     Members carry the same wire strings the engine used pre-W14i so JSON
     payloads remain byte-identical.
+
+    ``gate`` is the W23g cross-FSM kind: a state that pauses the run
+    waiting for a value supplied from outside the run's own state
+    environment (an LLM-supplied literal or a binding to another run's
+    output). See ``ctxr/fsm/memory/GATE_CONTRACT.md`` for the protocol.
     """
 
     worker = "worker"
     loop = "loop"
     inline = "inline"
+    gate = "gate"
     terminal = "terminal"
+
+
+class GateSourceKind(StrEnum):
+    """Where a gate state pulls its resolved value from.
+
+    ``run_output``  — the value is read from another run's state output
+                       via :class:`GateBinding`.
+    ``llm_supplied`` — the value is provided by the operator / LLM at
+                       resolve time and validated against the gate's
+                       ``response_schema``.
+    """
+
+    run_output = "run_output"
+    llm_supplied = "llm_supplied"
 
 
 class InlineFaultReason(StrEnum):
@@ -159,6 +179,15 @@ class EventKind(StrEnum):
     commit_token_expired = "commit_token_expired"
     inline_executed = "inline_executed"
     inline_failed = "inline_failed"
+    # W23g cross-FSM gates: gate_resolved when fsm.resolve_gate has
+    # validated + landed a value; gate_resolution_failed for any error
+    # envelope listed in GATE_CONTRACT.md; gate_binding_recorded when
+    # a binding row lands in the gate_bindings table (source_kind
+    # 'run_output' bindings only, since 'llm_supplied' resolutions
+    # have no cross-run link to record).
+    gate_resolved = "gate_resolved"
+    gate_resolution_failed = "gate_resolution_failed"
+    gate_binding_recorded = "gate_binding_recorded"
 
 
 class DeliveryStatus(StrEnum):
@@ -529,6 +558,87 @@ class InlineSpec(BaseModel):
         return value
 
 
+class GateBinding(BaseModel):
+    """A single ``run_output`` binding consumed by a :class:`Gate`.
+
+    A binding tells the engine which other run's state output should
+    land under ``target_field`` in this run's environment when the gate
+    resolves. ``source_run_id`` may be ``None`` at spec-author time and
+    populated by the orchestrator at start_run time when the source run
+    id is only known dynamically. ``source_spec_slug`` is an optional
+    safety check: when set, the resolver refuses bindings whose source
+    run's spec slug does not match.
+    """
+
+    model_config = _DOMAIN_CFG
+
+    source_run_id: str | None = None
+    source_spec_slug: str | None = None
+    source_state_id: str
+    source_field: str
+    target_field: str
+
+    @field_validator("source_state_id", "source_field", "target_field")
+    @classmethod
+    def _non_empty(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("GateBinding field must be a non-empty string")
+        return value
+
+    @field_validator("source_run_id", "source_spec_slug")
+    @classmethod
+    def _optional_non_empty(cls, value: str | None) -> str | None:
+        # Optional identifiers: ``None`` keeps the "unset" semantics, but
+        # an explicit empty/whitespace-only string is ambiguous and would
+        # silently bypass the spec-slug safety check or produce a binding
+        # against a phantom run id. Reject at the boundary.
+        if value is not None and not value.strip():
+            raise ValueError(
+                "GateBinding optional field, when provided, must be a "
+                "non-empty string"
+            )
+        return value
+
+
+class Gate(BaseModel):
+    """A cross-FSM gate body for a :class:`State`.
+
+    Sets a state's kind to :attr:`StateKind.gate`. The engine pauses
+    the run when it enters a gate state and waits for an explicit
+    ``fsm.resolve_gate`` call. The resolved value is validated against
+    :attr:`response_schema` and lands in the run's environment under
+    the gate's first declared output (or under each binding's
+    ``target_field`` when ``source_kind == run_output``).
+
+    ``max_age_ms`` is optional and applies only to ``run_output``
+    sources: if set, the resolver rejects sources whose state's
+    ``exited_at`` is older than the window with
+    ``error: gate_source_stale`` (see GATE_CONTRACT.md).
+    """
+
+    model_config = _DOMAIN_CFG
+
+    source_kind: GateSourceKind
+    response_schema: ResponseSchema
+    bindings: list[GateBinding] = Field(default_factory=list)
+    max_age_ms: int | None = None
+
+    @field_validator("max_age_ms")
+    @classmethod
+    def _max_age_positive(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("Gate.max_age_ms must be a positive integer")
+        return value
+
+    @model_validator(mode="after")
+    def _bindings_match_source_kind(self) -> Gate:
+        if self.source_kind is GateSourceKind.llm_supplied and self.bindings:
+            raise ValueError(
+                "Gate.bindings must be empty when source_kind=llm_supplied"
+            )
+        return self
+
+
 class Transition(BaseModel):
     """A single transition out of a state, with a guard."""
 
@@ -668,6 +778,7 @@ class State(BaseModel):
     worker: Worker | None = None
     loop: Loop | None = None
     inline: InlineSpec | None = None
+    gate: Gate | None = None
     outputs: list[str] = Field(default_factory=list)
     post_validations: list[Predicate] = Field(default_factory=list)
     transitions: list[Transition] = Field(default_factory=list)
@@ -687,12 +798,15 @@ class State(BaseModel):
 
         The kind is derived from which body fields are set, not stored:
 
-        * :attr:`StateKind.loop`     — :attr:`loop` is non-None.
-        * :attr:`StateKind.inline`   — :attr:`inline` is non-None
+        * :attr:`StateKind.loop`     - :attr:`loop` is non-None.
+        * :attr:`StateKind.inline`   - :attr:`inline` is non-None
           (and :attr:`loop` is None).
-        * :attr:`StateKind.worker`   — :attr:`worker` is non-None
-          (and :attr:`loop` / :attr:`inline` are None).
-        * :attr:`StateKind.terminal` — all three body fields are None
+        * :attr:`StateKind.gate`     - :attr:`gate` is non-None
+          (and :attr:`loop` / :attr:`inline` are None). Exclusive with
+          worker / loop / inline; enforced by the model_validator.
+        * :attr:`StateKind.worker`   - :attr:`worker` is non-None
+          (and :attr:`loop` / :attr:`inline` / :attr:`gate` are None).
+        * :attr:`StateKind.terminal` - all four body fields are None
           AND :attr:`transitions` is empty.
 
         A state with no body fields but a non-empty :attr:`transitions`
@@ -708,13 +822,15 @@ class State(BaseModel):
             return StateKind.loop
         if self.inline is not None:
             return StateKind.inline
+        if self.gate is not None:
+            return StateKind.gate
         if self.worker is not None:
             return StateKind.worker
         if not self.transitions:
             return StateKind.terminal
         raise ValueError(
             f"state {self.id!r}: terminal-by-content but has transitions; "
-            "set a worker / loop / inline body or remove the transitions"
+            "set a worker / loop / inline / gate body or remove the transitions"
         )
 
     @model_validator(mode="after")
@@ -730,6 +846,19 @@ class State(BaseModel):
         if self.inline is not None and self.loop is not None:
             raise ValueError(
                 f"state {self.id!r}: cannot have both `inline` and `loop` set"
+            )
+        # W23g: gate body is exclusive with every other body kind. The
+        # engine pauses on a gate the way it pauses on a worker, but
+        # the resolver is fsm.resolve_gate, not fsm.commit_outputs;
+        # combining bodies would make the brief shape ambiguous.
+        if self.gate is not None and (
+            self.worker is not None
+            or self.loop is not None
+            or self.inline is not None
+        ):
+            raise ValueError(
+                f"state {self.id!r}: `gate` cannot be combined with "
+                "`worker`, `loop`, or `inline`"
             )
         if self.loop is not None:
             schema = (
@@ -831,6 +960,12 @@ class Brief(BaseModel):
     allowed_tools: list[str] = Field(default_factory=list)
     worker: Worker | None = None
     loop: Loop | None = None
+    # W23g cross-FSM gates: when the current state is a gate, the
+    # brief carries the Gate body (response_schema + bindings +
+    # source_kind) instead of a Worker. has_worker and has_loop both
+    # stay False; consumers branch on `gate is not None` to switch
+    # from the commit_outputs path to the resolve_gate path.
+    gate: Gate | None = None
     iteration_n: int | None = None
     outputs_path: str | None = None
     brief_id: uuid.UUID

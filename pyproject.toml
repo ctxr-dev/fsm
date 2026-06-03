@@ -132,6 +132,7 @@ module = [
     "ctxr.fsm.sqlite.repos_events",
     "ctxr.fsm.sqlite.repos_locks_journal",
     "ctxr.fsm.sqlite.repos_enforcement",
+    "ctxr.fsm.sqlite.repos_gates",
 ]
 disable_error_code = ["arg-type", "attr-defined", "union-attr", "operator", "call-overload"]
 

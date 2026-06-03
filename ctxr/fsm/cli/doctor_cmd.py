@@ -55,6 +55,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import typer
 from rich.console import Console
 from rich.panel import Panel
 from sqlalchemy import func, select, text
@@ -73,6 +74,12 @@ from ctxr.fsm.cli.lifecycle.primitives import (
     read_active_mcp_file,
     read_pid_file,
     recall_port,
+)
+from ctxr.fsm.memory import (
+    get_bootstrap_path,
+    get_principles_path,
+    get_ssot_doc_path,
+    list_ssot_doc_slugs,
 )
 from ctxr.fsm.sqlite.connection import detect_journal_state
 from ctxr.fsm.sqlite.models_core import LockTable
@@ -336,6 +343,61 @@ def _active_mcp_for_table(
     return {"subsystems": merged}
 
 
+def _skill_consumer_report() -> dict[str, Any]:
+    """W23-SSOT: report on the canonical reference docs reachability.
+
+    A skill consumer asks: "is everything I need to drive an FSM run
+    actually present in this install?" The answer is yes when each of
+    the four pillar docs (principles, bootstrap, AGENT_QUICKSTART,
+    SKILL_TEMPLATE, GATE_CONTRACT) is readable inside the installed
+    package. We resolve each via the public ``ctxr.fsm.memory``
+    helpers so this check exercises the SAME code path skills use at
+    runtime, catching a stale install rather than a stale duplicate
+    constant.
+
+    Returned shape (designed for the JSON wire path)::
+
+        {
+          "status": "ok" | "missing_docs",
+          "principles_path": str,
+          "bootstrap_path": str,
+          "ssot_docs": {<slug>: {"path": str, "exists": bool}, ...},
+          "missing": [<slug>, ...],
+        }
+    """
+
+    missing: list[str] = []
+    out: dict[str, Any] = {
+        "principles_path": None,
+        "bootstrap_path": None,
+        "ssot_docs": {},
+    }
+
+    try:
+        out["principles_path"] = str(get_principles_path("claude"))
+    except FileNotFoundError:
+        missing.append("principles.claude.md")
+    try:
+        out["bootstrap_path"] = str(get_bootstrap_path())
+    except FileNotFoundError:
+        missing.append("bootstrap.md")
+
+    for slug in list_ssot_doc_slugs():
+        entry: dict[str, Any] = {"path": None, "exists": False}
+        try:
+            path = get_ssot_doc_path(slug)
+        except FileNotFoundError:
+            missing.append(slug)
+        else:
+            entry["path"] = str(path)
+            entry["exists"] = True
+        out["ssot_docs"][slug] = entry
+
+    out["status"] = "ok" if not missing else "missing_docs"
+    out["missing"] = missing
+    return out
+
+
 def _print_pretty_report(
     *,
     db_path: Path,
@@ -373,6 +435,19 @@ def _print_pretty_report(
 def doctor(
     db: Path | None = DB_OPTION,
     json_mode: bool = JSON_OPTION,
+    skill_consumer: bool = typer.Option(
+        False,
+        "--skill-consumer",
+        help=(
+            "Add a W23-SSOT 'skill consumer readiness' section to the "
+            "report. Verifies that the canonical reference docs "
+            "(AGENT_QUICKSTART, SKILL_TEMPLATE, GATE_CONTRACT, "
+            "principles, bootstrap) are reachable in the installed "
+            "package. Skills that depend on ctxr-fsm should call "
+            "this in CI to catch a stale install before a real run "
+            "discovers it."
+        ),
+    ),
 ) -> None:
     """Print a diagnostic report for the project DB and supervisor.
 
@@ -419,6 +494,8 @@ def doctor(
         "locks": {"count": locks},
         "supervisor": supervisor,
     }
+    if skill_consumer:
+        report["skill_consumer"] = _skill_consumer_report()
     if json_mode:
         # JSON path is the wire contract every script depends on; we
         # MUST emit the same shape every previous doctor invocation did.
