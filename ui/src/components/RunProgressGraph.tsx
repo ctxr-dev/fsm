@@ -83,6 +83,13 @@ export interface RunProgressGraphProps {
    * handler with its declared direction).
    */
   onEdgeClick?: (fromId: string, toId: string) => void;
+  /**
+   * Click handler for an iteration chip inside a loop node (W22b PR 5).
+   * Receives the entry_id stamped on the chip; the run-detail route
+   * wires this to ``openStateEntrySheet`` so a click on a specific
+   * iteration opens the per-iteration inspector.
+   */
+  onIterationClick?: (entryId: string) => void;
 }
 
 interface SpecCache {
@@ -101,6 +108,7 @@ export function RunProgressGraph({
   className = '',
   onNodeClick,
   onEdgeClick,
+  onIterationClick,
 }: RunProgressGraphProps): JSX.Element {
   const [spec, setSpec] = useState<SpecCache | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -234,6 +242,7 @@ export function RunProgressGraph({
         <FlowGraph
           nodes={overlaid.nodes}
           edges={overlaid.edges}
+          onIterationClick={onIterationClick}
           onNodeClick={
             onNodeClick
               ? (id: string) => onNodeClick(id)

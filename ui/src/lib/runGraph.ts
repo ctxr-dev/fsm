@@ -19,6 +19,7 @@
 import type { Edge, Node } from '@xyflow/react';
 
 import type { FlowNodeData } from '../components/FlowGraph';
+import { LOOP_NODE_HEIGHT, loopNodeExpandedWidth } from '../components/FlowGraph';
 import type { Event as FsmEvent, RunManifest, StateNode } from './api';
 
 /**
@@ -35,6 +36,23 @@ import type { Event as FsmEvent, RunManifest, StateNode } from './api';
  */
 export type RunNodeStatus = 'not_visited' | 'entered' | 'exited' | 'faulted';
 
+/**
+ * Per-iteration chip payload surfaced inside a loop node card. Each
+ * entry maps 1-to-1 to a row in the state-entry tree; clicking the
+ * chip opens the per-iteration StateEntrySheetBody (Tab 1 = run
+ * values for THIS entry's inputs/outputs, Tab 3 = events filtered to
+ * THIS entry_id) — the same per-iteration semantics PR 4 already
+ * baked into the sheet body.
+ */
+export interface LoopIterationEntry {
+  entry_id: string;
+  /** 1-based iteration counter as the engine recorded it. ``null`` when
+   *  the engine didn't stamp one (a defensive fallback so the chip
+   *  strip still renders for entries that pre-date the counter). */
+  iteration_n: number | null;
+  status: string;
+}
+
 export interface RunOverlay {
   /** Map of spec-state-id -> the strongest status observed across all
    *  entries for that state. "Strongest" means a faulted entry wins
@@ -50,6 +68,13 @@ export interface RunOverlay {
   takenTransitions: Set<string>;
   /** Spec-state-id where the engine recorded a fault, if any. */
   faultedStateId: string | null;
+  /** PR 5: spec-state-id -> chronological list of iteration entries
+   *  recorded against THAT state. The list is non-empty only for
+   *  states the run actually entered (and is shaped per ``LoopIterationEntry``
+   *  whether or not the spec declares ``kind: "loop"`` — the run-graph
+   *  layer doesn't know spec metadata; ``overlayRunOnSpecGraph`` joins
+   *  the chip strip onto loop nodes specifically). */
+  iterationEntriesByStateId: Map<string, LoopIterationEntry[]>;
 }
 
 /** Flatten the state tree into a CHRONOLOGICAL list.
@@ -115,12 +140,25 @@ export function buildRunOverlay(
   events: FsmEvent[],
 ): RunOverlay {
   const statusByStateId = new Map<string, RunNodeStatus>();
+  const iterationEntriesByStateId = new Map<string, LoopIterationEntry[]>();
   const entries = flattenEntries(stateTree);
   let faultedStateId: string | null = null;
 
   for (const entry of entries) {
     const stateId = entry.state_id;
     const prev = statusByStateId.get(stateId) ?? 'not_visited';
+    // PR 5: collect every entry per state_id in chronological order
+    // (flattenEntries already sorted by entry_seq). The downstream loop
+    // node renderer uses this to draw a chip per iteration; non-loop
+    // states still get a list here but ``overlayRunOnSpecGraph`` only
+    // joins it onto nodes whose spec data carries ``isLoop=true``.
+    const bucket = iterationEntriesByStateId.get(stateId) ?? [];
+    bucket.push({
+      entry_id: entry.entry_id,
+      iteration_n: entry.iteration_n,
+      status: entry.status,
+    });
+    iterationEntriesByStateId.set(stateId, bucket);
     // Derive entered/exited from ``exited_at`` (the timestamp is the
     // engine's source of truth: null = still active; non-null = the
     // engine has moved on). Only the ``faulted`` status string is
@@ -165,6 +203,7 @@ export function buildRunOverlay(
     currentStateId: manifest?.current_state ?? null,
     takenTransitions,
     faultedStateId,
+    iterationEntriesByStateId,
   };
 }
 
@@ -199,6 +238,32 @@ export function overlayRunOnSpecGraph(
         ? 'entered'
         : baseStatus;
     const isCurrent = overlay.currentStateId === stateId;
+    // PR 5: graft the per-iteration entries onto loop nodes. Non-loop
+    // nodes ignore the field (FlowGraph dispatches the loop renderer
+    // off ``data.isLoop``); we still copy the bucket so a future
+    // worker-node "iteration trail" affordance can opt in without
+    // changing the overlay surface again.
+    const iterationEntries =
+      overlay.iterationEntriesByStateId.get(stateId) ?? [];
+    const iterationCount = iterationEntries.length;
+    // Re-derive the per-node width from the OBSERVED iteration count
+    // when it exceeds the spec-declared ceiling (defensive: a loop
+    // that ran past its declared max_iterations because the engine
+    // bumped the cap mid-run would otherwise have its chips clipped
+    // off the right edge of the card).
+    const isLoop =
+      typeof (node.data as { isLoop?: boolean }).isLoop === 'boolean'
+        ? (node.data as { isLoop?: boolean }).isLoop === true
+        : false;
+    const loopMaxIterations =
+      typeof (node.data as { loopMaxIterations?: number }).loopMaxIterations ===
+      'number'
+        ? (node.data as { loopMaxIterations?: number }).loopMaxIterations!
+        : 0;
+    const widthDriver = isLoop
+      ? Math.max(loopMaxIterations, iterationCount)
+      : 0;
+    const loopWidth = isLoop ? loopNodeExpandedWidth(widthDriver) : undefined;
 
     // Compose the per-status badge prefix INTO ``data.label`` rather
     // than into a parallel ``labelPrefix`` field. FlowGraph renders
@@ -229,14 +294,26 @@ export function overlayRunOnSpecGraph(
     // overlay (Copilot review on PR #62).
     return {
       ...node,
+      // Re-stamp the per-node width so dagre's MiniMap thumbnail +
+      // any downstream re-layout sees the iteration-aware size. We
+      // only set width/height for loop nodes so non-loop nodes keep
+      // their xyflow defaults (the FlowGraph layout pass fills in
+      // NODE_WIDTH/NODE_HEIGHT for those).
+      ...(loopWidth !== undefined
+        ? { width: loopWidth, height: LOOP_NODE_HEIGHT }
+        : {}),
       data: {
         ...node.data,
         label: decoratedLabel,
         runStatus: status,
         isCurrent,
+        iterationCount,
+        iterationEntries,
       } as FlowNodeData & {
         runStatus?: RunNodeStatus;
         isCurrent?: boolean;
+        iterationCount?: number;
+        iterationEntries?: LoopIterationEntry[];
       },
     };
   });

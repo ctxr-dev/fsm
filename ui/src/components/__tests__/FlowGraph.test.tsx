@@ -508,6 +508,161 @@ describe('FlowGraph', () => {
     });
   });
 
+  describe('PR 5: loop node + iteration chip strip', () => {
+    function loopNode(
+      id: string,
+      iterations: Array<{ entry_id: string; iteration_n: number | null; status: string }>,
+      maxIterations = iterations.length,
+    ): Node<FlowNodeData> {
+      return {
+        id,
+        position: { x: 0, y: 0 },
+        data: {
+          kind: 'loop',
+          label: id,
+          isLoop: true,
+          loopMaxIterations: maxIterations,
+          iterationCount: iterations.length,
+          iterationEntries: iterations,
+        } as FlowNodeData,
+      };
+    }
+
+    test('loop nodes get type=loopNode and loopNode is registered with ReactFlow', () => {
+      const nodes = [loopNode('l', [{ entry_id: 'e1', iteration_n: 1, status: 'exited' }])];
+      render(<FlowGraph nodes={nodes} edges={[]} autoLayout={false} />);
+      const passed = lastReactFlowProps!.nodes as Array<Node<FlowNodeData> & { type?: string }>;
+      expect(passed[0].type).toBe('loopNode');
+      const nodeTypes = lastReactFlowProps!.nodeTypes as Record<string, unknown>;
+      expect(nodeTypes.loopNode).toBeTypeOf('function');
+      expect(nodeTypes.fsmNode).toBeTypeOf('function');
+    });
+
+    test('non-loop nodes keep type=fsmNode (dispatch discrimination)', () => {
+      const nodes: Node<FlowNodeData>[] = [
+        { id: 'w', position: { x: 0, y: 0 }, data: { kind: 'worker', label: 'w' } },
+      ];
+      render(<FlowGraph nodes={nodes} edges={[]} autoLayout={false} />);
+      const passed = lastReactFlowProps!.nodes as Array<Node<FlowNodeData> & { type?: string }>;
+      expect(passed[0].type).toBe('fsmNode');
+    });
+
+    test('loop node is collapsed by default; expanding renders the chip strip; chip click fires onIterationClick', async () => {
+      // Mount the loopNode renderer via the LoopIterationClickContext
+      // bridge — same pattern the FsmEdge test uses for FsmEdgeClickContext.
+      // The renderer is a Preact component (uses hooks), so it must be
+      // mounted via JSX inside render(), not invoked as a function.
+      const fg = await import('../FlowGraph');
+      const LoopIterationClickContext = (fg as unknown as {
+        LoopIterationClickContext: import('preact').Context<((id: string) => void) | null>;
+      }).LoopIterationClickContext;
+      const handler = vi.fn();
+      const iterations = [
+        { entry_id: 'e1', iteration_n: 1, status: 'exited' },
+        { entry_id: 'e2', iteration_n: 2, status: 'entered' },
+      ];
+      const data = {
+        kind: 'loop',
+        label: 'tick',
+        isLoop: true,
+        loopMaxIterations: 5,
+        iterationCount: 2,
+        iterationEntries: iterations,
+      } as FlowNodeData;
+
+      // Pull the registered loopNode component out of FlowGraph's
+      // NODE_TYPES map via the captured ReactFlow props. That way we
+      // test the ACTUAL renderer FlowGraph wires up, not a copy.
+      render(<FlowGraph nodes={[loopNode('tick', iterations, 5)]} edges={[]} autoLayout={false} />);
+      const nodeTypes = lastReactFlowProps!.nodeTypes as Record<string, any>;
+      const LoopComponent = nodeTypes.loopNode as (props: {
+        data: FlowNodeData;
+        selected?: boolean;
+      }) => any;
+
+      const { getByTestId, queryByTestId, getAllByTestId } = render(
+        <LoopIterationClickContext.Provider value={handler}>
+          <LoopComponent data={data} />
+        </LoopIterationClickContext.Provider>,
+      );
+
+      // Collapsed by default: no chip strip yet.
+      expect(queryByTestId('loop-chip-strip')).toBeNull();
+      // Header has the ×N badge.
+      expect(getByTestId('loop-iteration-badge').textContent).toContain('2');
+      // Toggle to expand.
+      const toggle = getByTestId('loop-expand-toggle') as HTMLButtonElement;
+      act(() => {
+        toggle.click();
+      });
+      // Chip strip now visible with one chip per iteration.
+      const strip = getByTestId('loop-chip-strip');
+      expect(strip).not.toBeNull();
+      const chips = getAllByTestId('loop-chip');
+      expect(chips).toHaveLength(2);
+      expect(chips[0].getAttribute('data-entry-id')).toBe('e1');
+      expect(chips[1].getAttribute('data-entry-id')).toBe('e2');
+      // Clicking a chip fires onIterationClick with the entry_id.
+      act(() => {
+        (chips[1] as HTMLButtonElement).click();
+      });
+      expect(handler).toHaveBeenCalledWith('e2');
+      // Toggle back to collapsed.
+      act(() => {
+        toggle.click();
+      });
+      expect(queryByTestId('loop-chip-strip')).toBeNull();
+    });
+
+    test('PR 5: layout width is bounded by min(20, iterations) * 40 + header for 0 / 1 / 5 / 200 iterations', () => {
+      // Use the auto-layout branch so dagre is actually exercised — the
+      // pre-stamped n.width must flow through to the positioned node.
+      const headerWidth = 270;
+      const chipWidth = 40;
+      const max = 20;
+      const cases = [0, 1, 5, 200];
+      for (const count of cases) {
+        const iter = Array.from({ length: count }, (_, i) => ({
+          entry_id: `e${i}`,
+          iteration_n: i + 1,
+          status: 'exited',
+        }));
+        // Pre-stamp width on the node the same way specGraph/runGraph
+        // does, so dagre sees the right dimensions.
+        const expanded = headerWidth + Math.min(max, count) * chipWidth;
+        const nodes: Node<FlowNodeData>[] = [
+          { ...loopNode('l', iter, count), width: expanded, height: 120 },
+        ];
+        render(<FlowGraph nodes={nodes} edges={[]} autoLayout={true} />);
+        const passed = lastReactFlowProps!.nodes as Array<Node<FlowNodeData> & { width?: number }>;
+        // The positioned node keeps the input width unchanged for loop
+        // nodes — non-default widths flow through dagre + back out.
+        expect(passed[0].width).toBe(expanded);
+        // The cap at 20 is the load-bearing assertion: 200 iterations
+        // must NOT produce 8000+ px.
+        expect(passed[0].width).toBeLessThanOrEqual(headerWidth + max * chipWidth);
+      }
+    });
+
+    test('PR 5: a loop with 50 iterations renders width bounded by min(20,50)*40 + header', () => {
+      const headerWidth = 270;
+      const chipWidth = 40;
+      const max = 20;
+      const iter = Array.from({ length: 50 }, (_, i) => ({
+        entry_id: `e${i}`,
+        iteration_n: i + 1,
+        status: 'exited',
+      }));
+      const expanded = headerWidth + Math.min(max, 50) * chipWidth;
+      const nodes: Node<FlowNodeData>[] = [
+        { ...loopNode('l', iter, 50), width: expanded, height: 120 },
+      ];
+      render(<FlowGraph nodes={nodes} edges={[]} autoLayout={true} />);
+      const passed = lastReactFlowProps!.nodes as Array<Node<FlowNodeData> & { width?: number }>;
+      expect(passed[0].width).toBe(headerWidth + max * chipWidth);
+    });
+  });
+
   test('default direction is TB (top-to-bottom) when not specified', () => {
     const nodes: Node<FlowNodeData>[] = [
       { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },

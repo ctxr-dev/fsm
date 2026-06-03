@@ -291,6 +291,66 @@ describe('specToGraph', () => {
     expect(g.nodes[0].data.sublabel).toBe('inline: aggregate');
   });
 
+  // -------------------------------------------------------------------------
+  // PR 5: loop node carries isLoop + loopMaxIterations + expanded width
+  // -------------------------------------------------------------------------
+
+  test('PR 5: explicit kind="loop" state gets kind=loop + isLoop=true', () => {
+    const g = specToGraph({
+      states: [{ id: 'l', kind: 'loop', loop: { max_iterations: 5 } }],
+    });
+    expect(g.nodes[0].data.kind).toBe('loop');
+    expect((g.nodes[0].data as { isLoop?: boolean }).isLoop).toBe(true);
+    expect(
+      (g.nodes[0].data as { loopMaxIterations?: number }).loopMaxIterations,
+    ).toBe(5);
+  });
+
+  test('PR 5: inferred loop body (no explicit kind) still flagged as loop', () => {
+    const g = specToGraph({
+      states: [{ id: 'l', loop: { max_iterations: 3 } }],
+    });
+    expect(g.nodes[0].data.kind).toBe('loop');
+    expect((g.nodes[0].data as { isLoop?: boolean }).isLoop).toBe(true);
+    expect(
+      (g.nodes[0].data as { loopMaxIterations?: number }).loopMaxIterations,
+    ).toBe(3);
+  });
+
+  test('PR 5: non-loop state has isLoop=false and loopMaxIterations=0', () => {
+    const g = specToGraph({
+      states: [{ id: 's', worker: { role: 'r' } }],
+    });
+    expect((g.nodes[0].data as { isLoop?: boolean }).isLoop).toBe(false);
+    expect(
+      (g.nodes[0].data as { loopMaxIterations?: number }).loopMaxIterations,
+    ).toBe(0);
+  });
+
+  test('PR 5: loop node carries width/height baked from max_iterations', () => {
+    // 5 chips × 40px + 270px header = 470px
+    const g = specToGraph({
+      states: [{ id: 'l', kind: 'loop', loop: { max_iterations: 5 } }],
+    });
+    expect(g.nodes[0].width).toBe(270 + 5 * 40);
+    expect(g.nodes[0].height).toBeGreaterThan(0);
+  });
+
+  test('PR 5: loop width caps at LOOP_NODE_CHIP_VISIBLE_MAX (20)', () => {
+    // 200 iterations capped at 20 chips × 40 + 270 = 1070px (not 8270)
+    const g = specToGraph({
+      states: [{ id: 'l', kind: 'loop', loop: { max_iterations: 200 } }],
+    });
+    expect(g.nodes[0].width).toBe(270 + 20 * 40);
+  });
+
+  test('PR 5: loop with 0 iterations gets header-only width', () => {
+    const g = specToGraph({
+      states: [{ id: 'l', kind: 'loop', loop: {} }],
+    });
+    expect(g.nodes[0].width).toBe(270);
+  });
+
   test('W21: bare predicate-string when is treated as deterministic', () => {
     const g = specToGraph({
       states: [
