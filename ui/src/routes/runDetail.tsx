@@ -880,6 +880,33 @@ export function RunDetailRoute(): JSX.Element {
               ),
             });
           }}
+          onIterationClick={(entryId) => {
+            // PR 5: loop chip click. The entry_id is the exact iteration
+            // the operator picked, so we open StateEntrySheetBody with
+            // THAT entry_id (not the loop state's first entry). The
+            // sheet body already handles per-iteration semantics in
+            // Tab 1 (run values for this entry's inputs/outputs) and
+            // Tab 3 (events filtered by entry_id) — added in PR 4 —
+            // so PR 5 doesn't have to change the body component.
+            const entry = nodeIndex.get(entryId);
+            const stateLabel = entry?.state_id ?? entryId;
+            const iterLabel =
+              entry?.iteration_n != null ? ` · iter ${entry.iteration_n}` : '';
+            openStateEntrySheetOpener({
+              entryId,
+              runId: runId,
+              title: `State entry · ${stateLabel}${iterLabel}`,
+              content: (
+                <StateEntrySheetBody
+                  entryId={entryId}
+                  runId={runId}
+                  stateTree={stateTree}
+                  spec={spec}
+                  events={events}
+                />
+              ),
+            });
+          }}
         />
       ) : null}
 

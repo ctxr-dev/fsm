@@ -26,6 +26,7 @@
 
 import type { Edge, Node } from '@xyflow/react';
 import type { FlowNodeData, FlowNodeKind } from '../components/FlowGraph';
+import { LOOP_NODE_HEIGHT, loopNodeExpandedWidth } from '../components/FlowGraph';
 
 interface SpecStateShape {
   id: string;
@@ -66,7 +67,13 @@ interface SpecDefinitionShape {
 function inferKind(state: SpecStateShape): FlowNodeKind {
   // Explicit `kind` always wins.
   if (state.kind === 'worker') return 'worker';
-  if (state.kind === 'loop') return 'worker';
+  // PR 5: loop states get their OWN custom node type so the renderer
+  // can surface per-iteration chips inside the node card. Before PR 5
+  // loop states were collapsed onto the worker variant (since they
+  // share most of the worker affordances at the inspector level); the
+  // run-graph layer needs them separately to attach the iteration
+  // strip without inflating every worker node card.
+  if (state.kind === 'loop') return 'loop';
   if (state.kind === 'inline') return 'inline';
   if (state.kind === 'terminal') return 'terminal';
   // Otherwise infer from which body field is present. Body presence
@@ -75,7 +82,8 @@ function inferKind(state: SpecStateShape): FlowNodeKind {
   // (a final worker that returns the answer; still NOT terminal in
   // the graph-rendering sense — it has work to perform).
   if (state.inline) return 'inline';
-  if (state.worker || state.loop) return 'worker';
+  if (state.loop) return 'loop';
+  if (state.worker) return 'worker';
   if (!state.transitions || state.transitions.length === 0) return 'terminal';
   return 'state';
 }
@@ -166,6 +174,18 @@ export function specToGraph(definition: unknown): SpecGraph {
 
   const nodes: Node<FlowNodeData>[] = states.map((s) => {
     const kind = inferKind(s);
+    const isLoop = kind === 'loop';
+    // Loop body declares max_iterations on the Pydantic Loop model (the
+    // server defaults to 30 when the spec author omits it). When this
+    // spec state has no loop body (e.g. the operator declared
+    // ``kind: "loop"`` without a structured body, an edge case the
+    // engine tolerates), default to 0 so the loop chip strip renders
+    // empty rather than spinning up 30 placeholder chips.
+    const loopMaxIterations = isLoop
+      ? typeof s.loop?.max_iterations === 'number'
+        ? s.loop!.max_iterations!
+        : 0
+      : 0;
 
     // Canonical sublabel: `worker: <role>` / `inline: <handler_id>` /
     // `terminal`. Always kept on `data.fullSublabel` (and surfaced via
@@ -195,9 +215,26 @@ export function specToGraph(definition: unknown): SpecGraph {
       sublabel = purpose || structural || '';
     }
 
+    // PR 5: loop nodes get their EXPANDED width baked into the layout
+    // input synchronously. dagre lays out once on mount; if we left the
+    // node at the default 270px and the operator later expanded the
+    // chip strip, sibling nodes would suddenly overlap. By pre-sizing
+    // the loop node to its widest possible layout the operator's
+    // expand/collapse toggle only swaps the chip strip's visibility,
+    // never the surrounding topology. Non-loop nodes keep the dagre
+    // default (FlowGraph fills in NODE_WIDTH/NODE_HEIGHT).
+    const expandedWidth = isLoop ? loopNodeExpandedWidth(loopMaxIterations) : undefined;
+    const expandedHeight = isLoop ? LOOP_NODE_HEIGHT : undefined;
     return {
       id: s.id,
       position: { x: 0, y: 0 }, // dagre fills these in
+      // Per-node width/height drive both the dagre layout pass (so it
+      // routes around the wider loop card) AND the MiniMap thumbnail.
+      // Spread `undefined` so xyflow falls through to its defaults for
+      // non-loop nodes; conditionally adding the keys would mutate the
+      // node shape between renders and re-trigger memoisation.
+      ...(expandedWidth !== undefined ? { width: expandedWidth } : {}),
+      ...(expandedHeight !== undefined ? { height: expandedHeight } : {}),
       // W21: copy the FULL spec state object onto data.state so the
       // click handler can render a State Inspector Sheet without
       // re-walking the spec. fullLabel/fullSublabel mirror the
@@ -219,6 +256,13 @@ export function specToGraph(definition: unknown): SpecGraph {
           fullLabel: s.id,
           fullSublabel: fs && fs.length > 0 ? fs : undefined,
           state: s as unknown as Record<string, unknown>,
+          // PR 5: structural loop metadata. ``isLoop`` is the boolean
+          // discriminator FlowGraph uses to dispatch to the loop
+          // renderer; ``loopMaxIterations`` is the spec-declared
+          // ceiling. The run-overlay layer adds per-iteration data
+          // (iterationCount, iterationEntries) on top of these.
+          isLoop,
+          loopMaxIterations,
         };
       })(),
     };

@@ -23,8 +23,9 @@
  * onNodeClick.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
+import { createContext } from 'preact';
 import dagre from 'dagre';
 import {
   BackgroundVariant,
@@ -46,7 +47,19 @@ import { useGraphViewport } from '../lib/graphViewport';
 import { Tooltip } from './Tooltip';
 import { FsmEdge, FsmEdgeClickContext } from './FsmEdge';
 
-export type FlowNodeKind = 'state' | 'worker' | 'terminal' | 'producer' | 'consumer' | 'inline';
+export type FlowNodeKind = 'state' | 'worker' | 'terminal' | 'producer' | 'consumer' | 'inline' | 'loop';
+
+/**
+ * Per-iteration chip payload. Mirrors ``LoopIterationEntry`` in
+ * ``runGraph.ts`` but is duplicated here so FlowGraph stays free of a
+ * direct import from the run-overlay layer (FlowGraph is reused by
+ * Topology, which has no notion of run iterations).
+ */
+export interface FlowLoopIteration {
+  entry_id: string;
+  iteration_n: number | null;
+  status: string;
+}
 
 export interface FlowNodeData extends Record<string, unknown> {
   kind: FlowNodeKind;
@@ -64,11 +77,31 @@ export interface FlowNodeData extends Record<string, unknown> {
    *  domain-agnostic for Topology / Drift consumers). Surfaced to
    *  onNodeClick so the caller can render an inspector Sheet. */
   state?: Record<string, unknown>;
+  /** PR 5: loop-state discriminator. When true, FlowGraph renders the
+   *  loop variant (custom node type) with an iteration chip strip
+   *  instead of the bare FsmNode card. */
+  isLoop?: boolean;
+  /** PR 5: spec-declared iteration ceiling. Used by the LoopNode
+   *  renderer to colour empty chip slots until the run actually fills
+   *  them. */
+  loopMaxIterations?: number;
+  /** PR 5: number of state-entry rows the run actually produced for
+   *  this loop state. Drives the "×N" badge in the loop node header. */
+  iterationCount?: number;
+  /** PR 5: chronological list of per-iteration entries. Each chip in
+   *  the loop node's strip is sourced from one element. */
+  iterationEntries?: FlowLoopIteration[];
 }
 
 export interface FlowGraphProps {
   nodes: readonly Node<FlowNodeData>[];
   edges: readonly Edge[];
+  /** PR 5: click handler for an iteration chip inside a loop node.
+   *  Receives the entry_id stamped on the chip; the run-detail route
+   *  wires this to ``openStateEntrySheet`` so a click on a specific
+   *  iteration opens the per-iteration inspector (Tab 1 = run values
+   *  for that entry; Tab 3 = events filtered to that entry_id). */
+  onIterationClick?: (entryId: string) => void;
   /** When true (default), runs a dagre layered layout that OVERWRITES any
    * per-node position. Pass `false` if the caller has already assigned
    * positions (e.g. a saved manual layout) and wants them preserved. */
@@ -123,6 +156,12 @@ const NODE_KIND_CLASSES: Record<FlowNodeKind, string> = {
     'border-sky-500 bg-sky-50 dark:bg-sky-900/30 text-sky-900 dark:text-sky-100',
   inline:
     'border-violet-500 bg-violet-50 dark:bg-violet-900/30 text-violet-900 dark:text-violet-100',
+  // PR 5: loop nodes get their own palette so the loop variant reads
+  // as a structurally-different shape on the graph (orange/sky blend
+  // — visually adjacent to worker since loops contain worker bodies,
+  // distinct enough to spot at a glance on a dense run topology).
+  loop:
+    'border-indigo-500 bg-indigo-50 dark:bg-indigo-900/30 text-indigo-900 dark:text-indigo-100',
   terminal:
     'border-slate-500 bg-slate-100 dark:bg-slate-900/50 text-slate-700 dark:text-slate-200',
   producer:
@@ -253,7 +292,256 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
   );
 }
 
-const NODE_TYPES = { fsmNode: FsmNode };
+// ---------------------------------------------------------------------------
+// PR 5: loop node — header card + collapsible chip strip
+// ---------------------------------------------------------------------------
+
+/**
+ * Width of the header band of a loop node (kind chip + state-id + ×N
+ * badge + expand toggle). Matches the default FsmNode card so a loop
+ * node collapsed reads at the same line height as its worker / inline
+ * siblings on the same rank.
+ */
+export const LOOP_NODE_HEADER_WIDTH = 270;
+/** Width of one iteration chip inside the strip. */
+export const LOOP_NODE_CHIP_WIDTH = 40;
+/** Hard cap on the number of chips contributed to the layout width;
+ *  beyond this the strip uses horizontal scroll so a 200-iteration
+ *  loop doesn't sprawl 8000px wide and break dagre. */
+export const LOOP_NODE_CHIP_VISIBLE_MAX = 20;
+/** Total node height (matches FsmNode for collapsed parity, plus a
+ *  fixed chip-strip height that's allocated whether the strip is
+ *  visible or not so the layout doesn't shift when the operator
+ *  expands). */
+export const LOOP_NODE_HEIGHT = NODE_HEIGHT + 36;
+
+/**
+ * Compute the layout width of a loop node given an iteration count.
+ * Exposed so ``specGraph`` / ``runGraph`` can stamp the same number
+ * onto the node BEFORE the dagre layout pass runs — that keeps dagre
+ * from re-routing edges every time the operator collapses the chip
+ * strip.
+ */
+export function loopNodeExpandedWidth(iterations: number): number {
+  const visible = Math.min(LOOP_NODE_CHIP_VISIBLE_MAX, Math.max(0, iterations));
+  return LOOP_NODE_HEADER_WIDTH + visible * LOOP_NODE_CHIP_WIDTH;
+}
+
+/** Per-status chip palette inside the loop strip. */
+const LOOP_CHIP_STATUS_CLASSES: Record<string, string> = {
+  faulted:
+    'border-red-500 bg-red-100 dark:bg-red-900/50 text-red-900 dark:text-red-100',
+  entered:
+    'border-amber-500 bg-amber-100 dark:bg-amber-900/50 text-amber-900 dark:text-amber-100',
+  exited:
+    'border-emerald-500 bg-emerald-100 dark:bg-emerald-900/50 text-emerald-900 dark:text-emerald-100',
+  completed:
+    'border-emerald-500 bg-emerald-100 dark:bg-emerald-900/50 text-emerald-900 dark:text-emerald-100',
+};
+
+function loopChipClass(status: string): string {
+  return (
+    LOOP_CHIP_STATUS_CLASSES[status.toLowerCase()] ??
+    'border-slate-400 bg-slate-100 dark:bg-slate-800/60 text-slate-700 dark:text-slate-300'
+  );
+}
+
+/** Context bridge for chip click dispatch.
+ *  Mirrors the FsmEdgeClickContext pattern (the loop node renderer is
+ *  instantiated by xyflow inside a portal, so prop-drilling
+ *  ``onIterationClick`` through the nodeTypes map would lose it). */
+export const LoopIterationClickContext = createContext<
+  ((entryId: string) => void) | null
+>(null);
+
+function LoopNode({
+  data,
+  selected,
+  sourcePosition,
+  targetPosition,
+}: NodeProps<Node<FlowNodeData>>): JSX.Element {
+  const sp = sourcePosition ?? Position.Bottom;
+  const tp = targetPosition ?? Position.Top;
+  const onIterationClick = useContext(LoopIterationClickContext);
+
+  // PR 5: the operator controls expand/collapse with the ▸ toggle. The
+  // default is collapsed so a graph full of loop nodes doesn't drown
+  // the operator in chip strips before they ask for one; expanding is
+  // one keypress / click away. State lives in the node component (not
+  // on data) so toggling doesn't trigger an overlay rebuild.
+  const [expanded, setExpanded] = useState(false);
+
+  const iterations = Array.isArray(data.iterationEntries)
+    ? data.iterationEntries
+    : [];
+  const iterationCount =
+    typeof data.iterationCount === 'number'
+      ? data.iterationCount
+      : iterations.length;
+  const maxIterations =
+    typeof data.loopMaxIterations === 'number' ? data.loopMaxIterations : 0;
+
+  const runStatus = typeof data.runStatus === 'string' ? data.runStatus : undefined;
+  const isCurrent = data.isCurrent === true;
+
+  // Reuse the status palette FsmNode owns for the header band so a
+  // loop card lights up the same emerald/amber/red as its worker
+  // siblings under the same run state.
+  const STATUS_CLASSES: Record<string, string> = {
+    not_visited:
+      'border-slate-400 bg-slate-100 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 opacity-70',
+    entered:
+      'border-amber-500 bg-amber-50 dark:bg-amber-900/40 text-amber-900 dark:text-amber-100',
+    exited:
+      'border-emerald-500 bg-emerald-50 dark:bg-emerald-900/40 text-emerald-900 dark:text-emerald-100',
+    faulted:
+      'border-red-500 bg-red-50 dark:bg-red-900/40 text-red-900 dark:text-red-100',
+  };
+  const paletteClass = runStatus
+    ? STATUS_CLASSES[runStatus] ?? NODE_KIND_CLASSES.loop
+    : NODE_KIND_CLASSES.loop;
+
+  const currentRing = isCurrent
+    ? 'ring-2 ring-amber-400 ring-offset-2 ring-offset-white dark:ring-offset-slate-900'
+    : '';
+  const currentPulse = isCurrent ? 'fsm-pulse-current' : '';
+
+  // Hover-highlight flags — same contract as FsmNode.
+  const isHovered = data.isHovered === true;
+  const isHighlighted = data.highlighted === true;
+  const isDimmed = data.dimmed === true;
+  const hoverRing = isHovered
+    ? 'ring-2 ring-amber-400 ring-offset-2 ring-offset-white dark:ring-offset-slate-900'
+    : isHighlighted
+    ? 'ring-1 ring-amber-300 ring-offset-1 ring-offset-white dark:ring-offset-slate-900'
+    : '';
+  const dimClass = isDimmed ? 'opacity-30' : '';
+
+  // The card width matches the layout-baked value (header +
+  // min(MAX, iterations) chips) so dagre's slack remains correct.
+  // The chip strip itself is independently overflow-x:auto, which
+  // means an over-MAX iteration count scrolls horizontally inside
+  // the fixed card width.
+  const cardWidth = loopNodeExpandedWidth(Math.max(maxIterations, iterationCount));
+
+  return (
+    <div
+      class={[
+        'fsm-node fsm-loop-node relative rounded-md border-2 shadow-sm',
+        'flex flex-col overflow-hidden',
+        'transition-opacity duration-150 motion-reduce:transition-none',
+        paletteClass,
+        selected ? 'ring-2 ring-emerald-400 ring-offset-1' : '',
+        currentRing,
+        currentPulse,
+        hoverRing,
+        dimClass,
+      ].join(' ')}
+      data-testid="loop-node"
+      /* eslint-disable-next-line react/forbid-dom-props -- xyflow loop node needs computed pixel width matched to dagre layout */
+      style={{ width: `${cardWidth}px`, minHeight: `${LOOP_NODE_HEIGHT}px` }}
+    >
+      <Handle
+        type="target"
+        position={tp}
+        style={{ background: 'currentColor', width: 8, height: 8, border: 'none' }}
+      />
+      {/* Header band — kind chip + label + ×N badge + expand toggle */}
+      <div class="flex flex-col gap-1 px-4 py-3">
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-[9px] uppercase tracking-wider opacity-60 leading-none">
+            loop
+          </span>
+          <div class="flex items-center gap-1">
+            <span
+              class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-black/10 dark:bg-white/10"
+              title={`${iterationCount} of ${maxIterations} iterations`}
+              data-testid="loop-iteration-badge"
+            >
+              ×{iterationCount}
+              {maxIterations > 0 ? ` / ${maxIterations}` : ''}
+            </span>
+            <button
+              type="button"
+              aria-expanded={expanded ? 'true' : 'false'}
+              aria-label={
+                expanded ? 'Collapse iteration chips' : 'Expand iteration chips'
+              }
+              data-testid="loop-expand-toggle"
+              onClick={(e) => {
+                // Stop the click from bubbling to xyflow's onNodeClick
+                // handler — toggling the chip strip is its own
+                // affordance, NOT a "select the loop node" gesture.
+                e.stopPropagation();
+                setExpanded((v) => !v);
+              }}
+              class={[
+                'text-[10px] font-semibold w-5 h-5 rounded',
+                'flex items-center justify-center',
+                'bg-black/5 dark:bg-white/5',
+                'hover:bg-black/10 dark:hover:bg-white/10',
+                'focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400',
+                'motion-safe:transition-transform',
+                expanded ? 'rotate-90' : '',
+              ].join(' ')}
+            >
+              ▸
+            </button>
+          </div>
+        </div>
+        <Tooltip content={data.fullLabel ?? data.label} delay={400}>
+          <span class="font-semibold text-sm truncate block w-full leading-tight">
+            {data.label}
+          </span>
+        </Tooltip>
+      </div>
+      {/* Chip strip — only painted when expanded. Width is fixed by
+          the outer card; overflow-x:auto handles the >20-iteration
+          case so the operator can scroll laterally rather than the
+          dagre layout shifting around. */}
+      {expanded && iterations.length > 0 ? (
+        <div
+          class="flex items-center gap-1 px-3 pb-2 overflow-x-auto"
+          data-testid="loop-chip-strip"
+          role="list"
+          aria-label={`Iteration entries for ${data.label}`}
+        >
+          {iterations.map((it) => (
+            <button
+              key={it.entry_id}
+              type="button"
+              role="listitem"
+              data-testid="loop-chip"
+              data-entry-id={it.entry_id}
+              title={`Iteration ${it.iteration_n ?? '?'} (${it.status})`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onIterationClick?.(it.entry_id);
+              }}
+              class={[
+                'shrink-0 inline-flex items-center justify-center',
+                'rounded border text-[10px] font-mono leading-none',
+                'h-6 min-w-[36px] px-1',
+                'focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400',
+                'hover:brightness-110',
+                loopChipClass(it.status),
+              ].join(' ')}
+            >
+              {it.iteration_n ?? '·'}
+            </button>
+          ))}
+        </div>
+      ) : null}
+      <Handle
+        type="source"
+        position={sp}
+        style={{ background: 'currentColor', width: 8, height: 8, border: 'none' }}
+      />
+    </div>
+  );
+}
+
+const NODE_TYPES = { fsmNode: FsmNode, loopNode: LoopNode };
 const EDGE_TYPES = { fsmEdge: FsmEdge };
 
 /**
@@ -361,7 +649,16 @@ function applyDagreLayout(
     marginy: 48,
     ranker: nodes.length > 8 ? 'network-simplex' : 'tight-tree',
   });
-  for (const n of nodes) g.setNode(n.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
+  for (const n of nodes) {
+    // PR 5: respect per-node width/height when the caller already
+    // stamped them (loop nodes do — their card width depends on the
+    // iteration count, which the run-overlay layer knows BEFORE the
+    // layout pass). Fall back to the FSM defaults for every other
+    // node so the existing layout numbers stay unchanged.
+    const w = typeof n.width === 'number' ? n.width : NODE_WIDTH;
+    const h = typeof n.height === 'number' ? n.height : NODE_HEIGHT;
+    g.setNode(n.id, { width: w, height: h });
+  }
   for (const e of edges) {
     const text = typeof e.label === 'string' ? e.label : '';
     // Reserve label space proportionally so dagre routes around
@@ -415,19 +712,25 @@ function applyDagreLayout(
 
   const positioned = nodes.map((n) => {
     const { x, y } = g.node(n.id);
+    const w = typeof n.width === 'number' ? n.width : NODE_WIDTH;
+    const h = typeof n.height === 'number' ? n.height : NODE_HEIGHT;
+    // PR 5: dispatch to the loop custom node type for loop states.
+    // The discriminator is data.isLoop — set by specGraph for loop
+    // bodies. Every other node keeps the existing fsmNode renderer.
+    const isLoop = (n.data as { isLoop?: boolean } | undefined)?.isLoop === true;
     return {
       ...n,
-      position: { x: x - NODE_WIDTH / 2, y: y - NODE_HEIGHT / 2 },
+      position: { x: x - w / 2, y: y - h / 2 },
       // xyflow v12 MiniMap reads node.width / node.height to draw the
       // thumbnail rectangle. Without these, the mini-map shows only the
       // viewport indicator + grid, no node dots (W22 user-visible bug).
       // Stamping the same dimensions we already feed dagre keeps the
       // mini-map in lockstep with the on-canvas layout.
-      width: NODE_WIDTH,
-      height: NODE_HEIGHT,
+      width: w,
+      height: h,
       sourcePosition: direction === 'LR' ? Position.Right : Position.Bottom,
       targetPosition: direction === 'LR' ? Position.Left : Position.Top,
-      type: 'fsmNode',
+      type: isLoop ? 'loopNode' : 'fsmNode',
     };
   });
   return { positioned, edgeLabelPositions };
@@ -522,6 +825,7 @@ export function FlowGraph({
   direction = 'TB',
   onNodeClick,
   onEdgeClick,
+  onIterationClick,
   selectedNodeId,
   miniMap,
   controls = true,
@@ -618,18 +922,22 @@ export function FlowGraph({
       // type is also applied so callers don't have to set it manually.
       const sp = direction === 'LR' ? Position.Right : Position.Bottom;
       const tp = direction === 'LR' ? Position.Left : Position.Top;
-      const manual = nodes.map((n) => ({
-        ...n,
-        // W22: stamp width/height so MiniMap renders thumbnails even
-        // for callers that supply manual positions. Only fill in
-        // defaults — callers that explicitly set per-node dimensions
-        // (a future cardinality-aware layout) keep their values.
-        width: n.width ?? NODE_WIDTH,
-        height: n.height ?? NODE_HEIGHT,
-        sourcePosition: n.sourcePosition ?? sp,
-        targetPosition: n.targetPosition ?? tp,
-        type: n.type ?? 'fsmNode',
-      }));
+      const manual = nodes.map((n) => {
+        // PR 5: same loop dispatch as the auto-layout branch.
+        const isLoop = (n.data as { isLoop?: boolean } | undefined)?.isLoop === true;
+        return {
+          ...n,
+          // W22: stamp width/height so MiniMap renders thumbnails even
+          // for callers that supply manual positions. Only fill in
+          // defaults — callers that explicitly set per-node dimensions
+          // (a future cardinality-aware layout) keep their values.
+          width: n.width ?? NODE_WIDTH,
+          height: n.height ?? NODE_HEIGHT,
+          sourcePosition: n.sourcePosition ?? sp,
+          targetPosition: n.targetPosition ?? tp,
+          type: n.type ?? (isLoop ? 'loopNode' : 'fsmNode'),
+        };
+      });
       return { positioned: manual, edgeLabelPositions: new Map() as DagreEdgeLabelMap };
     }
     return applyDagreLayout(nodes, edges, direction);
@@ -747,6 +1055,7 @@ export function FlowGraph({
   // clip nodes at the viewport edges.
   return (
     <FsmEdgeClickContext.Provider value={onEdgeClick ?? null}>
+    <LoopIterationClickContext.Provider value={onIterationClick ?? null}>
     <div
       ref={wrapperRef}
       class={[
@@ -878,6 +1187,7 @@ export function FlowGraph({
         </Tooltip>
       </div>
     </div>
+    </LoopIterationClickContext.Provider>
     </FsmEdgeClickContext.Provider>
   );
 }

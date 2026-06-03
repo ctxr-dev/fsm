@@ -380,6 +380,119 @@ describe('overlayRunOnSpecGraph', () => {
   });
 });
 
+describe('PR 5: loop iteration entries', () => {
+  test('buildRunOverlay collects iteration entries per state_id in chronological order', () => {
+    // 3 iterations of state "tick" — entry_seq drives the chip order.
+    const tree = node('loop_root', {
+      entry_seq: 0,
+      exited_at: '2026-01-01T00:00:01Z',
+      status: 'exited',
+      children: [
+        node('tick', {
+          entry_id: 'tick-1',
+          entry_seq: 1,
+          iteration_n: 1,
+          exited_at: '2026-01-01T00:00:02Z',
+          status: 'exited',
+          children: [
+            node('tick', {
+              entry_id: 'tick-2',
+              entry_seq: 2,
+              iteration_n: 2,
+              exited_at: '2026-01-01T00:00:03Z',
+              status: 'exited',
+              children: [
+                node('tick', {
+                  entry_id: 'tick-3',
+                  entry_seq: 3,
+                  iteration_n: 3,
+                  exited_at: null,
+                  status: 'entered',
+                }),
+              ],
+            }),
+          ],
+        }),
+      ],
+    });
+    const o = buildRunOverlay(manifest('tick'), tree, noEvents);
+    const bucket = o.iterationEntriesByStateId.get('tick');
+    expect(bucket).toBeDefined();
+    expect(bucket!.map((e) => e.entry_id)).toEqual(['tick-1', 'tick-2', 'tick-3']);
+    expect(bucket!.map((e) => e.iteration_n)).toEqual([1, 2, 3]);
+    expect(bucket!.map((e) => e.status)).toEqual(['exited', 'exited', 'entered']);
+  });
+
+  test('buildRunOverlay returns empty bucket for an unvisited state', () => {
+    const o = buildRunOverlay(manifest(null), null, noEvents);
+    expect(o.iterationEntriesByStateId.get('never_entered')).toBeUndefined();
+  });
+
+  test('overlayRunOnSpecGraph plumbs iterationCount + iterationEntries onto a loop node', () => {
+    const specNode = (id: string, opts: Partial<FlowNodeData> = {}): Node<FlowNodeData> => ({
+      id,
+      position: { x: 0, y: 0 },
+      data: { kind: 'loop', label: id, isLoop: true, loopMaxIterations: 10, ...opts } as FlowNodeData,
+    });
+    const base = {
+      nodes: [specNode('tick')],
+      edges: [] as Edge[],
+    };
+    const tree = node('tick', {
+      entry_id: 'tick-1',
+      entry_seq: 1,
+      iteration_n: 1,
+      exited_at: '2026-01-01T00:00:01Z',
+      status: 'exited',
+      children: [
+        node('tick', {
+          entry_id: 'tick-2',
+          entry_seq: 2,
+          iteration_n: 2,
+          exited_at: null,
+          status: 'entered',
+        }),
+      ],
+    });
+    const overlay = buildRunOverlay(manifest('tick'), tree, noEvents);
+    const out = overlayRunOnSpecGraph(base, overlay);
+    const data = out.nodes[0].data as FlowNodeData & {
+      iterationCount?: number;
+      iterationEntries?: Array<{ entry_id: string; iteration_n: number | null; status: string }>;
+    };
+    expect(data.iterationCount).toBe(2);
+    expect(data.iterationEntries?.map((e) => e.entry_id)).toEqual(['tick-1', 'tick-2']);
+    expect(data.iterationEntries?.map((e) => e.iteration_n)).toEqual([1, 2]);
+  });
+
+  test('overlayRunOnSpecGraph re-stamps loop node width when iterations exceed spec ceiling', () => {
+    const specNode = (id: string): Node<FlowNodeData> => ({
+      id,
+      position: { x: 0, y: 0 },
+      width: 270 + 2 * 40, // spec said max 2
+      data: { kind: 'loop', label: id, isLoop: true, loopMaxIterations: 2 } as FlowNodeData,
+    });
+    const base = { nodes: [specNode('tick')], edges: [] as Edge[] };
+    // The run actually ran 5 iterations (engine bumped past declared max).
+    let chain: StateNode | null = null;
+    for (let i = 5; i >= 1; i -= 1) {
+      const opts: Partial<StateNode> = {
+        entry_id: `tick-${i}`,
+        entry_seq: i,
+        iteration_n: i,
+        exited_at: i === 5 ? null : '2026-01-01T00:00:01Z',
+        status: i === 5 ? 'entered' : 'exited',
+        children: chain ? [chain] : [],
+      };
+      chain = node('tick', opts);
+    }
+    const overlay = buildRunOverlay(manifest('tick'), chain, noEvents);
+    const out = overlayRunOnSpecGraph(base, overlay);
+    // Width should expand to fit the OBSERVED 5 iterations: 270 + 5*40.
+    expect(out.nodes[0].width).toBe(270 + 5 * 40);
+  });
+});
+
 describe('overlayProgress', () => {
   test('counts visited and faulted distinctly from total', () => {
     const tree = node('a', {
