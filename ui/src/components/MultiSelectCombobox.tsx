@@ -1,32 +1,38 @@
 /**
- * ``<MultiSelectCombobox>`` — searchable multi-select dropdown.
+ * ``<MultiSelectCombobox>`` -- searchable multi-select dropdown.
  *
  * W23d centrepiece: the user asked for a "multiselect dropdown with
  * search, saved user choice in local storage per project name" on
  * /runs to filter by spec slug.
  *
- * Generic by design — the runs route binds it to SpecSummary today;
+ * Generic by design: the runs route binds it to SpecSummary today;
  * future routes can bind it to any T with a stable id + label
  * (drift signal kinds, tool-name filters, etc).
  *
  * Visual:
- *   - Trigger ``<button>`` shows the active selection count
- *     ("All specs" / "code-reviewer v3" / "2 specs" / "5 specs").
+ *   - Trigger ``<button>`` shows the active selection summary
+ *     ("All" / "code-reviewer v3" / "a + b" / "N selected").
  *   - Dropdown panel positioned absolutely below the trigger.
  *   - Search input autofocuses on open.
- *   - Each option row is a labelled ``<input type="checkbox">``.
+ *   - Each option row is a ``role="option"`` with ``aria-selected``
+ *     reflecting its state; selection is purely a click / Enter /
+ *     Space on the row itself. No nested ``<input type=checkbox>`` is
+ *     rendered (it would conflict with ARIA listbox semantics); the
+ *     visual check mark is decorative and ``aria-hidden``.
  *   - "Clear" + "Select all" buttons at the bottom (Select all
  *     respects the active search filter).
  *
  * Keyboard:
- *   - Click trigger / Enter / Space → opens panel.
- *   - Search input captures Up/Down to navigate the option list.
- *   - Space on a focused option toggles.
- *   - Escape closes panel.
- *   - Tab closes panel + moves focus naturally.
+ *   - Click trigger / Enter / Space on the trigger opens the panel.
+ *   - Standard text-input keyboard handling on the search field.
+ *   - Arrow Down from the search input (or first option) moves focus
+ *     into / through the option list; Arrow Up walks back. Options
+ *     use a roving tabindex so Tab also reaches the active option.
+ *   - Click / Space / Enter on a focused option toggles selection.
+ *   - Escape closes the panel and restores focus to the trigger.
  *
  * Click-outside dismissal is wired to a single document-level
- * mousedown listener that's attached only while the panel is open.
+ * mousedown listener attached only while the panel is open.
  */
 
 import type { JSX } from 'preact';
@@ -81,9 +87,16 @@ export function MultiSelectCombobox<T>({
 }: MultiSelectComboboxProps<T>): JSX.Element {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
+  const [focusedIndex, setFocusedIndex] = useState(-1);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
+  const optionRefs = useRef<Array<HTMLLIElement | null>>([]);
+  // Track previous `open` so we only restore focus on a true
+  // open -> closed transition. Without this, the effect would fire
+  // on the initial mount (open === false) and steal focus on page
+  // load, which is exactly the bug the Copilot reviewer flagged.
+  const prevOpenRef = useRef(false);
 
   // Close on click-outside while open.
   useEffect(() => {
@@ -99,13 +112,19 @@ export function MultiSelectCombobox<T>({
     return () => document.removeEventListener('mousedown', onMousedown);
   }, [open]);
 
-  // Autofocus search on open; restore focus to trigger on close.
+  // Autofocus search on open; restore focus to trigger only on
+  // the open -> closed transition (never on initial mount).
   useEffect(() => {
     if (open) {
       const t = setTimeout(() => searchRef.current?.focus(), 0);
+      prevOpenRef.current = true;
       return () => clearTimeout(t);
     }
-    triggerRef.current?.focus();
+    if (prevOpenRef.current) {
+      triggerRef.current?.focus();
+      prevOpenRef.current = false;
+    }
+    setFocusedIndex(-1);
     return undefined;
   }, [open]);
 
@@ -136,6 +155,30 @@ export function MultiSelectCombobox<T>({
     const next = new Set(selected);
     for (const opt of filtered) next.add(getId(opt));
     onChange(next);
+  };
+
+  // Roving-tabindex navigation. Move focus among filtered options
+  // with Arrow Up / Arrow Down; keep `focusedIndex` clamped when
+  // the filter changes underneath us. Home/End jump to ends.
+  useEffect(() => {
+    if (focusedIndex < 0) return;
+    if (focusedIndex >= filtered.length) {
+      setFocusedIndex(filtered.length > 0 ? filtered.length - 1 : -1);
+      return;
+    }
+    const el = optionRefs.current[focusedIndex];
+    if (el) el.focus();
+  }, [focusedIndex, filtered.length]);
+
+  const moveFocus = (delta: number) => {
+    if (filtered.length === 0) return;
+    setFocusedIndex((cur) => {
+      const start = cur < 0 ? (delta > 0 ? -1 : filtered.length) : cur;
+      const next = start + delta;
+      if (next < 0) return 0;
+      if (next >= filtered.length) return filtered.length - 1;
+      return next;
+    });
   };
 
   return (
@@ -187,6 +230,22 @@ export function MultiSelectCombobox<T>({
               type="text"
               value={query}
               onInput={(e) => setQuery((e.currentTarget as HTMLInputElement).value)}
+              onKeyDown={(e) => {
+                if (e.key === 'ArrowDown') {
+                  e.preventDefault();
+                  if (filtered.length > 0) setFocusedIndex(0);
+                } else if (e.key === 'Home') {
+                  if (filtered.length > 0) {
+                    e.preventDefault();
+                    setFocusedIndex(0);
+                  }
+                } else if (e.key === 'End') {
+                  if (filtered.length > 0) {
+                    e.preventDefault();
+                    setFocusedIndex(filtered.length - 1);
+                  }
+                }
+              }}
               placeholder={searchPlaceholder}
               aria-label="Filter options"
               class={[
@@ -208,36 +267,102 @@ export function MultiSelectCombobox<T>({
                 No matches
               </li>
             ) : (
-              filtered.map((opt) => {
+              filtered.map((opt, index) => {
                 const id = getId(opt);
                 const checked = selected.has(id);
                 const sub = getSubLabel?.(opt);
+                // Roving tabindex: only the active option is in the
+                // tab order. The remaining options stay at -1 and are
+                // reached via Arrow Up/Down. This keeps the listbox
+                // pattern intact while making Space/Enter reachable.
+                const isActive =
+                  focusedIndex === index ||
+                  (focusedIndex < 0 && index === 0);
+                // ARIA listbox-with-multi-select: each option carries
+                // its own aria-selected; we deliberately do NOT nest a
+                // checkbox input inside (mixing role=option with a
+                // focusable interactive descendant violates the
+                // listbox pattern). The check mark is decorative.
                 return (
-                  <li key={id} role="option" aria-selected={checked ? 'true' : 'false'}>
-                    <label
+                  <li
+                    key={id}
+                    ref={(el) => {
+                      optionRefs.current[index] = el;
+                    }}
+                    role="option"
+                    aria-selected={checked ? 'true' : 'false'}
+                    tabIndex={isActive ? 0 : -1}
+                    onClick={() => {
+                      setFocusedIndex(index);
+                      toggle(id);
+                    }}
+                    onFocus={() => {
+                      if (focusedIndex !== index) setFocusedIndex(index);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === ' ' || e.key === 'Enter') {
+                        e.preventDefault();
+                        toggle(id);
+                      } else if (e.key === 'ArrowDown') {
+                        e.preventDefault();
+                        moveFocus(1);
+                      } else if (e.key === 'ArrowUp') {
+                        e.preventDefault();
+                        if (index === 0) {
+                          setFocusedIndex(-1);
+                          searchRef.current?.focus();
+                        } else {
+                          moveFocus(-1);
+                        }
+                      } else if (e.key === 'Home') {
+                        e.preventDefault();
+                        setFocusedIndex(0);
+                      } else if (e.key === 'End') {
+                        e.preventDefault();
+                        setFocusedIndex(filtered.length - 1);
+                      }
+                    }}
+                    class={[
+                      'flex items-start gap-2 px-3 py-1.5 cursor-pointer select-none',
+                      'hover:bg-slate-50 dark:hover:bg-slate-700',
+                      'focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500',
+                      checked ? 'bg-emerald-50/50 dark:bg-emerald-900/20' : '',
+                    ].join(' ')}
+                  >
+                    <span
+                      aria-hidden="true"
                       class={[
-                        'flex items-start gap-2 px-3 py-1.5 cursor-pointer',
-                        'hover:bg-slate-50 dark:hover:bg-slate-700',
-                        checked ? 'bg-emerald-50/50 dark:bg-emerald-900/20' : '',
+                        'mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center',
+                        'rounded border',
+                        checked
+                          ? 'bg-emerald-600 border-emerald-600 text-white'
+                          : 'bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-600',
                       ].join(' ')}
                     >
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={() => toggle(id)}
-                        class="mt-0.5 h-4 w-4 rounded border-slate-300 dark:border-slate-600 text-emerald-600 focus:ring-emerald-500"
-                      />
-                      <span class="min-w-0 flex-1 leading-tight">
-                        <span class="block text-sm text-slate-800 dark:text-slate-100 truncate">
-                          {getLabel(opt)}
-                        </span>
-                        {sub ? (
-                          <span class="block text-[10px] text-slate-500 dark:text-slate-400 truncate">
-                            {sub}
-                          </span>
-                        ) : null}
+                      {checked ? (
+                        <svg
+                          viewBox="0 0 16 16"
+                          class="h-3 w-3"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2.5"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        >
+                          <polyline points="3.5 8.5 6.5 11.5 12.5 5" />
+                        </svg>
+                      ) : null}
+                    </span>
+                    <span class="min-w-0 flex-1 leading-tight">
+                      <span class="block text-sm text-slate-800 dark:text-slate-100 truncate">
+                        {getLabel(opt)}
                       </span>
-                    </label>
+                      {sub ? (
+                        <span class="block text-[10px] text-slate-500 dark:text-slate-400 truncate">
+                          {sub}
+                        </span>
+                      ) : null}
+                    </span>
                   </li>
                 );
               })

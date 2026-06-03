@@ -38,7 +38,15 @@ jobs:
   e2e:
     name: E2E (Playwright Chromium)
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    # 25min ceiling: ``playwright install --with-deps chromium`` runs
+    # ``apt-get update`` + a ~200 MB browser download, which on a cold
+    # hosted runner with a slow azure apt mirror routinely consumes
+    # 8-10 minutes by itself. The prior 12min cap killed the job mid
+    # apt download with the actual e2e suite still pending; the tests
+    # themselves complete in under 2 minutes locally, so 25min is the
+    # smallest budget that absorbs the install jitter without hiding
+    # genuine test hangs.
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4

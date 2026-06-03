@@ -1,9 +1,12 @@
 /**
- * /journal — recovery wizard for pending / ready journal txns.
+ * /journal — recovery wizard for journal txns.
  *
- * Lists every txn whose status != 'finalised', grouped by run_id.
- * Each txn row exposes its staged_writes via a JsonViewer + Discard
- * / Replay buttons gated on status. Recovery posts through
+ * Lists journal txns grouped by run_id, scoped by the operator-selected
+ * status filter (All / Pending / Ready to finalise / Finalised). The
+ * filter is pushed down to the server via api.listJournalTxns({status})
+ * so the route renders whatever the server returned for the chosen
+ * scope. Each txn row exposes its staged_writes via a JsonViewer +
+ * Discard / Replay buttons gated on status. Recovery posts through
  * `api.recoverJournal(runId, action)`.
  */
 
@@ -24,7 +27,7 @@ import {
   type PillVariant,
   type TimelineItem,
 } from '../components';
-import { api, ApiError, type JournalTxn, type Page } from '../lib/api';
+import { api, ApiError, type JournalTxn, type ListJournalTxnsParams, type Page } from '../lib/api';
 
 const DEFAULT_PAGE_SIZE = 200;
 
@@ -49,13 +52,13 @@ interface Pending {
   txnId: string;
 }
 
-type JournalStatusFilter = 'all' | 'pending' | 'ready_to_finalise' | 'finalised';
+type JournalStatusFilter = 'all' | NonNullable<ListJournalTxnsParams['status']>;
 
-const STATUS_FILTERS: readonly { value: JournalStatusFilter; label: string; variant: 'neutral' | 'warning' | 'info' | 'success' }[] = [
-  { value: 'all', label: 'All', variant: 'neutral' },
-  { value: 'pending', label: 'Pending', variant: 'info' },
-  { value: 'ready_to_finalise', label: 'Ready to finalise', variant: 'warning' },
-  { value: 'finalised', label: 'Finalised', variant: 'success' },
+const STATUS_FILTERS: readonly { value: JournalStatusFilter; label: string }[] = [
+  { value: 'all', label: 'All' },
+  { value: 'pending', label: 'Pending' },
+  { value: 'ready_to_finalise', label: 'Ready to finalise' },
+  { value: 'finalised', label: 'Finalised' },
 ];
 
 export function JournalRoute(): JSX.Element {
@@ -76,10 +79,7 @@ export function JournalRoute(): JSX.Element {
     // honest population size for the chosen scope rather than a
     // post-fetch length() that would drop to zero after every filter
     // narrowing.
-    const params: { page: number; page_size: number; status?: 'pending' | 'ready_to_finalise' | 'finalised' } = {
-      page,
-      page_size: pageSize,
-    };
+    const params: ListJournalTxnsParams = { page, page_size: pageSize };
     if (statusFilter !== 'all') params.status = statusFilter;
     api.listJournalTxns(params)
       .then((resp) => {
@@ -101,11 +101,13 @@ export function JournalRoute(): JSX.Element {
 
   const txns = txnsPage?.items ?? null;
 
+  // W22b6 fix: honour whatever scope the server returned. The previous
+  // hard-coded `status === 'finalised'` skip meant the Finalised and All
+  // tabs rendered an empty list even when the server returned txns.
   const grouped = useMemo(() => {
     if (!txns) return [];
     const map = new Map<string, JournalTxn[]>();
     for (const t of txns) {
-      if (t.status === 'finalised') continue; // wizard's job is non-finalised only
       if (!map.has(t.run_id)) map.set(t.run_id, []);
       map.get(t.run_id)!.push(t);
     }
@@ -129,48 +131,48 @@ export function JournalRoute(): JSX.Element {
 
   const items = useMemo<TimelineItem[]>(
     () =>
-      (txns ?? [])
-        .filter((t) => t.status !== 'finalised')
-        .map((t) => ({
-          id: t.id,
-          timestamp: t.started_at,
-          title: `txn ${t.id.slice(0, 7)} (run ${t.run_id.slice(0, 7)})`,
-          kind: t.status,
-          variant: statusVariant(t.status),
-          payload: (
-            <div class="space-y-2">
-              <div class="flex flex-wrap gap-2 items-center text-xs">
-                <span>started {fmt(t.started_at)}</span>
-                <span>ready {fmt(t.ready_at)}</span>
-                <span>{t.staged_writes?.length ?? 0} staged write(s)</span>
-              </div>
-              <JsonViewer
-                value={t.staged_writes}
-                rootLabel="staged_writes"
-                mode="inline"
-                maxInlineHeight="max-h-40"
-              />
-              <div class="flex gap-2">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setPending({ runId: t.run_id, action: 'replay', txnId: t.id })}
-                  disabled={t.status === 'pending'}
-                  title={t.status === 'pending' ? 'Replay only valid for ready_to_finalise' : 'Replay'}
-                >
-                  Replay
-                </Button>
-                <Button
-                  variant="danger"
-                  size="sm"
-                  onClick={() => setPending({ runId: t.run_id, action: 'discard', txnId: t.id })}
-                >
-                  Discard
-                </Button>
-              </div>
+      (txns ?? []).map((t) => ({
+        id: t.id,
+        timestamp: t.started_at,
+        title: `txn ${t.id.slice(0, 7)} (run ${t.run_id.slice(0, 7)})`,
+        kind: t.status,
+        variant: statusVariant(t.status),
+        payload: (
+          <div class="space-y-2">
+            <div class="flex flex-wrap gap-2 items-center text-xs">
+              <span>started {fmt(t.started_at)}</span>
+              <span>ready {fmt(t.ready_at)}</span>
+              <span>{t.staged_writes?.length ?? 0} staged write(s)</span>
             </div>
-          ),
-        })),
+            <JsonViewer
+              value={t.staged_writes}
+              rootLabel="staged_writes"
+              mode="inline"
+              maxInlineHeight="max-h-40"
+            />
+            <div class="flex gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setPending({ runId: t.run_id, action: 'replay', txnId: t.id })}
+                disabled={t.status !== 'ready_to_finalise'}
+                title={t.status !== 'ready_to_finalise' ? 'Replay only valid for ready_to_finalise' : 'Replay'}
+              >
+                Replay
+              </Button>
+              <Button
+                variant="danger"
+                size="sm"
+                onClick={() => setPending({ runId: t.run_id, action: 'discard', txnId: t.id })}
+                disabled={t.status === 'finalised'}
+                title={t.status === 'finalised' ? 'Cannot discard a finalised txn' : 'Discard'}
+              >
+                Discard
+              </Button>
+            </div>
+          </div>
+        ),
+      })),
     [txns],
   );
 
@@ -197,16 +199,18 @@ export function JournalRoute(): JSX.Element {
       </header>
       {/* W22b6: status filter row. Drives Page.total via the server's
           ?status= query param so the readout under the table reflects
-          the filtered population, not the unfiltered one. */}
-      <div role="tablist" aria-label="Filter journal txns by status" class="flex flex-wrap items-center gap-1.5">
+          the filtered population, not the unfiltered one. Uses
+          aria-pressed on plain buttons (not role=tab) since these
+          filter buttons don't expose tabpanels or tab-style keyboard
+          navigation. */}
+      <div role="group" aria-label="Filter journal txns by status" class="flex flex-wrap items-center gap-1.5">
         {STATUS_FILTERS.map((f) => {
           const active = f.value === statusFilter;
           return (
             <button
               key={f.value}
               type="button"
-              role="tab"
-              aria-selected={active ? 'true' : 'false'}
+              aria-pressed={active ? 'true' : 'false'}
               onClick={() => {
                 setStatusFilter(f.value);
                 if (page !== 1) setPage(1);
@@ -231,7 +235,12 @@ export function JournalRoute(): JSX.Element {
         {txnsPage === null ? (
           <div class="flex items-center justify-center py-12"><Spinner label="Loading journal" /></div>
         ) : grouped.length === 0 ? (
-          <EmptyState title="No pending txns" message="Every journal txn across every run is finalised." />
+          <EmptyState
+            title="No txns in scope"
+            message={statusFilter === 'all'
+              ? 'No journal txns recorded yet.'
+              : `No txns with status ${statusFilter} in this page.`}
+          />
         ) : (
           <div class="space-y-4">
             {grouped.map(([runId, runTxns]) => (

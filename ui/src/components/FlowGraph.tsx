@@ -23,11 +23,12 @@
  * onNodeClick.
  */
 
-import { useMemo } from 'preact/hooks';
+import { useEffect, useMemo, useRef } from 'preact/hooks';
 import type { JSX } from 'preact';
 import dagre from 'dagre';
 import {
   BackgroundVariant,
+  PanOnScrollMode,
   ReactFlow,
   Background,
   Controls,
@@ -142,29 +143,57 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
   // layout numbers; staying inline keeps the two values in literal
   // sync. Suppress the no-inline-styles lint for this single case.
   /* eslint-disable-next-line react/forbid-dom-props -- xyflow nodes need fixed pixel dimensions matched to dagre layout */
-  // Layout (W21, post 50% size bump):
-  //   ┌──────────────────────────────────────────────┐
-  //   │ KIND                                         │  row 1: kind chip (tiny)
-  //   │ synthesize_release_readiness                 │  row 2: label, FULL width
-  //   │ inline: synthesize_release_handler           │  row 3: sublabel, full width
-  //   └──────────────────────────────────────────────┘
-  // Moving the kind label to its own row above the main label gives
-  // the state id the entire 270-px node width to expand into, which is
-  // what the user asked for: "make sure all labels and texts fit the
-  // node shape, not going outside of it". Long ids (>~32 chars) still
-  // truncate visually but their full text remains reachable via the
-  // Tooltip wrapper.
+  // W23b regression fix: the node card is INTENTIONALLY content-thin.
+  // The only on-card affordances are the tiny uppercase kind chip and
+  // the bold state-id label. Any additional structural / canonical
+  // information (worker role, inline handler, output counts, transition
+  // counts, post-validations, verifier presence) is reachable via the
+  // click-to-open inspector Sheet, which is the source of truth for
+  // per-state detail. Rendering a sublabel here re-introduces the W22
+  // chaff the user explicitly rejected ("7 outputs / post-val x2" /
+  // "worker: tree-descender" beneath every node).
+  //
+  // Layout:
+  //   +----------------------------------------------+
+  //   | KIND                                         |  row 1: kind chip (tiny)
+  //   | synthesize_release_readiness                 |  row 2: label, FULL width
+  //   +----------------------------------------------+
+  // Click the card to open the full state inspector.
+  const runStatus = typeof data.runStatus === 'string' ? data.runStatus : undefined;
+  const isCurrent = data.isCurrent === true;
+  // RUN-STATUS palette takes precedence over the kind palette when a
+  // node carries a runStatus (set by overlayRunOnSpecGraph). This makes
+  // the status the dominant visual on the inner card so the legend's
+  // promise (amber=current, emerald=visited, red=fault, slate=pending)
+  // actually shows up on the graph. The kind chip remains visible at
+  // the top of the card so the operator still sees worker/inline/etc.
+  const STATUS_CLASSES: Record<string, string> = {
+    not_visited:
+      'border-slate-400 bg-slate-100 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 opacity-70',
+    entered:
+      'border-amber-500 bg-amber-50 dark:bg-amber-900/40 text-amber-900 dark:text-amber-100',
+    exited:
+      'border-emerald-500 bg-emerald-50 dark:bg-emerald-900/40 text-emerald-900 dark:text-emerald-100',
+    faulted:
+      'border-red-500 bg-red-50 dark:bg-red-900/40 text-red-900 dark:text-red-100',
+  };
+  const paletteClass = runStatus
+    ? STATUS_CLASSES[runStatus] ?? NODE_KIND_CLASSES[kind]
+    : NODE_KIND_CLASSES[kind];
+  const currentRing = isCurrent
+    ? 'ring-2 ring-amber-400 ring-offset-2 ring-offset-white dark:ring-offset-slate-900'
+    : '';
   return (
     <div
       class={[
         'fsm-node relative rounded-md border-2 shadow-sm px-4 py-3',
-        // justify-center centers the kind/label/sublabel block
-        // vertically within the (fixed) node height. gap-1 gives the
-        // three rows even breathing room instead of the previous
-        // gap-0.5 which clustered them too tightly at the top.
+        // justify-center centers the kind/label block vertically within
+        // the (fixed) node height. gap-1 gives the two rows even
+        // breathing room.
         'flex flex-col gap-1 justify-center overflow-hidden',
-        NODE_KIND_CLASSES[kind],
+        paletteClass,
         selected ? 'ring-2 ring-emerald-400 ring-offset-1' : '',
+        currentRing,
       ].join(' ')}
       style={{ width: `${NODE_WIDTH}px`, minHeight: `${NODE_HEIGHT}px` }}
     >
@@ -178,20 +207,10 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
       </span>
       <Tooltip content={data.fullLabel ?? data.label} delay={400}>
         <span class="font-semibold text-sm truncate block w-full leading-tight">
+          {typeof data.labelPrefix === 'string' ? data.labelPrefix : ''}
           {data.label}
         </span>
       </Tooltip>
-      {data.sublabel ? (
-        <Tooltip content={data.fullSublabel ?? data.sublabel} delay={400}>
-          {/* <span> not <div>: Tooltip's wrapper renders as a <span>,
-              and HTML doesn't allow <div> inside <span>. The `block`
-              class restores div-like layout without invalidating the
-              DOM. */}
-          <span class="text-[11px] opacity-70 truncate block w-full leading-tight">
-            {data.sublabel}
-          </span>
-        </Tooltip>
-      ) : null}
       <Handle
         type="source"
         position={sp}
@@ -240,8 +259,15 @@ const EDGE_TYPES = { fsmEdge: FsmEdge };
  * the dropped label. Multigraph mode requires a per-edge `name` so
  * dagre distinguishes parallel edges; we pass the React Flow edge id.
  */
-const LABEL_WIDTH = 160;
-const LABEL_HEIGHT = 18;
+// LABEL_PILL_MAX_WIDTH must match the FsmEdge pill's `max-w-[280px]`
+// so dagre reserves slack matching the actual rendered width.
+const LABEL_PILL_MAX_WIDTH = 280;
+// Approx characters per visual line at the pill's font-size 10 + the
+// 280px cap (10px monospace ≈ 6.5px advance => 280/6.5 ≈ 43).
+const LABEL_CHARS_PER_LINE = 43;
+// Line-height for the wrapped pill (in px) + 8px vertical pill padding.
+const LABEL_LINE_HEIGHT = 14;
+const LABEL_PILL_VERTICAL_PADDING = 8;
 
 function applyDagreLayout(
   nodes: readonly Node<FlowNodeData>[],
@@ -250,21 +276,21 @@ function applyDagreLayout(
 ): Node<FlowNodeData>[] {
   const g = new dagre.graphlib.Graph({ multigraph: true });
   g.setDefaultEdgeLabel(() => ({}));
+  // W23c user correction: bias the layout HORIZONTAL. The previous
+  // adaptive ranksep heuristic stretched the graph vertically until the
+  // operator had to scroll on a 16:9 viewport. The fix is to widen
+  // sibling spacing (nodesep) so predicate pills at the same rank stop
+  // overlapping, and SHRINK ranksep so consecutive ranks pack tighter
+  // vertically. Constants only; no label-aware logic this round.
+  //
+  //   nodesep: 280  horizontal gap between sibling nodes in same rank
+  //   ranksep: 120  vertical gap between consecutive ranks (smaller)
+  //   edgesep:  72  minimum gap between adjacent edges
   g.setGraph({
     rankdir: direction,
-    // W23b: bump inter-node spacing to ≥ half-node-width so connection
-    // lines cannot pass closer than NODE_WIDTH/2 (=135px) from any
-    // node. The user's screenshots showed edges threading between
-    // sibling nodes with insufficient clearance — these values keep
-    // every routed edge at least half a node-width away from the
-    // nearest non-endpoint node, satisfying the "absolute requirement".
-    // network-simplex ranker produces wider, less chimney-shaped
-    // layouts than tight-tree for specs with >8 states (the
-    // skill-code-review 15-state fixture is the test case); fall back
-    // to tight-tree for small specs where chimney-shaped is fine.
-    nodesep: direction === 'TB' ? 160 : 200,
-    ranksep: direction === 'TB' ? 160 : 280,
-    edgesep: 56,
+    nodesep: 280,
+    ranksep: 120,
+    edgesep: 72,
     marginx: 48,
     marginy: 48,
     ranker: nodes.length > 8 ? 'network-simplex' : 'tight-tree',
@@ -274,15 +300,18 @@ function applyDagreLayout(
     const labelLen = typeof e.label === 'string' ? e.label.length : 0;
     // Reserve label space proportionally so dagre routes around
     // long predicate labels instead of letting them collide with
-    // nodes downstream. The fourth argument is the edge name; under
+    // nodes downstream. Wrap-aware: a 120-char predicate reserves a
+    // ~3-line tall box, not the legacy 18px strip that the rendered
+    // pill would overflow. The fourth argument is the edge name; under
     // multigraph mode it disambiguates parallel edges so a second
     // predicate between the same two states doesn't clobber the first.
+    const lines = labelLen > 0 ? Math.max(1, Math.ceil(labelLen / LABEL_CHARS_PER_LINE)) : 0;
     g.setEdge(
       e.source,
       e.target,
       {
-        width: labelLen > 0 ? Math.min(LABEL_WIDTH, Math.max(40, labelLen * 7)) : 0,
-        height: labelLen > 0 ? LABEL_HEIGHT : 0,
+        width: labelLen > 0 ? Math.min(LABEL_PILL_MAX_WIDTH, Math.max(60, labelLen * 7)) : 0,
+        height: lines * LABEL_LINE_HEIGHT + (lines > 0 ? LABEL_PILL_VERTICAL_PADDING : 0),
         labelpos: 'c',
       },
       e.id,
@@ -309,23 +338,15 @@ function applyDagreLayout(
   });
 }
 
-// Truncate predicate strings so a single edge label can't sprawl over
-// downstream nodes. The FULL text is preserved on edge.data.fullLabel
-// (W21) and surfaced via the FsmEdge custom edge type's Tooltip on
-// hover + click-to-Sheet.
-//
-// Note on dagre slack: applyDagreLayout above computes per-edge label
-// dimensions from the ORIGINAL (pre-decoration) label length and
-// clamps to LABEL_WIDTH (160 px). The truncation that happens in
-// decorateEdges only affects the VISIBLE text the user reads — dagre
-// never sees the truncated string, so its routing slack stays
-// proportional to the actual predicate complexity. Truncation point
-// chosen empirically: 28 chars fits comfortably within LABEL_WIDTH
-// at the 10 px font-size we use.
-const LABEL_MAX_CHARS = 28;
+// W23b regression fix: do NOT pre-truncate edge labels. The FsmEdge
+// custom edge type owns visual presentation (a 280px max-width pill
+// with break-words wrapping) and surfaces the full predicate text via
+// hover Tooltip. Pre-truncating here would just clip the visible text
+// before the pill ever got the chance to wrap it. The dagre slack
+// reservation in applyDagreLayout still uses the original label
+// length so routing stays clear of long predicates.
 function truncateLabel(text: string): string {
-  if (text.length <= LABEL_MAX_CHARS) return text;
-  return text.slice(0, LABEL_MAX_CHARS - 1) + '…';
+  return text;
 }
 
 // Decorate edges so they render visibly in both themes: stroke via
@@ -408,6 +429,42 @@ export function FlowGraph({
   // The hook returns undefined when nothing is stored yet, in which case
   // we keep the existing fitView default so first-paint frames the graph.
   const viewport = useGraphViewport(viewportKey ?? '');
+
+  // Capture-phase wheel adapter so Shift+wheel pans horizontally even
+  // though wheel events from a vertical mouse wheel carry only deltaY.
+  // xyflow's pan-on-scroll handler consumes deltaY directly; without
+  // swapping the axes here, Shift+wheel would still pan vertically.
+  // Cmd/Ctrl+wheel zoom is left untouched (xyflow handles it via
+  // zoomActivationKeyCode).
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = wrapperRef.current;
+    if (!el) return undefined;
+    const onWheel = (e: WheelEvent): void => {
+      if (e.metaKey || e.ctrlKey) return; // zoom path, let xyflow handle.
+      if (e.shiftKey && e.deltaX === 0 && e.deltaY !== 0) {
+        e.stopPropagation();
+        e.preventDefault();
+        el.dispatchEvent(
+          new WheelEvent('wheel', {
+            bubbles: true,
+            cancelable: true,
+            deltaX: e.deltaY,
+            deltaY: 0,
+            deltaZ: e.deltaZ,
+            deltaMode: e.deltaMode,
+            clientX: e.clientX,
+            clientY: e.clientY,
+            shiftKey: false,
+          }),
+        );
+      }
+    };
+    el.addEventListener('wheel', onWheel, { capture: true, passive: false });
+    return () => {
+      el.removeEventListener('wheel', onWheel, { capture: true } as unknown as EventListenerOptions);
+    };
+  }, []);
   const positioned = useMemo(() => {
     if (!autoLayout) {
       // Preserve caller-supplied positions but still tag every node
@@ -477,6 +534,7 @@ export function FlowGraph({
   return (
     <FsmEdgeClickContext.Provider value={onEdgeClick ?? null}>
     <div
+      ref={wrapperRef}
       class={[
         'flow-graph relative h-full w-full min-h-[320px]',
         'text-slate-400 dark:text-slate-500',
@@ -495,17 +553,17 @@ export function FlowGraph({
         fitViewOptions={{ padding: 0.2, includeHiddenNodes: false }}
         defaultViewport={viewport.defaultViewport}
         onMove={viewportKey ? viewport.onMove : undefined}
-        // W23b: explicit wheel-mode contract for the operator.
-        // Plain wheel = zoom (the user's preference, opposite of the
-        // panOnScroll=true default). Shift+wheel = pan (the
-        // panActivationKeyCode below). Drag also pans (panOnDrag).
-        // The help tooltip below the graph documents this so the
-        // gesture is discoverable.
-        panOnScroll={false}
-        zoomOnScroll
+        // Wheel = pan vertically (xyflow's panOnScroll). The wrapper
+        // useEffect above swaps deltaY into deltaX when Shift is held
+        // so Shift+wheel pans horizontally on plain mice. Cmd / Ctrl +
+        // wheel forces zoom; pinch zoom keeps working on trackpads.
+        // Drag also pans.
+        panOnScroll
+        panOnScrollMode={PanOnScrollMode.Free}
+        zoomOnScroll={false}
+        zoomOnPinch
         panOnDrag
-        panActivationKeyCode="Shift"
-        zoomActivationKeyCode="Meta"
+        zoomActivationKeyCode={['Meta', 'Control']}
         selectionOnDrag={false}
         proOptions={{ hideAttribution: true }}
         defaultEdgeOptions={{
@@ -575,12 +633,11 @@ export function FlowGraph({
           content={
             <div class="text-left text-xs leading-relaxed">
               <div class="font-semibold mb-1">Graph controls</div>
-              <div>Wheel — zoom</div>
-              <div>Shift + wheel — pan</div>
-              <div>Drag — pan</div>
-              <div>⌘ + wheel — zoom (forced)</div>
-              <div>Click node — open inspector</div>
-              <div>Click edge — open transition</div>
+              <div>Wheel: scroll vertically.</div>
+              <div>Shift + Wheel: scroll horizontally.</div>
+              <div>Cmd/Ctrl + Wheel: zoom.</div>
+              <div>Drag: pan.</div>
+              <div>Double-click: fit.</div>
             </div>
           }
           delay={200}
