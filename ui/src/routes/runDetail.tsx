@@ -84,11 +84,35 @@ import {
   type Event as FsmEvent,
   type JsonObject,
   type RunDetail,
+  type RunManifest,
   type SpecDetail,
   type StateNode,
   type ToolCall,
 } from '../lib/api';
+import { openSheet } from '../lib/store';
 import { EventStream } from '../lib/sse';
+import { AdminSheetBody } from './runDetail/AdminSheetBody';
+
+/**
+ * Helper: open the run-admin sheet for ``runId``.
+ *
+ * Exposed as a route-local function so the header button stays a thin
+ * onClick handler and the SheetHost contract (``{ id, title, content }``)
+ * lives next to the body component it routes to.
+ */
+export function openAdminSheet(params: {
+  runId: string;
+  manifest: RunManifest;
+}): void {
+  const { runId, manifest } = params;
+  openSheet({
+    id: `admin:${runId}`,
+    title: 'Run admin',
+    width: 'right-half',
+    urlFragment: `admin-${runId}`,
+    content: <AdminSheetBody runId={runId} manifest={manifest} />,
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
@@ -755,6 +779,19 @@ export function RunDetailRoute(): JSX.Element {
             onClick={() => setPendingAction({ kind: 'journal-replay' })}
           >
             Replay journal
+          </Button>
+          {/* W?? — admin sheet trigger. The existing right-column Admin
+              Card stays during this PR so operators have both surfaces
+              simultaneously; a follow-up PR removes the inline card
+              once the sheet has soaked. */}
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() =>
+              openAdminSheet({ runId: manifest.id, manifest })
+            }
+          >
+            Admin
           </Button>
         </div>
       </header>
