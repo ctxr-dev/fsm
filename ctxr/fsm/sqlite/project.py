@@ -129,31 +129,64 @@ _RUNTIME_PRODUCER_NAME: str = "fsm.runtime"
 def _find_alembic_ini() -> Path:
     """Locate ``alembic.ini`` for the ctxr-fsm package.
 
-    Walks up from this module's filesystem location looking for an
-    ``alembic.ini`` sibling of a ``migrations/`` directory. We do not
-    rely on the current working directory because callers (tests,
-    one-off scripts, MCP servers spawned by other processes) frequently
-    start from elsewhere on the filesystem and would otherwise see
-    ``FileNotFoundError`` from Alembic.
+    Resolution order (first hit wins):
 
-    Raises :class:`FileNotFoundError` if no suitable file is found —
-    that almost always means the package was installed without its
-    sibling ``migrations/`` directory, which is a packaging bug worth
+    1. **Installed-package copy**. The wheel's
+       ``[tool.hatch.build.targets.wheel.force-include]`` block ships
+       ``alembic.ini`` + ``migrations/`` at
+       ``ctxr/fsm/_alembic/`` inside the package itself, so a
+       pip-installed / pipx-installed ctxr-fsm carries them next to
+       this module. We resolve that copy via the package directory
+       (no ``importlib.resources`` ceremony needed because alembic
+       requires a real filesystem path for ``script_location`` anyway).
+    2. **Editable / source-checkout walk-up**. When ctxr-fsm is
+       installed editable (``pip install -e .``) or run from a sibling
+       symlink, the package directory is the source tree itself, so
+       the installed-copy check above misses but the repo-root
+       ``alembic.ini`` is reachable by walking parents from this
+       module. The repo layout puts the file at
+       ``<repo_root>/alembic.ini`` and this module at
+       ``<repo_root>/ctxr/fsm/sqlite/project.py``, so four parents up
+       is the typical answer; we walk to keep the search robust to
+       alternative layouts.
+
+    Raises :class:`FileNotFoundError` if neither path resolves — that
+    indicates a packaging regression (wheel rebuilt without
+    force-include, or editable checkout missing the file) worth
     surfacing loudly.
     """
     here = Path(__file__).resolve()
-    # Walk up looking for ``alembic.ini``. The repo layout puts
-    # ``alembic.ini`` at ``<repo_root>/alembic.ini`` and this module at
-    # ``<repo_root>/ctxr/fsm/sqlite/project.py``, so four parents up is
-    # the typical answer; we still walk to keep the search robust to
-    # alternative install layouts.
-    for candidate in (here, *here.parents):
+    # Path 1: the wheel-installed copy under ``ctxr/fsm/_alembic/``.
+    # ``project.py`` lives at ``ctxr/fsm/sqlite/project.py``; the
+    # bundled alembic dir is at ``ctxr/fsm/_alembic/`` -> one parent
+    # up from ``sqlite/``. We accept the bundled copy only when the
+    # sibling ``migrations/`` directory exists too, because
+    # ``alembic.ini`` declares ``script_location = %(here)s/migrations``
+    # — returning an ini without the directory next to it would defer
+    # the failure to Alembic's own loader and produce a much less
+    # useful error than the explicit ``FileNotFoundError`` below.
+    bundled = here.parent.parent / "_alembic" / "alembic.ini"
+    if bundled.is_file() and (bundled.parent / "migrations").is_dir():
+        return bundled
+
+    # Path 2: editable-install / source-checkout walk-up. We start
+    # from ``here.parent`` (the file itself can never be a directory
+    # holding ``alembic.ini``) and accept a candidate only when both
+    # the ``alembic.ini`` AND its sibling ``migrations/`` directory
+    # exist — same script_location reason as the bundled branch, plus
+    # it stops the resolver from latching onto an unrelated
+    # ``alembic.ini`` higher up the filesystem tree.
+    for candidate in here.parents:
         ini = candidate / "alembic.ini"
-        if ini.is_file():
+        if ini.is_file() and (candidate / "migrations").is_dir():
             return ini
+
     raise FileNotFoundError(
         "Could not locate alembic.ini for ctxr.fsm.sqlite — the package "
-        "must be installed alongside its migrations/ directory."
+        "must either be installed from a wheel that bundles the "
+        "_alembic/ data directory (with a sibling _alembic/migrations/), "
+        "or run from a source checkout whose repo root carries "
+        "alembic.ini next to migrations/."
     )
 
 

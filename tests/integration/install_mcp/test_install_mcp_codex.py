@@ -110,10 +110,16 @@ def test_codex_direct_toml_when_codex_binary_absent(
     assert "[mcp_servers.linear]" in patched
     assert "[settings]" in patched
     assert "auto_save = true" in patched
-    # Our table is present.
+    # Our table is present. Compute the expected command shape from
+    # the same helper the install path uses — that keeps the assertion
+    # valid for both the uv-run shape and the absolute-path shape
+    # Fix 4 introduced (rather than re-baking the bare-literal
+    # regression).
+    from ctxr.fsm.cli.install_mcp_cmd import _resolve_stdio_entry
+    desired = _resolve_stdio_entry()
     assert "[mcp_servers.ctxr-fsm]" in patched
-    assert 'command = "ctxr-fsm"' in patched
-    assert '["mcp", "--transport", "stdio"]' in patched
+    assert f'command = "{desired["command"]}"' in patched
+    assert '"mcp", "--transport", "stdio"' in patched
 
 
 def test_codex_toml_unchanged_on_reapply(

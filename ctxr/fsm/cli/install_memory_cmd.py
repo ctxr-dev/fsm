@@ -94,7 +94,13 @@ import typer
 
 from ctxr.fsm.cli._clients import McpClient
 from ctxr.fsm.cli._common import json_or_pretty
-from ctxr.fsm.memory import BOOTSTRAP_FILENAME, get_bootstrap_path, get_principles_path
+from ctxr.fsm.memory import (
+    BOOTSTRAP_FILENAME,
+    get_bootstrap_path,
+    get_principles_path,
+    get_ssot_doc_path,
+    list_ssot_doc_slugs,
+)
 
 __all__ = [
     "BootstrapStatus",
@@ -212,6 +218,33 @@ _CLAUDE_LINKED_PATH: Path = Path(".ctxr-fsm") / "memory" / "principles.claude.md
 _BOOTSTRAP_LINKED_PATH: Path = (
     Path(".ctxr-fsm") / "memory" / BOOTSTRAP_FILENAME
 )
+
+
+def _ssot_relative_paths() -> dict[str, Path]:
+    """Map each W23-SSOT slug to its staged relative path under the target.
+
+    Each canonical reference doc (AGENT_QUICKSTART.md, SKILL_TEMPLATE.md,
+    GATE_CONTRACT.md) is staged under ``.ctxr-fsm/memory/<filename>.md``
+    so any sibling skill or agent in the workspace can resolve the doc
+    via the same Claude ``@.ctxr-fsm/memory/<filename>.md`` import
+    convention used by principles.md and bootstrap.md. The slug list
+    comes from :func:`list_ssot_doc_slugs` so adding a new SSOT doc in
+    one place (``ctxr/fsm/memory/__init__.py``) automatically flows
+    through to staging + drift detection.
+
+    Codex and Cursor do NOT follow ``@`` imports, so this staging
+    applies only to the Claude install path. The Codex/Cursor adapters
+    inline the bootstrap body (the only SSOT doc that ships as part of
+    the principles contract); the broader SSOT reference docs are not
+    inlined because they are reference material a sibling skill links
+    to, not principles a single LLM session must internalise.
+    """
+
+    return {
+        slug: Path(".ctxr-fsm") / "memory" / get_ssot_doc_path(slug).name
+        for slug in list_ssot_doc_slugs()
+    }
+
 
 # The relative path Cursor uses for project-scoped rule files. We pick a
 # stable filename (``ctxr-fsm.mdc``) so the rule is greppable and so
@@ -579,6 +612,33 @@ def _materialise_bootstrap_doc(
     )
 
 
+def _materialise_ssot_docs(
+    target: Path,
+    *,
+    no_symlink: bool,
+) -> dict[str, str]:
+    """Stage every W23-SSOT canonical reference doc under ``target/.ctxr-fsm/memory/``.
+
+    Iterates :func:`_ssot_relative_paths` and runs each doc through
+    :func:`_materialise_package_file`. Returns a slug -> link_mode
+    mapping (``"symlink"`` or ``"copy"``) for inclusion in the install
+    summary. Applies to the Claude install path only — Codex and Cursor
+    do not follow ``@`` imports, so staging these docs under
+    ``.ctxr-fsm/memory/`` for them would create unreachable files.
+    """
+
+    modes: dict[str, str] = {}
+    for slug, relative_dest in _ssot_relative_paths().items():
+        _, mode = _materialise_package_file(
+            target,
+            get_ssot_doc_path(slug),
+            relative_dest,
+            no_symlink=no_symlink,
+        )
+        modes[slug] = mode
+    return modes
+
+
 def _build_claude_payload() -> str:
     """The payload for the CLAUDE.md marker block — a single ``@<path>`` import.
 
@@ -627,6 +687,14 @@ class _InstallResult:
     # ``tools/generate_memory_adapters.py``) and report ``None``
     # here because no separate file is materialised.
     bootstrap_link_mode: str | None = None
+    # ``ssot_link_modes`` records how each W23-SSOT canonical reference
+    # doc was staged for this client (slug -> ``"symlink"`` / ``"copy"``).
+    # Empty dict on dry-run and on Codex / Cursor — those clients do not
+    # follow ``@`` imports and the SSOT docs are reference material, not
+    # adapter content, so we do not inline them either. Drift on these
+    # docs is hash-detected on the Claude row via
+    # :func:`_check_ssot_status` (mirrors the bootstrap.md check).
+    ssot_link_modes: dict[str, str] | None = None
     note: str = ""
 
 
@@ -674,11 +742,13 @@ def _install_claude(
             installed_version=installed_version,
             link_mode=link_mode,
             bootstrap_link_mode=link_mode,
+            ssot_link_modes={slug: link_mode for slug in list_ssot_doc_slugs()},
             note=_diff_preview(existing_text, new_text),
         )
 
     _, link_mode = _materialise_claude_link(target, package_file, no_symlink=no_symlink)
     _, bootstrap_link_mode = _materialise_bootstrap_doc(target, no_symlink=no_symlink)
+    ssot_link_modes = _materialise_ssot_docs(target, no_symlink=no_symlink)
 
     existing_text = host_file.read_text(encoding="utf-8") if host_file.is_file() else ""
     new_block = _build_marker_block(
@@ -695,6 +765,7 @@ def _install_claude(
             installed_version=package_version,
             link_mode=link_mode,
             bootstrap_link_mode=bootstrap_link_mode,
+            ssot_link_modes=ssot_link_modes,
         )
 
     host_file.parent.mkdir(parents=True, exist_ok=True)
@@ -707,6 +778,7 @@ def _install_claude(
         installed_version=package_version,
         link_mode=link_mode,
         bootstrap_link_mode=bootstrap_link_mode,
+        ssot_link_modes=ssot_link_modes,
     )
 
 
@@ -903,6 +975,13 @@ class _CheckRow:
     installed_version: str | None
     status: MemoryInstallStatus
     bootstrap_status: BootstrapStatus = BootstrapStatus.not_installed
+    # ``ssot_statuses`` maps each W23-SSOT slug to a
+    # :class:`BootstrapStatus` (the same enum reused: ok / out_of_date /
+    # not_installed for Claude, inlined for codex / cursor where the
+    # docs are reference material reached through Claude's @ import
+    # alone). Drift on any SSOT doc is treated the same way as
+    # bootstrap drift for exit-code purposes.
+    ssot_statuses: dict[str, BootstrapStatus] | None = None
 
 
 def _sha256_file(path: Path) -> str:
@@ -943,11 +1022,40 @@ def _check_bootstrap_status(
     return BootstrapStatus.out_of_date
 
 
+def _check_ssot_statuses(
+    target: Path, package_ssot_hashes: dict[str, str]
+) -> dict[str, BootstrapStatus]:
+    """Per-slug drift check for the staged W23-SSOT canonical reference docs.
+
+    Mirrors :func:`_check_bootstrap_status` but iterates each SSOT slug:
+    compare the staged file's sha256 against the package source. Slugs
+    whose staged file is absent flip to
+    :attr:`BootstrapStatus.not_installed`; bytes-differ slugs flip to
+    :attr:`BootstrapStatus.out_of_date`. Applies to the Claude install
+    path only (the only path that stages the SSOT docs as separate
+    files on disk).
+    """
+
+    staged_paths = _ssot_relative_paths()
+    out: dict[str, BootstrapStatus] = {}
+    for slug, relative in staged_paths.items():
+        staged = target / relative
+        if not staged.is_file():
+            out[slug] = BootstrapStatus.not_installed
+            continue
+        if _sha256_file(staged) == package_ssot_hashes[slug]:
+            out[slug] = BootstrapStatus.ok
+        else:
+            out[slug] = BootstrapStatus.out_of_date
+    return out
+
+
 def _check_one(
     target: Path,
     detection: _ClientDetection,
     package_version: str | None,
     package_bootstrap_hash: str,
+    package_ssot_hashes: dict[str, str],
 ) -> _CheckRow:
     """Compute the status for one detected client.
 
@@ -957,12 +1065,22 @@ def _check_one(
     the principles adapter for those clients, so drift in bootstrap
     content surfaces via the principles version comparison rather
     than a separate hash check.
+
+    SSOT docs follow the same shape: Claude gets per-slug hash drift
+    via :func:`_check_ssot_statuses`; Codex / Cursor get the
+    :attr:`BootstrapStatus.inlined` sentinel uniformly across every
+    slug (the reference docs are reachable only through Claude's
+    ``@`` import — not inlined into the adapter — but for drift
+    purposes they are treated like the bootstrap doc, with drift
+    detected only on the staged-file client).
     """
     host = detection.host_file
     if detection.name == McpClient.claude.value:
         bootstrap_status = _check_bootstrap_status(target, package_bootstrap_hash)
+        ssot_statuses = _check_ssot_statuses(target, package_ssot_hashes)
     else:
         bootstrap_status = BootstrapStatus.inlined
+        ssot_statuses = {slug: BootstrapStatus.inlined for slug in package_ssot_hashes}
 
     if host is None or not host.is_file():
         return _CheckRow(
@@ -972,6 +1090,7 @@ def _check_one(
             installed_version=None,
             status=MemoryInstallStatus.not_installed,
             bootstrap_status=bootstrap_status,
+            ssot_statuses=ssot_statuses,
         )
 
     installed = _read_installed_version_from_text(
@@ -986,6 +1105,7 @@ def _check_one(
             installed_version=None,
             status=MemoryInstallStatus.missing,
             bootstrap_status=bootstrap_status,
+            ssot_statuses=ssot_statuses,
         )
     if installed == package_version:
         return _CheckRow(
@@ -995,6 +1115,7 @@ def _check_one(
             installed_version=installed,
             status=MemoryInstallStatus.ok,
             bootstrap_status=bootstrap_status,
+            ssot_statuses=ssot_statuses,
         )
     return _CheckRow(
         client=detection.name,
@@ -1003,6 +1124,7 @@ def _check_one(
         installed_version=installed,
         status=MemoryInstallStatus.out_of_date,
         bootstrap_status=bootstrap_status,
+        ssot_statuses=ssot_statuses,
     )
 
 
@@ -1126,6 +1248,7 @@ def run_install_memory(
                 "installed_version": r.installed_version,
                 "link_mode": r.link_mode,
                 "bootstrap_link_mode": r.bootstrap_link_mode,
+                "ssot_link_modes": r.ssot_link_modes,
                 "note": r.note,
             }
             for r in results
@@ -1232,9 +1355,17 @@ def install_memory(
             canonical_package_file.read_text(encoding="utf-8")
         )
         package_bootstrap_hash = _sha256_file(get_bootstrap_path())
+        package_ssot_hashes = {
+            slug: _sha256_file(get_ssot_doc_path(slug))
+            for slug in list_ssot_doc_slugs()
+        }
         rows = [
             _check_one(
-                resolved_target, d, package_version, package_bootstrap_hash
+                resolved_target,
+                d,
+                package_version,
+                package_bootstrap_hash,
+                package_ssot_hashes,
             )
             for d in detections
         ]
@@ -1255,11 +1386,29 @@ def install_memory(
             BootstrapStatus.out_of_date,
             BootstrapStatus.not_installed,
         }
+
+        def _any_ssot_drift(row: _CheckRow) -> bool:
+            """Return True iff any staged SSOT doc is drifted or absent.
+
+            The ``inlined`` sentinel (codex / cursor) is never a failure
+            on its own — for those clients the SSOT axis is checked
+            elsewhere via the principles version. Only the per-slug
+            ``out_of_date`` / ``not_installed`` statuses count as drift.
+            """
+
+            if not row.ssot_statuses:
+                return False
+            return any(
+                status in bootstrap_fail_statuses
+                for status in row.ssot_statuses.values()
+            )
+
         out_of_date = [
             r
             for r in rows
             if r.status in memory_fail_statuses
             or r.bootstrap_status in bootstrap_fail_statuses
+            or _any_ssot_drift(r)
         ]
         json_or_pretty(
             {
@@ -1273,6 +1422,10 @@ def install_memory(
                         "installed_version": r.installed_version,
                         "status": r.status.value,
                         "bootstrap_status": r.bootstrap_status.value,
+                        "ssot_statuses": {
+                            slug: status.value
+                            for slug, status in (r.ssot_statuses or {}).items()
+                        },
                     }
                     for r in rows
                 ],

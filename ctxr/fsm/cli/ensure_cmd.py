@@ -1,8 +1,9 @@
 """``ctxr-fsm ensure`` — single bootstrap entry point skills call (W14b).
 
 This command is the **one** thing every ctxr-fsm-driven skill invokes
-from its SKILL.md preamble. It is idempotent + fast (<500ms on the
-warm path) and self-heals every dimension that could be cold:
+from its SKILL.md preamble. It is idempotent and intended to be fast
+on the warm path (measured 1.5-1.8s on cycle 1) and self-heals every
+dimension that could be cold:
 
 1. **init** — ``./.ctxr-fsm/`` + ``fsm.db`` + alembic head.
 2. **memory** — FSM-usage principles wired into CLAUDE.md /
@@ -759,8 +760,9 @@ def ensure(
 ) -> None:
     """Ensure the project is fully bootstrapped + the supervisor is up.
 
-    One-shot, idempotent, fast on the warm path (<500ms). See the
-    module docstring for the full algorithm.
+    One-shot, idempotent. Intended to be fast on the warm path
+    (measured 1.5-1.8s on cycle 1). See the module docstring for the
+    full algorithm.
     """
     if client not in _CLIENT_CHOICES:
         raise typer.BadParameter(

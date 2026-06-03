@@ -170,9 +170,10 @@ def test_non_claude_adapter_inlines_bootstrap_body(
     begin_pos = rendered.index(begin_marker)
     end_pos = rendered.index(end_marker)
     inlined_block = rendered[begin_pos:end_pos]
-    assert "Step 1 — detect the package, then install ONCE if missing" in inlined_block, (
-        inlined_block
-    )
+    assert (
+        "Step 1 — detect the package, then ASK ONCE before installing if missing"
+        in inlined_block
+    ), inlined_block
 
     # The per-client reload subsection (Gap 1 addition) must also be
     # visible inside the inlined block.
@@ -232,7 +233,10 @@ def test_codex_adapter_demotes_step_headings_to_h4(gen_mod: object) -> None:
     """``## Step 1`` in bootstrap.md becomes ``#### Step 1`` in the codex adapter."""
 
     rendered = _render_all(gen_mod)["principles.codex.md"]
-    assert "#### Step 1 — detect the package, then install ONCE if missing" in rendered, rendered
+    step_title = (
+        "Step 1 — detect the package, then ASK ONCE before installing if missing"
+    )
+    assert f"#### {step_title}" in rendered, rendered
     # The original H2 form must not appear as a line-start heading.
     # We grep line-by-line rather than substring-matching because
     # ``## Step 1`` is a substring of ``#### Step 1`` and would
@@ -240,7 +244,7 @@ def test_codex_adapter_demotes_step_headings_to_h4(gen_mod: object) -> None:
     h2_step_lines = [
         line
         for line in rendered.splitlines()
-        if line.startswith("## Step 1 — detect the package, then install ONCE if missing")
+        if line.startswith(f"## {step_title}")
     ]
     assert h2_step_lines == [], h2_step_lines
 

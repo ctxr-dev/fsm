@@ -41,6 +41,16 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["ctxr"]
+# alembic.ini + migrations/ live at the repo root for the dev /
+# source-checkout layout, but the wheel MUST carry them too —
+# ``Project.open(..., migrate=True)`` calls ``alembic upgrade head``
+# at first-use and crashes otherwise. Force-include both under
+# ``ctxr/fsm/_alembic/`` so ``_find_alembic_ini`` can resolve them
+# via ``importlib.resources`` relative to the installed package
+# regardless of where the operator's cwd is.
+[tool.hatch.build.targets.wheel.force-include]
+"alembic.ini" = "ctxr/fsm/_alembic/alembic.ini"
+"migrations" = "ctxr/fsm/_alembic/migrations"
 
 [tool.hatch.build]
 include = [
@@ -54,6 +64,14 @@ include = [
   "ctxr/fsm/testing/fixture_project/**/*.ts",
   "ctxr/fsm/testing/fixture_project/**/*.json",
   "ctxr/fsm/testing/fixture_project/**/*.template",
+  # Alembic config + migrations live at the repo root in the source
+  # checkout. The sdist must carry them too so the wheel build (which
+  # consumes the sdist) finds them at the force-include source paths
+  # configured under [tool.hatch.build.targets.wheel.force-include].
+  "alembic.ini",
+  "migrations/**/*.py",
+  "migrations/**/*.mako",
+  "migrations/README",
   "README.md",
   "LICENSE",
 ]

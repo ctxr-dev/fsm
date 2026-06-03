@@ -42,6 +42,8 @@ with status ``1`` so any script that pipes these commands through
 
 from __future__ import annotations
 
+import importlib.metadata
+
 import typer
 
 from ctxr.fsm.cli import (
@@ -73,6 +75,64 @@ app: typer.Typer = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+
+
+def _resolve_package_version() -> str:
+    """Return the installed ``ctxr-fsm`` distribution version.
+
+    Falls back to the literal ``"unknown"`` rather than raising — the
+    version probe must succeed even when ``ctxr-fsm`` is being run from
+    a source checkout that has no installed dist-info (e.g. a sibling
+    ``file://`` link during development).
+    """
+    try:
+        return importlib.metadata.version("ctxr-fsm")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _version_callback(value: bool) -> None:
+    """Typer eager-callback for ``--version``.
+
+    Prints ``ctxr-fsm <version>`` and exits 0 before any subcommand is
+    dispatched. The bootstrap procedure (``@.ctxr-fsm/memory/bootstrap.md``
+    Step 1) probes this flag to decide whether the package is installed
+    in the current workdir, so the contract is: exit 0 with one line of
+    output on stdout. ``value`` is the resolved option value: only fire
+    when explicitly set to ``True`` (``--version``), never on the
+    default ``False`` path.
+    """
+    if not value:
+        return
+    typer.echo(f"ctxr-fsm {_resolve_package_version()}")
+    raise typer.Exit(code=0)
+
+
+@app.callback(invoke_without_command=True)
+def _main(
+    ctx: typer.Context,
+    version: bool = typer.Option(
+        False,
+        "--version",
+        help="Print the installed ctxr-fsm version and exit.",
+        callback=_version_callback,
+        is_eager=True,
+    ),
+) -> None:
+    """Top-level Typer callback.
+
+    Owns the global ``--version`` flag (eager callback, exits 0). With
+    ``invoke_without_command=True``, the CLI tolerates being called
+    with ONLY ``--version`` (no subcommand). The eager callback above
+    handles the print + exit; when the flag is not set and no
+    subcommand was supplied, we fall through to the help screen the
+    same way ``no_args_is_help=True`` would have done for the bare
+    invocation. The ``version`` parameter is consumed by Typer via the
+    callback; we do not need to inspect it here.
+    """
+    if ctx.invoked_subcommand is None:
+        typer.echo(ctx.get_help())
+        raise typer.Exit(code=0)
 
 
 # ---------------------------------------------------------------------------

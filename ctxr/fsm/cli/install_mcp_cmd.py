@@ -82,8 +82,104 @@ _CLIENT_CHOICES: tuple[str, ...] = tuple(member.value for member in McpClient)
 # matching test can grep for the same literal.
 _ENTRY_NAME: str = "ctxr-fsm"
 
-# The stdio entry payload (JSON-shape). Codex's TOML emit is derived
-# from this dict so the two surfaces stay in lockstep.
+
+def _resolve_stdio_entry() -> dict[str, Any]:
+    """Resolve the stdio MCP entry shape for the current invocation.
+
+    Cross-client bootstrap regression: writing the bare literal
+    ``command="ctxr-fsm"`` made the registered entry unreachable for
+    operators whose shell PATH did not pick up the project venv's
+    console scripts (the most common case: an operator running
+    ``uv run ctxr-fsm install-mcp`` inside a uv-managed project; the
+    venv's ``.venv/bin/ctxr-fsm`` is on PATH only for the duration of
+    that single ``uv run`` call, never for the long-running client
+    process that later spawns the stdio MCP).
+
+    Resolution order:
+
+    1. If we were invoked via ``uv run`` (detected by a co-located
+       ``VIRTUAL_ENV`` pointing at the same dist-info we are running
+       from, plus ``sys.executable`` living inside that venv), write
+       ``command="uv"`` + ``args=["run", "ctxr-fsm", "mcp",
+       "--transport", "stdio"]``. ``uv run`` re-resolves the venv at
+       spawn time, so any client (Claude Code, Codex, Cursor) that
+       launches with a different cwd / PATH still ends up running the
+       correct binary against the project's pinned environment.
+    2. Otherwise, write the absolute resolved path of the current
+       ``ctxr-fsm`` console script. We use ``sys.argv[0]`` only when
+       it already points at an existing file (e.g. a uv-run invocation
+       that bypassed the ``uv`` branch above, or a direct call against
+       the venv's ``.venv/bin/ctxr-fsm``). For the common pipx /
+       global-install case, ``sys.argv[0]`` is the bare name
+       ``ctxr-fsm`` — resolving that with :meth:`Path.resolve` would
+       produce ``<cwd>/ctxr-fsm``, a path that does not exist on the
+       operator's machine. To avoid persisting that broken absolute
+       path into long-lived client configs (which would reintroduce
+       the unreachable-MCP regression this whole resolver guards
+       against), we fall back to :func:`shutil.which` to discover
+       where the installed console script actually lives.
+    3. If neither path produces a real file, raise
+       :class:`FileNotFoundError` — silently persisting an unreachable
+       command into Claude / Codex / Cursor configs is much worse than
+       a loud failure at install time.
+
+    The Codex TOML emitter derives its own block from the returned
+    dict so the two surfaces stay in lockstep.
+    """
+    py_exe = Path(sys.executable).resolve()
+    virtual_env = os.environ.get("VIRTUAL_ENV")
+    is_uv_run = (
+        virtual_env is not None
+        and py_exe.is_relative_to(Path(virtual_env).resolve())
+    )
+    if is_uv_run and shutil.which("uv") is not None:
+        return {
+            "command": "uv",
+            "args": ["run", "ctxr-fsm", "mcp", "--transport", "stdio"],
+            "env": {},
+        }
+
+    # Fall back to the absolute resolved script path.
+    resolved: Path | None = None
+    argv0_raw = sys.argv[0] if sys.argv else ""
+    if argv0_raw:
+        candidate = Path(argv0_raw)
+        # ``Path.is_file()`` against a relative path resolves against
+        # cwd, but we ONLY accept it when it is a real file at that
+        # location — for a bare console-script name like ``ctxr-fsm``
+        # this almost always returns False (no ``./ctxr-fsm`` in cwd),
+        # which is precisely the case that must fall through to
+        # ``shutil.which``.
+        if candidate.is_file():
+            resolved = candidate.resolve()
+
+    if resolved is None:
+        which_hit = shutil.which("ctxr-fsm")
+        if which_hit is not None:
+            resolved = Path(which_hit).resolve()
+
+    if resolved is None:
+        raise FileNotFoundError(
+            "Could not resolve a real filesystem path for the "
+            "ctxr-fsm console script — sys.argv[0]="
+            f"{argv0_raw!r} is not an existing file and "
+            "shutil.which('ctxr-fsm') returned None. Refusing to "
+            "persist an unreachable command into client MCP configs. "
+            "Install ctxr-fsm so the console script is on PATH "
+            "(e.g. `pipx install ctxr-fsm` or `uv tool install "
+            "ctxr-fsm`) and retry."
+        )
+
+    return {
+        "command": str(resolved),
+        "args": ["mcp", "--transport", "stdio"],
+        "env": {},
+    }
+
+
+# Module-level fallback kept for tests + back-compat with callers that
+# diff against a known shape. Treated as a default only; production
+# callers always go through :func:`_resolve_stdio_entry`.
 _STDIO_ENTRY_JSON: dict[str, Any] = {
     "command": "ctxr-fsm",
     "args": ["mcp", "--transport", "stdio"],
@@ -284,7 +380,7 @@ def _merge_json_entry(
         else {}
     )
     current_entry = existing_servers.get(_ENTRY_NAME)
-    desired_entry = dict(_STDIO_ENTRY_JSON)
+    desired_entry = _resolve_stdio_entry()
     is_installed = current_entry == desired_entry
 
     if check:
@@ -356,15 +452,19 @@ def _emit_codex_toml_block() -> str:
     single, fixed-shape table with two string-array values; the cost
     of a third-party write-dependency for this one case is not worth
     it. The format we emit is the TOML canonical form (``key = ...``,
-    arrays bracketed, strings double-quoted).
+    arrays bracketed, strings double-quoted). The ``command`` /
+    ``args`` shape comes from :func:`_resolve_stdio_entry` so the
+    Codex TOML stays in lockstep with the JSON-merge surface.
     """
+    entry = _resolve_stdio_entry()
     # ``json.dumps`` is the easiest way to emit a JSON-style string
     # array that also happens to be valid TOML for an array of
     # quoted strings.
-    args_arr = json.dumps(_STDIO_ENTRY_JSON["args"])
+    args_arr = json.dumps(entry["args"])
+    command_str = json.dumps(entry["command"])
     return (
         "[mcp_servers.ctxr-fsm]\n"
-        f'command = "{_STDIO_ENTRY_JSON["command"]}"\n'
+        f"command = {command_str}\n"
         f"args = {args_arr}\n"
     )
 
@@ -398,13 +498,17 @@ def _codex_entry_matches_desired(entry: dict[str, Any] | None) -> bool:
 
     We compare only the keys we own (``command`` and ``args``). Codex
     users sometimes add their own ``env`` / ``cwd`` keys; preserving
-    those (rather than wiping them) is the polite default.
+    those (rather than wiping them) is the polite default. The
+    ``command`` / ``args`` shape comes from :func:`_resolve_stdio_entry`
+    so a stale-shape entry (bare literal vs uv-run / absolute-path) is
+    correctly flagged as out-of-date on the next ``--check``.
     """
     if entry is None:
         return False
+    desired = _resolve_stdio_entry()
     matches: bool = (
-        entry.get("command") == _STDIO_ENTRY_JSON["command"]
-        and entry.get("args") == _STDIO_ENTRY_JSON["args"]
+        entry.get("command") == desired["command"]
+        and entry.get("args") == desired["args"]
     )
     return matches
 
@@ -477,22 +581,25 @@ def _can_use_codex_cli() -> bool:
 
 
 def _invoke_codex_cli_add(*, dry_run: bool) -> dict[str, Any]:
-    """Run ``codex mcp add ctxr-fsm -- ctxr-fsm mcp --transport stdio``.
+    """Run ``codex mcp add ctxr-fsm -- <command> <args...>``.
 
     Returns the same outcome dict shape JSON merger returns so callers
     can treat both paths uniformly. ``dry_run`` short-circuits to a
-    "would-invoke" record without spawning Codex.
+    "would-invoke" record without spawning Codex. The trailing argv
+    after ``--`` comes from :func:`_resolve_stdio_entry` so the Codex
+    CLI surface matches what the JSON / TOML mergers write (the
+    ``uv run`` shape under a uv-managed venv, the absolute path
+    otherwise).
     """
+    entry = _resolve_stdio_entry()
     cmd = [
         "codex",
         "mcp",
         "add",
         _ENTRY_NAME,
         "--",
-        "ctxr-fsm",
-        "mcp",
-        "--transport",
-        "stdio",
+        entry["command"],
+        *entry["args"],
     ]
     if dry_run:
         return {
