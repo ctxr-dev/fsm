@@ -65,6 +65,14 @@ export interface FsmEdgeData extends Record<string, unknown> {
    *  sibling labels on a fan-out from stacking on the same midpoint
    *  band even when dagre reserved distinct slack for each. */
   dagreLabel?: { x: number; y: number };
+  /** W23d 1-hop hover highlight. Set by FlowGraph while a hover is
+   *  active. `isHovered` is the edge the cursor is on; `highlighted`
+   *  is a 1-hop neighbour (an edge that shares an endpoint with the
+   *  hovered node); `dimmed` is set on every edge that's neither the
+   *  hover target nor in the highlighted set. */
+  isHovered?: boolean;
+  highlighted?: boolean;
+  dimmed?: boolean;
 }
 
 /**
@@ -209,7 +217,20 @@ export function FsmEdge(props: EdgeProps): JSX.Element {
               edge coordinates. nodrag/nopan stop xyflow from hijacking
               pointer events when the user hovers/clicks the label. */}
           <div
-            class="pointer-events-auto nodrag nopan"
+            class={[
+              'pointer-events-auto nodrag nopan',
+              // W23d 1-hop hover highlight. The edge's underlying SVG
+              // path opacity is set on its `style` from FlowGraph, but
+              // the label pill lives in the EdgeLabelRenderer portal
+              // and needs its own dimming class. The spec calls for
+              // the pill to stay at full opacity when the edge itself
+              // is hovered (so the predicate text remains readable
+              // while the operator is reading it). `isHovered` and
+              // `highlighted` both keep full opacity; only the
+              // dimmed-but-not-highlighted state fades.
+              'transition-opacity duration-150 motion-reduce:transition-none',
+              ed.dimmed && !ed.isHovered && !ed.highlighted ? 'opacity-30' : '',
+            ].join(' ')}
             // eslint-disable-next-line react/forbid-dom-props -- per-edge position is computed from getSmoothStepPath
             style={{
               position: 'absolute',
