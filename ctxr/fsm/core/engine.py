@@ -47,6 +47,9 @@ from ctxr.fsm.core.models import (
     Brief,
     EngineAdvanceKind,
     FsmSpec,
+    Gate,
+    GateBinding,
+    GateSourceKind,
     InlineExecutionResult,
     InlineFaultReason,
     Loop,
@@ -57,6 +60,7 @@ from ctxr.fsm.core.models import (
     ResponseSchema,
     RunCtx,
     State,
+    StateKind,
     Transition,
     TransitionEvaluation,
     TransitionKind,
@@ -70,12 +74,20 @@ from ctxr.fsm.core.predicates import (
     evaluate_expression,
     validate_expression,
 )
+from ctxr.fsm.core.prompts import (
+    PromptContext,
+    PromptRenderer,
+    needs_rendering,
+)
 
 __all__ = [
     "EngineAdvanceResult",
+    "GateResolution",
+    "GateResolutionError",
     "advance",
     "build_brief",
     "execute_inline",
+    "resolve_gate",
     "resolve_transition",
     "run_post_validations",
     "validate_output",
@@ -85,6 +97,84 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # UUIDv7 helper (graceful fallback)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Prompt rendering (W23f integration)
+# ---------------------------------------------------------------------------
+
+
+# Cache of rendered prompt strings keyed by (spec.id, state.id, iteration?).
+# The cache exists so re-entering a state (or iterating a loop) does not
+# re-parse the same template. We key on the raw template text under the
+# (spec, state) tuple so a spec mutation that swaps the template body
+# automatically invalidates the cached entry. Loop bodies share their
+# loop state's id, so per-iteration env differences are reflected by
+# always recomputing the runtime context but only re-using the parsed
+# Jinja template; the renderer itself owns Jinja parsing reuse via its
+# SandboxedEnvironment cache, so this dict is a lightweight per-state
+# guard against re-walking the needs_rendering precheck or re-allocating
+# the PromptRenderer.
+_PROMPT_RENDERER: PromptRenderer | None = None
+_RENDER_CACHE: dict[tuple[str, str, str], str] = {}
+
+
+def _get_prompt_renderer() -> PromptRenderer:
+    """Return the module-level :class:`PromptRenderer` (lazy init)."""
+    global _PROMPT_RENDERER
+    if _PROMPT_RENDERER is None:
+        _PROMPT_RENDERER = PromptRenderer()
+    return _PROMPT_RENDERER
+
+
+def _maybe_render_prompt(
+    spec: FsmSpec,
+    state: State,
+    worker: Worker,
+    env: dict[str, Any],
+    iteration_n: int | None,
+) -> Worker:
+    """Return ``worker`` with a rendered ``prompt_template`` if needed.
+
+    A worker whose template contains no Jinja markers passes through
+    untouched (the renderer is never invoked). Otherwise, the template
+    is rendered through the shared :class:`PromptRenderer` with a
+    :class:`PromptContext` populated from the spec, state, worker, and
+    runtime env. The rendered string replaces the template on a
+    ``model_copy`` clone so the original spec object remains immutable.
+    """
+    template = worker.prompt_template
+    if not needs_rendering(template):
+        return worker
+
+    cache_key = (spec.id, state.id, template)
+    cached = _RENDER_CACHE.get(cache_key)
+    if cached is None:
+        renderer = _get_prompt_renderer()
+        context = PromptContext(
+            spec_slug=spec.id,
+            spec_version=spec.version,
+            state_id=state.id,
+            state_kind=state.kind.value,
+            response_schema=(
+                worker.response_schema.schema_
+                if worker.response_schema is not None
+                else None
+            ),
+            inputs_schema=(
+                worker.inputs_schema.schema_
+                if worker.inputs_schema is not None
+                else None
+            ),
+            allowed_tools=list(state.allowed_tools),
+            iteration_n=iteration_n,
+            args=dict(env),
+            metadata={},
+        )
+        cached = renderer.render(template, context)
+        _RENDER_CACHE[cache_key] = cached
+
+    return worker.model_copy(update={"prompt_template": cached})
 
 
 def _new_brief_id() -> uuid.UUID:
@@ -201,6 +291,7 @@ def build_brief(
     inputs: dict[str, Any]
     outputs_path: str | None = None
     effective_iteration: int | None = None
+    loop_for_brief: Loop | None = state.loop
 
     if is_loop:
         loop: Loop = state.loop  # type: ignore[assignment]
@@ -218,6 +309,23 @@ def build_brief(
             inputs = {}
             has_worker = False
 
+    # W23f: render the worker's prompt template through the sandboxed
+    # PromptRenderer when it carries Jinja constructs. Plain prompts
+    # pass through verbatim with zero overhead. For loop states the
+    # rendered worker is mirrored back onto a Loop.model_copy clone so
+    # the brief's `loop` field exposes the same rendered prompt as its
+    # top-level `worker` field, so consumers reading either surface see a
+    # consistent rendered template.
+    if worker is not None:
+        rendered_worker = _maybe_render_prompt(
+            spec, state, worker, env, effective_iteration
+        )
+        worker = rendered_worker
+        if is_loop and loop_for_brief is not None:
+            loop_for_brief = loop_for_brief.model_copy(
+                update={"worker": rendered_worker}
+            )
+
     return Brief(
         run_id=run_id,
         fsm_id=spec.id,
@@ -232,7 +340,7 @@ def build_brief(
         has_loop=is_loop,
         allowed_tools=list(state.allowed_tools),
         worker=worker,
-        loop=state.loop,
+        loop=loop_for_brief,
         # W23g: surface the gate body when this state is a gate state.
         # The engine pause-on-gate dispatch + fsm.resolve_gate MCP tool
         # consume this in a follow-up commit; the brief surface is
@@ -668,6 +776,22 @@ def advance(
         env_with_outputs,
         run_id=run_ctx.run_id,
     )
+
+    # W23g: the incoming state is a gate. The engine MUST NOT invoke a
+    # worker on a gate state; the brief carries the Gate body so the
+    # orchestrator surface can recognise the gate and route the next
+    # call to fsm.resolve_gate (LLM-supplied value or run_output
+    # binding) instead of fsm.commit_outputs. The brief is still
+    # populated so the caller has the gate's response_schema +
+    # source_kind + bindings in hand without a second round-trip.
+    if next_state.kind is StateKind.gate:
+        return EngineAdvanceResult(
+            kind=EngineAdvanceKind.gate_pending,
+            next_state=next_state.id,
+            brief=next_brief,
+            evaluations=evaluations,
+        )
+
     return EngineAdvanceResult(
         kind=EngineAdvanceKind.advance,
         next_state=next_state.id,
@@ -893,4 +1017,242 @@ def execute_inline(
         post_validations=post_result,
         fault_reason=None,
         fault_detail=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# resolve_gate — W23g cross-FSM gate resolution
+# ---------------------------------------------------------------------------
+
+
+class GateResolutionError(ValueError):
+    """Typed error raised by :func:`resolve_gate` for the GATE_CONTRACT envelopes.
+
+    The ``code`` attribute is one of the snake_case envelope vocabulary
+    keys documented in ``ctxr/fsm/memory/GATE_CONTRACT.md``:
+
+    * ``gate_schema_mismatch`` — the resolved value did not validate
+      against ``Gate.response_schema``.
+    * ``gate_value_or_binding_required`` — neither ``value`` nor a
+      binding was supplied.
+    * ``gate_value_and_binding_conflict`` — both were supplied; the
+      contract requires exactly one.
+    * ``gate_source_kind_mismatch`` — the supplied resolution shape
+      did not match the gate's ``source_kind`` (``binding`` on an
+      ``llm_supplied`` gate, or ``value`` on a ``run_output`` gate).
+
+    The MCP tool layer (:func:`ctxr.fsm.mcp.tools_runs.fsm_resolve_gate`)
+    catches this and maps the ``code`` straight onto the wire envelope
+    so clients can branch on the same vocabulary they read in
+    GATE_CONTRACT.md.
+    """
+
+    def __init__(self, code: str, detail: str, *, errors: list[str] | None = None):
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+        self.errors: list[str] = list(errors or [])
+
+
+class GateResolution(BaseModel):
+    """The outcome of :func:`resolve_gate`.
+
+    * :attr:`env_update` — the dict of ``{target_field: resolved_value}``
+      entries the caller should merge into the run's env. The current
+      :func:`resolve_gate` API accepts a single optional
+      :class:`GateBinding` and a single optional ``value``, so
+      ``env_update`` always carries exactly one entry: for
+      ``llm_supplied`` gates it is keyed off the gate state's first
+      declared output; for ``run_output`` gates it is keyed off the
+      supplied binding's ``target_field``.
+    * :attr:`transitions` — the list of :class:`Transition` declared on
+      the gate state, surfaced for the caller so the persistence layer
+      can drive the outgoing transition without re-walking the spec.
+
+    The MCP tool body merges ``env_update`` into the run env, records
+    a ``gate_resolved`` event, persists the binding row, then advances
+    the engine through the gate's outgoing transitions.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    env_update: dict[str, Any] = Field(default_factory=dict)
+    transitions: list[Transition] = Field(default_factory=list)
+
+
+def _validate_against_gate_schema(
+    gate: Gate,
+    payload: dict[str, Any],
+) -> None:
+    """Validate ``payload`` against the gate's ``response_schema``.
+
+    Raises :class:`GateResolutionError` with ``code='gate_schema_mismatch'``
+    when validation fails. Uses the same
+    :meth:`ResponseSchema.model_validate_json_payload` helper the
+    worker-output path uses so the error vocabulary stays uniform across
+    the engine.
+    """
+    valid, errors = gate.response_schema.model_validate_json_payload(payload)
+    if not valid:
+        raise GateResolutionError(
+            "gate_schema_mismatch",
+            "resolved gate value did not match Gate.response_schema",
+            errors=errors,
+        )
+
+
+def resolve_gate(
+    spec: FsmSpec,
+    state: State,
+    env: dict[str, Any],
+    run_id: uuid.UUID,
+    *,
+    value: dict[str, Any] | None = None,
+    binding: GateBinding | None = None,
+    binding_value: Any = None,
+) -> GateResolution:
+    """Resolve a gate state's pending value and return the env delta + transitions.
+
+    Parameters
+    ----------
+    spec, state:
+        The owning :class:`FsmSpec` and the gate :class:`State`. ``state``
+        MUST have ``state.gate`` non-None — otherwise a ``TypeError``
+        surfaces immediately because the caller is feeding a non-gate
+        state into the resolver.
+    env:
+        The run env at gate-entry time. Reserved for future use (a
+        gate's ``response_schema`` could in principle reference
+        ``env``-shaped properties); currently the env is read-only.
+    run_id:
+        The run id this resolution belongs to. Currently unused in the
+        pure-engine resolver but threaded through so future telemetry
+        hooks (the event-bus payloads minted by the MCP layer) carry
+        consistent identifiers.
+    value:
+        LLM-supplied literal. Required when ``gate.source_kind`` is
+        ``llm_supplied``; validated against the gate's
+        ``response_schema`` and landed under the gate state's first
+        declared :attr:`State.outputs` entry.
+    binding:
+        :class:`GateBinding` describing where the resolved value came
+        from. Required when ``gate.source_kind`` is ``run_output``;
+        ``binding.target_field`` names the env key the resolved value
+        lands under.
+    binding_value:
+        The actual value pulled from the source run's state output
+        (only used when ``binding`` is supplied). The MCP layer reads
+        the source via :meth:`Project.runs` (or equivalent) and threads
+        the looked-up value here; the pure engine resolver itself has
+        no I/O so it cannot perform the lookup.
+
+    Returns
+    -------
+    GateResolution
+        A typed envelope carrying:
+
+        * ``env_update`` — the dict of resolved fields to merge into
+          the run env.
+        * ``transitions`` — the gate state's outgoing transitions,
+          ready for the persistence layer to walk and drive the next
+          state entry.
+
+    Raises
+    ------
+    GateResolutionError
+        On any of the GATE_CONTRACT-vocabulary envelope codes:
+
+        * ``gate_value_or_binding_required`` — neither ``value`` nor
+          ``binding`` was supplied.
+        * ``gate_value_and_binding_conflict`` — both ``value`` and
+          ``binding`` were supplied; the contract requires exactly
+          one.
+        * ``gate_source_kind_mismatch`` — the supplied resolution
+          shape does not match the gate's ``source_kind`` (a
+          ``run_output`` gate was handed a literal ``value``, or an
+          ``llm_supplied`` gate was handed a ``binding``).
+        * ``gate_schema_mismatch`` — the resolved value did not pass
+          the gate's response schema.
+    """
+    if state.gate is None:
+        raise TypeError(
+            f"resolve_gate called on state {state.id!r} which is not a gate state"
+        )
+
+    gate: Gate = state.gate
+
+    if value is None and binding is None:
+        raise GateResolutionError(
+            "gate_value_or_binding_required",
+            "fsm.resolve_gate requires exactly one of `value` or `binding`",
+        )
+    if value is not None and binding is not None:
+        raise GateResolutionError(
+            "gate_value_and_binding_conflict",
+            "fsm.resolve_gate requires exactly one of `value` or `binding`, not both",
+        )
+
+    # source_kind enforcement: the gate's declared source_kind dictates
+    # which resolution shape is legal. A run_output gate resolved via a
+    # literal `value` would bypass the binding-lookup + max_age_ms
+    # staleness semantics; an llm_supplied gate resolved via a
+    # `binding` would persist an unintended cross-run dependency (and
+    # advertise it in the gate_bindings topology index). Reject both
+    # before we touch the schema validator or persistence layer.
+    if binding is not None and gate.source_kind is not GateSourceKind.run_output:
+        raise GateResolutionError(
+            "gate_source_kind_mismatch",
+            (
+                f"gate {state.id!r} has source_kind={gate.source_kind.value!r}; "
+                "a `binding` is only valid for source_kind='run_output'"
+            ),
+        )
+    if value is not None and gate.source_kind is not GateSourceKind.llm_supplied:
+        raise GateResolutionError(
+            "gate_source_kind_mismatch",
+            (
+                f"gate {state.id!r} has source_kind={gate.source_kind.value!r}; "
+                "a literal `value` is only valid for source_kind='llm_supplied'"
+            ),
+        )
+
+    env_update: dict[str, Any] = {}
+
+    if binding is not None:
+        # run_output path. The binding's target_field names the env
+        # key the resolved value lands under. We validate the supplied
+        # binding_value against the gate's response_schema so a
+        # spec-evolved schema cannot silently land an out-of-shape
+        # value in the downstream run's env.
+        payload = {binding.target_field: binding_value}
+        _validate_against_gate_schema(gate, payload)
+        env_update[binding.target_field] = binding_value
+    else:
+        # llm_supplied path. The LLM passes a dict that must validate
+        # against the gate's response_schema. The resolved fields land
+        # under the gate state's first declared output (GATE_CONTRACT
+        # rule: "lands in the run's environment under the gate's
+        # `target_field` (defaults to the gate state's first declared
+        # output)"). We use the whole validated value under that key,
+        # which matches what a worker's outputs would look like.
+        assert value is not None  # narrow for the type checker
+        _validate_against_gate_schema(gate, value)
+        if not state.outputs:
+            raise GateResolutionError(
+                "gate_schema_mismatch",
+                f"gate state {state.id!r} has no declared outputs to land the value under",
+            )
+        target_field = state.outputs[0]
+        if target_field in value:
+            # Common case: the gate's response_schema is shaped as
+            # {target_field: <typed value>}; we lift the inner value
+            # so downstream env reads see the same shape they would
+            # see for a worker that returned {target_field: ...}.
+            env_update[target_field] = value[target_field]
+        else:
+            env_update[target_field] = value
+
+    return GateResolution(
+        env_update=env_update,
+        transitions=list(state.transitions),
     )
