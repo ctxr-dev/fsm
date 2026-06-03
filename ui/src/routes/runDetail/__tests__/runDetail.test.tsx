@@ -21,9 +21,11 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { cleanup, render, waitFor } from '@testing-library/preact';
 
 import type {
+  Event as FsmEvent,
   RunDetail,
   StateNode,
 } from '../../../lib/api';
+import { resetRunDetailRefresh } from '../../../lib/runDetailRefresh';
 
 // --- Mocks --------------------------------------------------------------
 
@@ -34,13 +36,19 @@ vi.mock('preact-iso', () => ({
 }));
 
 // The SSE EventStream opens a real EventSource on construction; jsdom
-// doesn't ship one. Stub the module so the timeline mount doesn't
-// throw and the route's render path is exercised end-to-end.
+// doesn't ship one. Stub the module and capture the most-recent ``on``
+// handler so PR 6 tests can synthesise SSE frames into the route.
+const sseHandlers: Array<(e: FsmEvent) => void> = [];
+function emitSse(event: FsmEvent): void {
+  for (const h of sseHandlers) h(event);
+}
 vi.mock('../../../lib/sse', () => ({
   EventStream: class {
-    on(): () => void {
+    on(cb: (e: FsmEvent) => void): () => void {
+      sseHandlers.push(cb);
       return () => {
-        // no-op
+        const i = sseHandlers.indexOf(cb);
+        if (i >= 0) sseHandlers.splice(i, 1);
       };
     }
     close(): void {
@@ -133,6 +141,8 @@ function renderRoute() {
 describe('RunDetailRoute (PR 7 layout)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    sseHandlers.length = 0;
+    resetRunDetailRefresh();
   });
 
   test('renders the 50/50 grid (graph | timeline) once data has loaded', async () => {
@@ -169,6 +179,131 @@ describe('RunDetailRoute (PR 7 layout)', () => {
       getByRole('button', { name: /Admin/i }),
     );
     expect(adminBtn).toBeInTheDocument();
+  });
+
+  test('SSE state-tree events dispatch a debounced refetch (PR 6)', async () => {
+    const { getByTestId } = renderRoute();
+    await waitFor(() => getByTestId('run-detail-grid'));
+
+    // Import the mock api so we can assert on call counts.
+    const { api } = await import('../../../lib/api');
+    const initialStateTreeCalls = (api.getStateTree as ReturnType<typeof vi.fn>)
+      .mock.calls.length;
+    const initialDriftCalls = (api.listDriftSignals as ReturnType<typeof vi.fn>)
+      .mock.calls.length;
+    const initialSigsCalls = (
+      api.listCommitSignatures as ReturnType<typeof vi.fn>
+    ).mock.calls.length;
+    const initialToolsCalls = (api.listToolCalls as ReturnType<typeof vi.fn>)
+      .mock.calls.length;
+
+    emitSse({
+      id: 'e1',
+      run_id: 'run-test-1',
+      kind: 'state_entered',
+      producer_id: 'engine',
+      payload: { state_id: 'plan' },
+      created_at: '2025-01-01T00:00:02Z',
+      seq: 10,
+    });
+
+    // useDebouncedRefetch waits 200ms; allow real timers to elapse.
+    await new Promise((r) => setTimeout(r, 350));
+
+    expect(
+      (api.getStateTree as ReturnType<typeof vi.fn>).mock.calls.length,
+    ).toBeGreaterThan(initialStateTreeCalls);
+    // Other refetchers should NOT fire on a state_entered event.
+    expect(
+      (api.listDriftSignals as ReturnType<typeof vi.fn>).mock.calls.length,
+    ).toBe(initialDriftCalls);
+    expect(
+      (api.listCommitSignatures as ReturnType<typeof vi.fn>).mock.calls.length,
+    ).toBe(initialSigsCalls);
+    expect(
+      (api.listToolCalls as ReturnType<typeof vi.fn>).mock.calls.length,
+    ).toBe(initialToolsCalls);
+  });
+
+  test('SSE drift / signatures / tool_call events route to their own refetchers (PR 6)', async () => {
+    const { getByTestId } = renderRoute();
+    await waitFor(() => getByTestId('run-detail-grid'));
+
+    const { api } = await import('../../../lib/api');
+    const before = {
+      drift: (api.listDriftSignals as ReturnType<typeof vi.fn>).mock.calls
+        .length,
+      sigs: (api.listCommitSignatures as ReturnType<typeof vi.fn>).mock.calls
+        .length,
+      tools: (api.listToolCalls as ReturnType<typeof vi.fn>).mock.calls.length,
+    };
+
+    emitSse({
+      id: 'e2',
+      run_id: 'run-test-1',
+      kind: 'drift_signal_recorded',
+      producer_id: 'engine',
+      payload: {},
+      created_at: '2025-01-01T00:00:03Z',
+      seq: 11,
+    });
+    emitSse({
+      id: 'e3',
+      run_id: 'run-test-1',
+      kind: 'commit_signature_verified',
+      producer_id: 'engine',
+      payload: {},
+      created_at: '2025-01-01T00:00:04Z',
+      seq: 12,
+    });
+    emitSse({
+      id: 'e4',
+      run_id: 'run-test-1',
+      kind: 'tool_call_observed',
+      producer_id: 'engine',
+      payload: {},
+      created_at: '2025-01-01T00:00:05Z',
+      seq: 13,
+    });
+
+    await new Promise((r) => setTimeout(r, 350));
+
+    expect(
+      (api.listDriftSignals as ReturnType<typeof vi.fn>).mock.calls.length,
+    ).toBeGreaterThan(before.drift);
+    expect(
+      (api.listCommitSignatures as ReturnType<typeof vi.fn>).mock.calls.length,
+    ).toBeGreaterThan(before.sigs);
+    expect(
+      (api.listToolCalls as ReturnType<typeof vi.fn>).mock.calls.length,
+    ).toBeGreaterThan(before.tools);
+  });
+
+  test('a burst of state_entered events coalesces to a single refetch (PR 6 debouncer)', async () => {
+    const { getByTestId } = renderRoute();
+    await waitFor(() => getByTestId('run-detail-grid'));
+
+    const { api } = await import('../../../lib/api');
+    const before = (api.getStateTree as ReturnType<typeof vi.fn>).mock.calls
+      .length;
+
+    for (let i = 0; i < 5; i++) {
+      emitSse({
+        id: `burst-${i}`,
+        run_id: 'run-test-1',
+        kind: 'state_entered',
+        producer_id: 'engine',
+        payload: {},
+        created_at: '2025-01-01T00:00:06Z',
+        seq: 20 + i,
+      });
+    }
+
+    await new Promise((r) => setTimeout(r, 350));
+    const after = (api.getStateTree as ReturnType<typeof vi.fn>).mock.calls
+      .length;
+    // 5 frames → exactly 1 coalesced refetch.
+    expect(after - before).toBe(1);
   });
 
   test('legacy inline surfaces are not rendered (States tree, Admin Card, Tool Calls audit, per-node JsonViewer panels)', async () => {

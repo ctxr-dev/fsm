@@ -10,7 +10,7 @@
  */
 
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 
 import {
   EmptyState,
@@ -18,6 +18,7 @@ import {
   Spinner,
 } from '../../../components';
 import { api, ApiError, type DriftSignalsResponse } from '../../../lib/api';
+import { driftRefreshNonce } from '../../../lib/runDetailRefresh';
 import { CollapsibleSection } from './CollapsibleSection';
 
 /** Visual gauge for a drift score in the ``[0, 1]`` band. */
@@ -63,12 +64,24 @@ export function DriftSection({ runId }: DriftSectionProps): JSX.Element {
   const [drift, setDrift] = useState<DriftSignalsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState<boolean>(false);
+  // PR 6: re-fetch whenever the route's SSE handler bumps the drift
+  // nonce. Reading ``.value`` in the render body auto-subscribes so a
+  // dependency on it triggers the effect on every bump. We keep
+  // previously-loaded data on-screen across refetches so the panel
+  // does not flash a Spinner on every tick.
+  const nonce = driftRefreshNonce.value;
+  const lastRunIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    setDrift(null);
-    setError(null);
-    setLoaded(false);
+    // Only blank-and-spin on the FIRST fetch for a given runId. Nonce-
+    // driven refetches keep the previously-loaded data visible.
+    if (lastRunIdRef.current !== runId) {
+      setDrift(null);
+      setError(null);
+      setLoaded(false);
+      lastRunIdRef.current = runId;
+    }
     api
       .listDriftSignals(runId)
       .then((res) => {
@@ -84,7 +97,7 @@ export function DriftSection({ runId }: DriftSectionProps): JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [runId]);
+  }, [runId, nonce]);
 
   const trailing = drift ? (
     <Pill variant="neutral" size="sm">

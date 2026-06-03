@@ -55,7 +55,7 @@
  */
 
 import type { JSX } from 'preact';
-import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useRoute } from 'preact-iso';
 
 import {
@@ -96,6 +96,13 @@ import {
   openEdgeSheet as openEdgeSheetOpener,
   openStateEntrySheet as openStateEntrySheetOpener,
 } from '../lib/runDetailSheets';
+import {
+  bumpDriftRefresh,
+  bumpSignaturesRefresh,
+  bumpStateTreeRefresh,
+  bumpToolCallsRefresh,
+} from '../lib/runDetailRefresh';
+import { useDebouncedRefetch } from '../lib/useDebouncedRefetch';
 import { EventStream } from '../lib/sse';
 import { AdminSheetBody } from './runDetail/AdminSheetBody';
 import { EdgeSheetBody } from './runDetail/EdgeSheetBody';
@@ -274,6 +281,9 @@ export function RunDetailRoute(): JSX.Element {
   // AdminSheet (which mounts lazily) sees a populated manifest the
   // first time the operator opens it. They are NOT rendered inline by
   // the route any more — that responsibility moved to AdminSheetBody.
+  // The setters are also fed by the PR 6 SSE-driven debounced
+  // refetchers below; the values themselves are intentionally not read
+  // here (AdminSheetBody owns the per-section fetch + render).
   const [, setToolCalls] = useState<ToolCall[]>([]);
   const [, setDrift] = useState<DriftSignalsResponse | null>(null);
   const [, setSignatures] = useState<CommitSignatureRecord[]>([]);
@@ -386,7 +396,106 @@ export function RunDetailRoute(): JSX.Element {
   }, [run?.manifest.fsm_spec_id]);
 
   // -----------------------------------------------------------------------
-  // SSE subscription — keeps the timeline live
+  // PR 6: SSE-driven debounced refetchers.
+  //
+  // The route owns the SINGLE EventStream subscription for the page so
+  // the server only fans out the run's events once. As each event lands
+  // we (a) prepend it to the timeline (handled below) and (b) dispatch
+  // a debounced refetch for the relevant data source — state tree on
+  // entry/exit/transition/inline events, drift on signal/pause events,
+  // signatures on commit verify/mismatch, tool-calls on tool_call
+  // events. The debouncer coalesces bursts so a chatty run does not
+  // hammer the API with one refetch per frame.
+  //
+  // The refetchers also bump per-kind refresh nonces (see
+  // ``runDetailRefresh.ts``) so lazily-mounted panels (eg. the Admin
+  // Sheet's Drift / Signatures / Tool calls sections) can react to the
+  // same burst without opening their own redundant EventStream.
+  // -----------------------------------------------------------------------
+
+  // Race guard — every refetch closure captures the event seq at
+  // trigger time and ignores its response if a newer event has since
+  // arrived. The check is a defence-in-depth measure: the debouncer's
+  // bounded latency already minimises overlap, but a slow API call can
+  // still resolve out of order relative to a fresh burst. ``lastEventSeq``
+  // is updated by the SSE handler each time a frame lands so the guard
+  // sees the most-recent seq when the API call resolves.
+  const lastEventSeqRef = useRef<number>(0);
+
+  const refetchStateTree = useDebouncedRefetch(() => {
+    if (!runId) return;
+    const seqAtTrigger = lastEventSeqRef.current;
+    return api
+      .getStateTree(runId)
+      .then((tree) => {
+        if (seqAtTrigger < lastEventSeqRef.current && lastEventSeqRef.current > 0) {
+          // A newer burst overtook us; a follow-up refetch is already
+          // queued or in-flight so dropping this response is safe.
+          return;
+        }
+        setStateTree(tree);
+        bumpStateTreeRefresh();
+      })
+      .catch(() => {
+        // Stay silent: a single failed refetch should not blank the
+        // tree. The next event tick will retry.
+      });
+  });
+
+  const refetchDrift = useDebouncedRefetch(() => {
+    if (!runId) return;
+    const seqAtTrigger = lastEventSeqRef.current;
+    return api
+      .listDriftSignals(runId)
+      .then((res) => {
+        if (seqAtTrigger < lastEventSeqRef.current && lastEventSeqRef.current > 0) {
+          return;
+        }
+        setDrift(res);
+        bumpDriftRefresh();
+      })
+      .catch(() => {
+        /* see refetchStateTree */
+      });
+  });
+
+  const refetchSignatures = useDebouncedRefetch(() => {
+    if (!runId) return;
+    const seqAtTrigger = lastEventSeqRef.current;
+    return api
+      .listCommitSignatures(runId, { page_size: 200 })
+      .then((page) => {
+        if (seqAtTrigger < lastEventSeqRef.current && lastEventSeqRef.current > 0) {
+          return;
+        }
+        setSignatures(page.items);
+        bumpSignaturesRefresh();
+      })
+      .catch(() => {
+        /* see refetchStateTree */
+      });
+  });
+
+  const refetchToolCalls = useDebouncedRefetch(() => {
+    if (!runId) return;
+    const seqAtTrigger = lastEventSeqRef.current;
+    return api
+      .listToolCalls({ run_id: runId, page_size: 50 })
+      .then((page) => {
+        if (seqAtTrigger < lastEventSeqRef.current && lastEventSeqRef.current > 0) {
+          return;
+        }
+        setToolCalls(page.items);
+        bumpToolCallsRefresh();
+      })
+      .catch(() => {
+        /* see refetchStateTree */
+      });
+  });
+
+  // -----------------------------------------------------------------------
+  // SSE subscription — keeps the timeline live and dispatches the
+  // debounced per-kind refetches above.
   // -----------------------------------------------------------------------
 
   useEffect(() => {
@@ -396,6 +505,36 @@ export function RunDetailRoute(): JSX.Element {
       filter_run_id: runId,
     });
     const unsubscribe = stream.on((event) => {
+      // Track the most-recent seq so each in-flight refetch's race
+      // guard sees the latest tick when it resolves.
+      if (event.seq != null && event.seq > lastEventSeqRef.current) {
+        lastEventSeqRef.current = event.seq;
+      }
+      // Dispatch debounced refetches BEFORE the prepend so a fast SSE
+      // burst still triggers exactly one refetch per kind per debounce
+      // window — the timeline prepend just rerenders the rows.
+      switch (event.kind) {
+        case 'state_entered':
+        case 'state_exited':
+        case 'state_faulted':
+        case 'transition_taken':
+        case 'inline_executed':
+          refetchStateTree.trigger();
+          break;
+        case 'drift_signal_recorded':
+        case 'drift_pause_triggered':
+          refetchDrift.trigger();
+          break;
+        case 'commit_signature_verified':
+        case 'commit_signature_mismatch':
+          refetchSignatures.trigger();
+          break;
+        case 'tool_call_observed':
+          refetchToolCalls.trigger();
+          break;
+        default:
+          break;
+      }
       // Prepend so newest renders at the top of the timeline; cap at 200
       // so the DOM stays bounded on chatty runs.
       setEvents((prev) => {
@@ -410,7 +549,7 @@ export function RunDetailRoute(): JSX.Element {
       unsubscribe();
       stream.close();
     };
-  }, [runId]);
+  }, [runId, refetchStateTree, refetchDrift, refetchSignatures, refetchToolCalls]);
 
   // -----------------------------------------------------------------------
   // Derived state
