@@ -23,7 +23,7 @@
  * onNodeClick.
  */
 
-import { useEffect, useMemo, useRef } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
 import dagre from 'dagre';
 import {
@@ -183,6 +183,26 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
   const currentRing = isCurrent
     ? 'ring-2 ring-amber-400 ring-offset-2 ring-offset-white dark:ring-offset-slate-900'
     : '';
+  // W23d 1-hop hover highlight. FlowGraph stamps three transient flags
+  // onto node.data while a hover is active:
+  //   data.isHovered    — this is the node the cursor is on (or one
+  //                       endpoint of the hovered edge)
+  //   data.highlighted  — this node is a neighbour (1 hop away) of the
+  //                       hovered node, or it is the source/target of
+  //                       the hovered edge
+  //   data.dimmed       — something else is hovered and this node is
+  //                       NOT in the highlighted set
+  // When nothing is hovered all three flags are false and the node
+  // renders unchanged.
+  const isHovered = data.isHovered === true;
+  const isHighlighted = data.highlighted === true;
+  const isDimmed = data.dimmed === true;
+  const hoverRing = isHovered
+    ? 'ring-2 ring-amber-400 ring-offset-2 ring-offset-white dark:ring-offset-slate-900'
+    : isHighlighted
+    ? 'ring-1 ring-amber-300 ring-offset-1 ring-offset-white dark:ring-offset-slate-900'
+    : '';
+  const dimClass = isDimmed ? 'opacity-30' : '';
   return (
     <div
       class={[
@@ -191,9 +211,15 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
         // the (fixed) node height. gap-1 gives the two rows even
         // breathing room.
         'flex flex-col gap-1 justify-center overflow-hidden',
+        // Smooth fade between dim / un-dim states. motion-reduce
+        // disables the transition for users with
+        // prefers-reduced-motion (existing pattern across the dashboard).
+        'transition-opacity duration-150 motion-reduce:transition-none',
         paletteClass,
         selected ? 'ring-2 ring-emerald-400 ring-offset-1' : '',
         currentRing,
+        hoverRing,
+        dimClass,
       ].join(' ')}
       style={{ width: `${NODE_WIDTH}px`, minHeight: `${NODE_HEIGHT}px` }}
     >
@@ -536,6 +562,45 @@ export function FlowGraph({
       el.removeEventListener('wheel', onWheel, { capture: true } as unknown as EventListenerOptions);
     };
   }, []);
+  // W23d 1-hop hover highlight state. Tracking the hovered node / edge
+  // here (not inside FsmNode / FsmEdge) keeps every node + edge aware
+  // of what the operator is pointing at, which is what lets us dim
+  // everything outside the 1-hop neighbourhood. Only one of these is
+  // ever non-null at a time; entering an edge clears the node hover
+  // and vice-versa to avoid an in-between flicker where both apply.
+  const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
+  const [hoveredEdgeId, setHoveredEdgeId] = useState<string | null>(null);
+
+  // Pre-compute the "highlighted set" — the set of node ids and edge
+  // ids that are 1 hop away from the current hover target. useMemo
+  // keyed on edges + the hover ids so we don't rebuild the set on
+  // every unrelated render (e.g. a viewport pan that re-renders the
+  // FlowGraph but doesn't change the topology).
+  const highlight = useMemo(() => {
+    const highlightedNodes = new Set<string>();
+    const highlightedEdges = new Set<string>();
+    if (hoveredNodeId !== null) {
+      highlightedNodes.add(hoveredNodeId);
+      for (const e of edges) {
+        if (e.source === hoveredNodeId || e.target === hoveredNodeId) {
+          highlightedEdges.add(e.id);
+          highlightedNodes.add(e.source);
+          highlightedNodes.add(e.target);
+        }
+      }
+    } else if (hoveredEdgeId !== null) {
+      const hoveredEdge = edges.find((e) => e.id === hoveredEdgeId);
+      if (hoveredEdge) {
+        highlightedEdges.add(hoveredEdge.id);
+        highlightedNodes.add(hoveredEdge.source);
+        highlightedNodes.add(hoveredEdge.target);
+      }
+    }
+    return { nodes: highlightedNodes, edges: highlightedEdges };
+  }, [edges, hoveredNodeId, hoveredEdgeId]);
+
+  const hoverActive = hoveredNodeId !== null || hoveredEdgeId !== null;
+
   const { positioned, edgeLabelPositions } = useMemo(() => {
     if (!autoLayout) {
       // Preserve caller-supplied positions but still tag every node
@@ -565,10 +630,26 @@ export function FlowGraph({
 
   const decoratedNodes = useMemo(
     () =>
-      positioned.map((n) =>
-        selectedNodeId && n.id === selectedNodeId ? { ...n, selected: true } : n,
-      ),
-    [positioned, selectedNodeId],
+      positioned.map((n) => {
+        const isHovered = hoveredNodeId === n.id;
+        const isHighlighted = !isHovered && highlight.nodes.has(n.id);
+        const isDimmed = hoverActive && !isHovered && !isHighlighted;
+        // Spread node.data so we don't drop any caller-set fields
+        // (kind, label, runStatus, isCurrent, etc.). The three hover
+        // flags are stripped back to undefined when nothing is hovered
+        // so FsmNode's `=== true` checks render the un-highlighted
+        // baseline.
+        const nextData = {
+          ...n.data,
+          isHovered,
+          highlighted: isHighlighted,
+          dimmed: isDimmed,
+        } as FlowNodeData;
+        const withSelection =
+          selectedNodeId && n.id === selectedNodeId ? { ...n, selected: true } : n;
+        return { ...withSelection, data: nextData };
+      }),
+    [positioned, selectedNodeId, hoveredNodeId, hoverActive, highlight],
   );
 
   const showMiniMap = miniMap ?? nodes.length > 10;
@@ -578,10 +659,61 @@ export function FlowGraph({
   // on every render; the previous version put this useMemo after the
   // empty-graph early return, which threw when the same FlowGraph
   // flipped between 0 nodes and >0 nodes (Copilot finding on PR #57).
-  const decoratedEdges = useMemo(
-    () => decorateEdges(edges, edgeLabelPositions),
-    [edges, edgeLabelPositions],
-  );
+  const decoratedEdges = useMemo(() => {
+    const base = decorateEdges(edges, edgeLabelPositions);
+    return base.map((e) => {
+      const isHovered = hoveredEdgeId === e.id;
+      const isHighlighted = !isHovered && highlight.edges.has(e.id);
+      const isDimmed = hoverActive && !isHovered && !isHighlighted;
+      const nextData = {
+        ...(e.data ?? {}),
+        isHovered,
+        highlighted: isHighlighted,
+        dimmed: isDimmed,
+      };
+      // Boost the SVG stroke when the edge is the hover target or a
+      // 1-hop neighbour. FsmEdge owns label pill opacity / colour via
+      // nextData; the path's stroke-width lives on style and is set
+      // here because BaseEdge consumes it directly.
+      const baseStrokeWidth =
+        typeof (e.style as { strokeWidth?: number } | undefined)?.strokeWidth === 'number'
+          ? ((e.style as { strokeWidth?: number }).strokeWidth as number)
+          : 1.5;
+      const nextStrokeWidth = isHovered
+        ? Math.max(baseStrokeWidth, 2.5)
+        : isHighlighted
+        ? Math.max(baseStrokeWidth, 2)
+        : baseStrokeWidth;
+      const nextStyle = {
+        ...(e.style ?? {}),
+        strokeWidth: nextStrokeWidth,
+        opacity: isDimmed ? 0.3 : 1,
+        // The path doesn't need a CSS class hook for the transition —
+        // BaseEdge renders a plain <path>. xyflow applies CSS via
+        // style only, so we set the transition inline.
+        transition: 'opacity 150ms ease-out, stroke-width 150ms ease-out',
+      };
+      return { ...e, data: nextData, style: nextStyle };
+    });
+  }, [edges, edgeLabelPositions, hoveredEdgeId, hoverActive, highlight]);
+
+  // React Flow's onNodeMouseEnter / Leave fire with (event, node);
+  // collapse to just the id and clear any active edge hover so the two
+  // hover states stay mutually exclusive.
+  const onNodeMouseEnter = useCallback((_e: unknown, node: { id: string }) => {
+    setHoveredNodeId(node.id);
+    setHoveredEdgeId(null);
+  }, []);
+  const onNodeMouseLeave = useCallback(() => {
+    setHoveredNodeId(null);
+  }, []);
+  const onEdgeMouseEnter = useCallback((_e: unknown, edge: { id: string }) => {
+    setHoveredEdgeId(edge.id);
+    setHoveredNodeId(null);
+  }, []);
+  const onEdgeMouseLeave = useCallback(() => {
+    setHoveredEdgeId(null);
+  }, []);
 
   if (nodes.length === 0) {
     return (
@@ -658,6 +790,10 @@ export function FlowGraph({
         onEdgeClick={(_e, edge) =>
           onEdgeClick?.(edge.id, edge.data as Record<string, unknown> | undefined)
         }
+        onNodeMouseEnter={onNodeMouseEnter}
+        onNodeMouseLeave={onNodeMouseLeave}
+        onEdgeMouseEnter={onEdgeMouseEnter}
+        onEdgeMouseLeave={onEdgeMouseLeave}
       >
         {background ? (
           <Background

@@ -11,7 +11,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
-import { cleanup, render } from '@testing-library/preact';
+import { act, cleanup, render } from '@testing-library/preact';
 
 // Mock @xyflow/react before importing FlowGraph.
 let lastReactFlowProps: Record<string, unknown> | null = null;
@@ -329,6 +329,183 @@ describe('FlowGraph', () => {
       sourceId: 'a',
       targetId: 'b',
     }));
+  });
+
+  describe('W23d 1-hop hover highlight', () => {
+    // Helper to build a small graph: a -> b -> c with a side branch d
+    // attached to b. This gives us a node (b) with TWO neighbours
+    // (a + c) plus one unrelated node (d when hovering a, or d only
+    // when nothing else is hovered). The graph stays small enough to
+    // assert exact sets without hand-counting.
+    const buildGraph = (): {
+      nodes: Node<FlowNodeData>[];
+      edges: Edge[];
+    } => ({
+      nodes: [
+        { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+        { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
+        { id: 'c', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'c' } },
+        { id: 'd', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'd' } },
+      ],
+      edges: [
+        { id: 'a-b', source: 'a', target: 'b', label: 'first' },
+        { id: 'b-c', source: 'b', target: 'c', label: 'next' },
+        { id: 'a-d', source: 'a', target: 'd', label: 'side' },
+      ],
+    });
+
+    test('no hover: every node + edge renders un-dimmed and un-highlighted', () => {
+      const { nodes, edges } = buildGraph();
+      render(<FlowGraph nodes={nodes} edges={edges} autoLayout={false} />);
+      const decoratedNodes = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
+      const decoratedEdges = lastReactFlowProps!.edges as Array<
+        Edge & { data?: { dimmed?: boolean; highlighted?: boolean; isHovered?: boolean } }
+      >;
+      // Baseline: nothing dimmed, nothing highlighted, nothing hovered.
+      for (const n of decoratedNodes) {
+        expect(n.data.dimmed).toBe(false);
+        expect(n.data.highlighted).toBe(false);
+        expect(n.data.isHovered).toBe(false);
+      }
+      for (const e of decoratedEdges) {
+        expect(e.data?.dimmed).toBe(false);
+        expect(e.data?.highlighted).toBe(false);
+        expect(e.data?.isHovered).toBe(false);
+      }
+    });
+
+    test('hovering node "a" highlights a + its neighbours (b, d) + the connecting edges; dims c + b-c', () => {
+      const { nodes, edges } = buildGraph();
+      render(<FlowGraph nodes={nodes} edges={edges} autoLayout={false} />);
+      const onNodeMouseEnter = lastReactFlowProps!.onNodeMouseEnter as (
+        e: unknown,
+        node: { id: string },
+      ) => void;
+      act(() => {
+        onNodeMouseEnter({}, { id: 'a' });
+      });
+      const decoratedNodes = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
+      const decoratedEdges = lastReactFlowProps!.edges as Array<
+        Edge & { data?: { dimmed?: boolean; highlighted?: boolean; isHovered?: boolean } }
+      >;
+      const byId = Object.fromEntries(decoratedNodes.map((n) => [n.id, n]));
+      // a is THE hover target.
+      expect(byId.a.data.isHovered).toBe(true);
+      expect(byId.a.data.dimmed).toBe(false);
+      // b and d are 1-hop neighbours of a (via a-b and a-d).
+      expect(byId.b.data.highlighted).toBe(true);
+      expect(byId.b.data.dimmed).toBe(false);
+      expect(byId.d.data.highlighted).toBe(true);
+      expect(byId.d.data.dimmed).toBe(false);
+      // c is 2 hops away — must be dimmed.
+      expect(byId.c.data.highlighted).toBe(false);
+      expect(byId.c.data.dimmed).toBe(true);
+
+      const edgesById = Object.fromEntries(decoratedEdges.map((e) => [e.id, e]));
+      expect(edgesById['a-b'].data?.highlighted).toBe(true);
+      expect(edgesById['a-b'].data?.dimmed).toBe(false);
+      expect(edgesById['a-d'].data?.highlighted).toBe(true);
+      expect(edgesById['a-d'].data?.dimmed).toBe(false);
+      expect(edgesById['b-c'].data?.highlighted).toBe(false);
+      expect(edgesById['b-c'].data?.dimmed).toBe(true);
+    });
+
+    test('hovering edge "a-b" highlights the edge + its endpoints (a, b); dims c, d and the other edges', () => {
+      const { nodes, edges } = buildGraph();
+      render(<FlowGraph nodes={nodes} edges={edges} autoLayout={false} />);
+      const onEdgeMouseEnter = lastReactFlowProps!.onEdgeMouseEnter as (
+        e: unknown,
+        edge: { id: string },
+      ) => void;
+      act(() => {
+        onEdgeMouseEnter({}, { id: 'a-b' });
+      });
+      const decoratedNodes = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
+      const decoratedEdges = lastReactFlowProps!.edges as Array<
+        Edge & {
+          data?: { dimmed?: boolean; highlighted?: boolean; isHovered?: boolean };
+          style?: { strokeWidth?: number; opacity?: number };
+        }
+      >;
+      const nodeById = Object.fromEntries(decoratedNodes.map((n) => [n.id, n]));
+      // Endpoints of a-b stay full opacity and pick up the subtle ring
+      // signal via data.highlighted.
+      expect(nodeById.a.data.highlighted).toBe(true);
+      expect(nodeById.a.data.dimmed).toBe(false);
+      expect(nodeById.b.data.highlighted).toBe(true);
+      expect(nodeById.b.data.dimmed).toBe(false);
+      // c and d are not endpoints of a-b -> dimmed.
+      expect(nodeById.c.data.dimmed).toBe(true);
+      expect(nodeById.d.data.dimmed).toBe(true);
+
+      const edgeById = Object.fromEntries(decoratedEdges.map((e) => [e.id, e]));
+      expect(edgeById['a-b'].data?.isHovered).toBe(true);
+      expect(edgeById['a-b'].data?.dimmed).toBe(false);
+      // Hovered edge gets a thicker stroke.
+      expect(edgeById['a-b'].style?.strokeWidth).toBeGreaterThan(1.5);
+      expect(edgeById['a-b'].style?.opacity).toBe(1);
+      // Other edges fade and stay at baseline stroke.
+      expect(edgeById['a-d'].data?.dimmed).toBe(true);
+      expect(edgeById['a-d'].style?.opacity).toBe(0.3);
+      expect(edgeById['b-c'].data?.dimmed).toBe(true);
+      expect(edgeById['b-c'].style?.opacity).toBe(0.3);
+    });
+
+    test('node hover then leave returns to the un-hovered baseline', () => {
+      const { nodes, edges } = buildGraph();
+      render(<FlowGraph nodes={nodes} edges={edges} autoLayout={false} />);
+      const onNodeMouseEnter = lastReactFlowProps!.onNodeMouseEnter as (
+        e: unknown,
+        node: { id: string },
+      ) => void;
+      const onNodeMouseLeave = lastReactFlowProps!.onNodeMouseLeave as (
+        e: unknown,
+        node: { id: string },
+      ) => void;
+      act(() => {
+        onNodeMouseEnter({}, { id: 'a' });
+      });
+      // Confirm at least one node is dimmed mid-hover, then leave and
+      // confirm nothing is dimmed.
+      let decoratedNodes = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
+      expect(decoratedNodes.some((n) => n.data.dimmed === true)).toBe(true);
+      act(() => {
+        onNodeMouseLeave({}, { id: 'a' });
+      });
+      decoratedNodes = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
+      expect(decoratedNodes.every((n) => n.data.dimmed === false)).toBe(true);
+      expect(decoratedNodes.every((n) => n.data.highlighted === false)).toBe(true);
+      expect(decoratedNodes.every((n) => n.data.isHovered === false)).toBe(true);
+    });
+
+    test('entering an edge clears any active node hover (mutually exclusive)', () => {
+      const { nodes, edges } = buildGraph();
+      render(<FlowGraph nodes={nodes} edges={edges} autoLayout={false} />);
+      const onNodeMouseEnter = lastReactFlowProps!.onNodeMouseEnter as (
+        e: unknown,
+        node: { id: string },
+      ) => void;
+      const onEdgeMouseEnter = lastReactFlowProps!.onEdgeMouseEnter as (
+        e: unknown,
+        edge: { id: string },
+      ) => void;
+      act(() => {
+        onNodeMouseEnter({}, { id: 'a' });
+      });
+      act(() => {
+        onEdgeMouseEnter({}, { id: 'b-c' });
+      });
+      const decoratedNodes = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
+      const byId = Object.fromEntries(decoratedNodes.map((n) => [n.id, n]));
+      // Node hover should be cleared; only b + c (endpoints of b-c)
+      // are highlighted now.
+      expect(byId.a.data.isHovered).toBe(false);
+      expect(byId.a.data.highlighted).toBe(false);
+      expect(byId.a.data.dimmed).toBe(true);
+      expect(byId.b.data.highlighted).toBe(true);
+      expect(byId.c.data.highlighted).toBe(true);
+      expect(byId.d.data.dimmed).toBe(true);
+    });
   });
 
   test('default direction is TB (top-to-bottom) when not specified', () => {
