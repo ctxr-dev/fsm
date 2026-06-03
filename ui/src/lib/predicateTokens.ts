@@ -33,9 +33,12 @@ export interface PredicateToken {
   text: string;
 }
 
-const OPERATOR_KEYWORDS = new Set(['AND', 'OR', 'NOT', 'IN']);
+// Mirror ctxr/fsm/core/predicates.py: AND/OR/NOT are operator
+// keywords; `in` is a built-in function, NOT an operator, so it must
+// only render as `function` when followed by `(`.
+const OPERATOR_KEYWORDS = new Set(['AND', 'OR', 'NOT']);
 const LITERAL_KEYWORDS = new Set(['TRUE', 'FALSE', 'NULL', 'ALWAYS']);
-const FUNCTION_NAMES = new Set(['len', 'empty']);
+const FUNCTION_NAMES = new Set(['len', 'empty', 'in']);
 const TWO_CHAR_OPS = new Set(['==', '!=', '<=', '>=', '&&', '||']);
 
 function isDigit(ch: string): boolean {
@@ -105,10 +108,25 @@ export function tokenisePredicate(source: string): PredicateToken[] {
       i = j;
       continue;
     }
-    // Numeric literal (integer or float with one optional decimal point).
+    // Numeric literal (integer or float with one optional decimal
+    // point). Matches the Python tokenizer in predicates.py, which
+    // rejects multiple dots — the highlighter stops the run at the
+    // second dot so malformed input like `1.2.3` doesn't collapse
+    // into a single misleading number token.
     if (isDigit(ch)) {
       let j = i;
-      while (j < n && (isDigit(source[j]) || source[j] === '.')) j++;
+      let seenDot = false;
+      while (j < n) {
+        const c = source[j];
+        if (isDigit(c)) {
+          j++;
+        } else if (c === '.' && !seenDot) {
+          seenDot = true;
+          j++;
+        } else {
+          break;
+        }
+      }
       out.push({ kind: 'number', text: source.slice(i, j) });
       i = j;
       continue;
@@ -120,12 +138,13 @@ export function tokenisePredicate(source: string): PredicateToken[] {
       const raw = source.slice(i, j);
       const upper = raw.toUpperCase();
       if (OPERATOR_KEYWORDS.has(upper)) {
-        // AND / OR / NOT / in render as operators (logical glue).
+        // AND / OR / NOT render as operators (logical glue).
         out.push({ kind: 'operator', text: raw });
       } else if (LITERAL_KEYWORDS.has(upper)) {
         out.push({ kind: 'keyword', text: raw });
       } else if (FUNCTION_NAMES.has(raw) && source[j] === '(') {
-        // len( / empty( only — `in` is handled above as an operator.
+        // len( / empty( / in( — built-in functions in the DSL, only
+        // highlighted as such when immediately followed by `(`.
         out.push({ kind: 'function', text: raw });
       } else {
         out.push({ kind: 'identifier', text: raw });

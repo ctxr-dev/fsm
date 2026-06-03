@@ -241,6 +241,10 @@ function applySearchHighlight(root: HTMLElement, terms: readonly string[]): void
       // Skip text already inside a mark (defensive after the unwrap).
       const parentEl = node.parentElement;
       if (parentEl && parentEl.classList.contains('jv-match')) return NodeFilter.FILTER_REJECT;
+      // Reset lastIndex: pattern is /gi, and .test() on a global regex
+      // advances lastIndex, which would make later sibling text nodes
+      // skip matches in a traversal-order-dependent way.
+      pattern.lastIndex = 0;
       return pattern.test(t) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
     },
   });
@@ -335,10 +339,12 @@ export function JsonViewer({
   const filteredValue = useMemo(() => {
     if (searchTerms.length === 0) return value;
     const { pruned, matched } = pruneJsonToMatches(value, searchTerms);
-    // If nothing matched the user still gets feedback (empty object)
-    // instead of the full original tree, which would silently ignore
-    // the query.
-    return matched ? pruned : {};
+    // If nothing matched the user still gets feedback (empty
+    // container) instead of the full original tree, which would
+    // silently ignore the query. Preserve the root container kind so
+    // searching inside an array doesn't visually flip to `{}`.
+    if (matched) return pruned;
+    return Array.isArray(value) ? [] : {};
   }, [value, searchTerms]);
 
   // Effective collapse depth for the on-page JsonView. When a search
