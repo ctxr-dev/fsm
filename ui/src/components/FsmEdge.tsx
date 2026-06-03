@@ -59,6 +59,12 @@ export interface FsmEdgeData extends Record<string, unknown> {
   transition?: unknown;
   sourceId?: string;
   targetId?: string;
+  /** Label centre coords stamped by FlowGraph's dagre layout (graph
+   *  space). When present, FsmEdge anchors the label here instead of
+   *  the geometric longest-segment midpoint — this is what stops
+   *  sibling labels on a fan-out from stacking on the same midpoint
+   *  band even when dagre reserved distinct slack for each. */
+  dagreLabel?: { x: number; y: number };
 }
 
 /**
@@ -154,23 +160,24 @@ export function FsmEdge(props: EdgeProps): JSX.Element {
     borderRadius: 4,
   });
 
-  // W23b regression fix: xyflow's getSmoothStepPath returns the
-  // GEOMETRIC centre of the path, which for an L-shape lands on the
-  // bend itself, a visually poor anchor that often overlaps a
-  // downstream node corner. Re-derive the polyline xyflow emits for a
-  // 90-degree step edge (4 points, 3 segments) and place the label at
-  // the midpoint of the LONGEST segment instead. This keeps the label
-  // on the dominant straight run where there is the most clearance.
-  const [labelX, labelY] = longestSegmentMidpoint(
-    sourceX,
-    sourceY,
-    targetX,
-    targetY,
-    sourcePosition,
-    targetPosition,
-  );
-
   const ed = (data ?? {}) as FsmEdgeData;
+  // Prefer dagre's layout-assigned label position when FlowGraph
+  // captured one for this edge. Dagre treats each label box as a
+  // first-class layout obstacle and assigns distinct (x, y) per edge,
+  // so sibling labels on a fan-out (one source -> N targets) don't
+  // stack on the same midpoint band. Fallback is the geometric
+  // longest-segment midpoint: it still wins for edges added by ad-hoc
+  // callers that bypass applyDagreLayout (e.g. unit-test fixtures).
+  const [labelX, labelY] = ed.dagreLabel
+    ? [ed.dagreLabel.x, ed.dagreLabel.y]
+    : longestSegmentMidpoint(
+        sourceX,
+        sourceY,
+        targetX,
+        targetY,
+        sourcePosition,
+        targetPosition,
+      );
   const fullText = typeof ed.fullLabel === 'string' && ed.fullLabel.length > 0
     ? ed.fullLabel
     : typeof label === 'string'

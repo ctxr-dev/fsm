@@ -262,18 +262,51 @@ const EDGE_TYPES = { fsmEdge: FsmEdge };
 // LABEL_PILL_MAX_WIDTH must match the FsmEdge pill's `max-w-[280px]`
 // so dagre reserves slack matching the actual rendered width.
 const LABEL_PILL_MAX_WIDTH = 280;
-// Approx characters per visual line at the pill's font-size 10 + the
-// 280px cap (10px monospace ≈ 6.5px advance => 280/6.5 ≈ 43).
-const LABEL_CHARS_PER_LINE = 43;
+// Width per glyph for the 10px non-monospace UI font used inside the
+// FsmEdge pill. The previous 7px estimate UNDERshot real rendered
+// width because the syntax-coloured token spans use a mix of bold +
+// proportional glyphs. 8px per char is a safe ceiling.
+const LABEL_CHAR_WIDTH = 8;
+// Horizontal padding (px-1.5 each side = 6px each, plus the SVG
+// labelBgPadding of 6px) and the FsmEdge border. Dagre needs to know
+// the FULL outer box, not just the text run.
+const LABEL_HORIZONTAL_PADDING = 16;
 // Line-height for the wrapped pill (in px) + 8px vertical pill padding.
 const LABEL_LINE_HEIGHT = 14;
-const LABEL_PILL_VERTICAL_PADDING = 8;
+const LABEL_PILL_VERTICAL_PADDING = 12;
+// Perpendicular distance dagre keeps between the label centre and the
+// rank centreline. Default 10 lands labels right on the edge polyline;
+// 24 lifts them off so they don't collide with adjacent node corners.
+const LABEL_OFFSET = 24;
+
+/**
+ * Measure an edge label as the FsmEdge pill would render it. Returns
+ * the outer box dagre should reserve so neighbouring edges/nodes don't
+ * collide with the label.
+ */
+function measureEdgeLabel(text: string): { width: number; height: number } {
+  if (!text) return { width: 0, height: 0 };
+  const naiveWidth = text.length * LABEL_CHAR_WIDTH + LABEL_HORIZONTAL_PADDING;
+  const width = Math.min(LABEL_PILL_MAX_WIDTH, Math.max(60, naiveWidth));
+  // Lines = ceil(natural text width / usable width), where usable
+  // width excludes horizontal padding. Worst-case break-words wrapping
+  // matches the FsmEdge `whitespace-normal break-words` pill.
+  const usable = Math.max(1, width - LABEL_HORIZONTAL_PADDING);
+  const lines = Math.max(
+    1,
+    Math.ceil((text.length * LABEL_CHAR_WIDTH) / usable),
+  );
+  return { width, height: lines * LABEL_LINE_HEIGHT + LABEL_PILL_VERTICAL_PADDING };
+}
+
+/** Map from edge id -> dagre-assigned label centre coords (graph-space). */
+export type DagreEdgeLabelMap = Map<string, { x: number; y: number }>;
 
 function applyDagreLayout(
   nodes: readonly Node<FlowNodeData>[],
   edges: readonly Edge[],
   direction: 'LR' | 'TB',
-): Node<FlowNodeData>[] {
+): { positioned: Node<FlowNodeData>[]; edgeLabelPositions: DagreEdgeLabelMap } {
   const g = new dagre.graphlib.Graph({ multigraph: true });
   g.setDefaultEdgeLabel(() => ({}));
   // W23c user correction: bias the layout HORIZONTAL. The previous
@@ -297,29 +330,57 @@ function applyDagreLayout(
   });
   for (const n of nodes) g.setNode(n.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
   for (const e of edges) {
-    const labelLen = typeof e.label === 'string' ? e.label.length : 0;
+    const text = typeof e.label === 'string' ? e.label : '';
     // Reserve label space proportionally so dagre routes around
     // long predicate labels instead of letting them collide with
-    // nodes downstream. Wrap-aware: a 120-char predicate reserves a
-    // ~3-line tall box, not the legacy 18px strip that the rendered
-    // pill would overflow. The fourth argument is the edge name; under
-    // multigraph mode it disambiguates parallel edges so a second
-    // predicate between the same two states doesn't clobber the first.
-    const lines = labelLen > 0 ? Math.max(1, Math.ceil(labelLen / LABEL_CHARS_PER_LINE)) : 0;
+    // nodes downstream. measureEdgeLabel models the FsmEdge pill
+    // (8px-per-char, horizontal padding, wrap @ 280px max-width) so
+    // dagre's slack reflects the ACTUAL rendered box. The fourth
+    // argument is the edge name; under multigraph mode it disambiguates
+    // parallel edges so a second predicate between the same two states
+    // doesn't clobber the first.
+    const { width, height } = measureEdgeLabel(text);
     g.setEdge(
       e.source,
       e.target,
       {
-        width: labelLen > 0 ? Math.min(LABEL_PILL_MAX_WIDTH, Math.max(60, labelLen * 7)) : 0,
-        height: lines * LABEL_LINE_HEIGHT + (lines > 0 ? LABEL_PILL_VERTICAL_PADDING : 0),
+        width,
+        height,
         labelpos: 'c',
+        // labeloffset pushes labels perpendicular to the rank
+        // centreline. The dagre default (10) sits the label right on
+        // the polyline, where it collides with adjacent node corners
+        // when ranksep is tight. 24 lifts it clear.
+        labeloffset: LABEL_OFFSET,
+        // Long predicates get an extra rank of vertical slack so dagre
+        // has somewhere to route the multi-line pill without stealing
+        // space from siblings.
+        minlen: text.length > 60 ? 2 : 1,
       },
       e.id,
     );
   }
   dagre.layout(g);
 
-  return nodes.map((n) => {
+  // Capture dagre's per-edge label centre so FsmEdge can prefer the
+  // layout-computed position over the geometric longest-segment
+  // midpoint. Without this, siblings fanning out of one source land
+  // their labels on the same midpoint band and visually collide even
+  // though dagre's routing accounted for them. Multigraph mode requires
+  // the {v, w, name} signature to retrieve the right parallel edge.
+  const edgeLabelPositions: DagreEdgeLabelMap = new Map();
+  for (const e of edges) {
+    try {
+      const de = g.edge({ v: e.source, w: e.target, name: e.id });
+      if (de && typeof de.x === 'number' && typeof de.y === 'number') {
+        edgeLabelPositions.set(e.id, { x: de.x, y: de.y });
+      }
+    } catch {
+      // Edge not present (defensive: nothing to do).
+    }
+  }
+
+  const positioned = nodes.map((n) => {
     const { x, y } = g.node(n.id);
     return {
       ...n,
@@ -336,6 +397,7 @@ function applyDagreLayout(
       type: 'fsmNode',
     };
   });
+  return { positioned, edgeLabelPositions };
 }
 
 // W23b regression fix: do NOT pre-truncate edge labels. The FsmEdge
@@ -354,7 +416,10 @@ function truncateLabel(text: string): string {
 // markers so direction is unambiguous, labels with a themed fill +
 // solid background rect so the text is always legible against the
 // graph background.
-function decorateEdges(edges: readonly Edge[]): Edge[] {
+function decorateEdges(
+  edges: readonly Edge[],
+  edgeLabelPositions?: DagreEdgeLabelMap,
+): Edge[] {
   return edges.map((e) => {
     const original = typeof e.label === 'string' ? e.label : undefined;
     const labelText = typeof e.label === 'string' ? truncateLabel(e.label) : e.label;
@@ -363,6 +428,7 @@ function decorateEdges(edges: readonly Edge[]): Edge[] {
     // (specDetail's inspector Sheet) can render the full payload without
     // re-walking the spec.
     const incomingData = (e.data ?? {}) as Record<string, unknown>;
+    const dagrePos = edgeLabelPositions?.get(e.id);
     const data: Record<string, unknown> = {
       ...incomingData,
       fullLabel: typeof incomingData.fullLabel === 'string'
@@ -370,6 +436,11 @@ function decorateEdges(edges: readonly Edge[]): Edge[] {
         : original,
       sourceId: e.source,
       targetId: e.target,
+      // dagreLabel propagates the layout-computed label centre to
+      // FsmEdge, which prefers it over the geometric longest-segment
+      // midpoint when present. This is what stops sibling labels on a
+      // fan-out from stacking on the same midpoint band.
+      ...(dagrePos ? { dagreLabel: dagrePos } : {}),
     };
     return {
       ...e,
@@ -465,7 +536,7 @@ export function FlowGraph({
       el.removeEventListener('wheel', onWheel, { capture: true } as unknown as EventListenerOptions);
     };
   }, []);
-  const positioned = useMemo(() => {
+  const { positioned, edgeLabelPositions } = useMemo(() => {
     if (!autoLayout) {
       // Preserve caller-supplied positions but still tag every node
       // with the source/target Position that matches the active
@@ -475,7 +546,7 @@ export function FlowGraph({
       // type is also applied so callers don't have to set it manually.
       const sp = direction === 'LR' ? Position.Right : Position.Bottom;
       const tp = direction === 'LR' ? Position.Left : Position.Top;
-      return nodes.map((n) => ({
+      const manual = nodes.map((n) => ({
         ...n,
         // W22: stamp width/height so MiniMap renders thumbnails even
         // for callers that supply manual positions. Only fill in
@@ -487,6 +558,7 @@ export function FlowGraph({
         targetPosition: n.targetPosition ?? tp,
         type: n.type ?? 'fsmNode',
       }));
+      return { positioned: manual, edgeLabelPositions: new Map() as DagreEdgeLabelMap };
     }
     return applyDagreLayout(nodes, edges, direction);
   }, [nodes, edges, autoLayout, direction]);
@@ -506,7 +578,10 @@ export function FlowGraph({
   // on every render; the previous version put this useMemo after the
   // empty-graph early return, which threw when the same FlowGraph
   // flipped between 0 nodes and >0 nodes (Copilot finding on PR #57).
-  const decoratedEdges = useMemo(() => decorateEdges(edges), [edges]);
+  const decoratedEdges = useMemo(
+    () => decorateEdges(edges, edgeLabelPositions),
+    [edges, edgeLabelPositions],
+  );
 
   if (nodes.length === 0) {
     return (
