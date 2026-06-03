@@ -145,3 +145,39 @@ body {
   padding: 0 1px;
   color: inherit;
 }
+
+/* Amber ring pulse used by the RunProgressGraph's current-state node.
+   The animation paints a single expanding amber shadow ring that fades
+   out at 70 % then continues invisibly to 100 % so the next iteration
+   restarts cleanly without flashing. Tuned around the W22b amber-500
+   token (rgba(251,191,36,*)) so the colour matches the existing
+   "current" pill and ring legend on the run graph header.
+
+   The infinite loop runs at 1.6 s per cycle — slow enough that the
+   movement is calming, fast enough that the operator's eye lands on
+   the active node within the first scan. */
+@keyframes fsm-amber-ring-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(251, 191, 36, 0.6);
+  }
+  70% {
+    box-shadow: 0 0 0 12px rgba(251, 191, 36, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(251, 191, 36, 0);
+  }
+}
+
+.fsm-pulse-current {
+  animation: fsm-amber-ring-pulse 1.6s ease-out infinite;
+}
+
+/* Respect the operator's reduced-motion preference: the pulsing ring
+   is replaced with a static amber outline so the "current" affordance
+   is still present without continuous animation. */
+@media (prefers-reduced-motion: reduce) {
+  .fsm-pulse-current {
+    animation: none;
+    outline: 2px solid rgb(251 191 36);
+  }
+}

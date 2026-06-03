@@ -90,8 +90,14 @@ import {
   type ToolCall,
 } from '../lib/api';
 import { openSheet } from '../lib/store';
+import {
+  openEdgeSheet as openEdgeSheetOpener,
+  openStateEntrySheet as openStateEntrySheetOpener,
+} from '../lib/runDetailSheets';
 import { EventStream } from '../lib/sse';
 import { AdminSheetBody } from './runDetail/AdminSheetBody';
+import { EdgeSheetBody } from './runDetail/EdgeSheetBody';
+import { StateEntrySheetBody } from './runDetail/StateEntrySheetBody';
 
 /**
  * Helper: open the run-admin sheet for ``runId``.
@@ -824,6 +830,56 @@ export function RunDetailRoute(): JSX.Element {
           manifest={run.manifest}
           stateTree={stateTree}
           events={events}
+          onNodeClick={(stateId) => {
+            // The graph emits the spec-state-id (FlowGraph node id ==
+            // spec state id). Resolve it to a concrete state ENTRY in
+            // the loaded tree: prefer the most-recently-entered entry
+            // for that state so a loop iteration opens the active
+            // entry rather than the first one. Falls back to the
+            // state id itself when no entry has landed yet so the
+            // sheet can render the "Entry not in tree" EmptyState
+            // instead of swallowing the click.
+            let target: string = stateId;
+            for (const node of nodeIndex.values()) {
+              if (node.state_id !== stateId) continue;
+              const existing = nodeIndex.get(target);
+              if (!existing || existing.state_id !== stateId || node.entry_seq > existing.entry_seq) {
+                target = node.entry_id;
+              }
+            }
+            openStateEntrySheetOpener({
+              entryId: target,
+              runId: runId,
+              title: `State entry · ${stateId}`,
+              content: (
+                <StateEntrySheetBody
+                  entryId={target}
+                  runId={runId}
+                  stateTree={stateTree}
+                  spec={spec}
+                  events={events}
+                />
+              ),
+            });
+          }}
+          onEdgeClick={(fromId, toId) => {
+            openEdgeSheetOpener({
+              runId: runId,
+              fromStateId: fromId,
+              toStateId: toId,
+              title: `Edge · ${fromId} → ${toId}`,
+              content: (
+                <EdgeSheetBody
+                  fromStateId={fromId}
+                  toStateId={toId}
+                  runId={runId}
+                  stateTree={stateTree}
+                  spec={spec}
+                  events={events}
+                />
+              ),
+            });
+          }}
         />
       ) : null}
 
