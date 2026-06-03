@@ -181,3 +181,29 @@ body {
     outline: 2px solid rgb(251 191 36);
   }
 }
+
+/* PR 6: RunEventTimeline freshness flash. SSE-driven prepends arrive at
+   the top of the tape; the row's ``data-fresh="true"`` attribute
+   triggers a brief amber background that fades out over ~2 s so the
+   operator's eye lands on the newly-arrived row without obscuring its
+   content. The CSS transition runs on a property that doesn't trigger
+   layout (background-color) so the flash is GPU-friendly even when
+   dozens of rows are flashing at once during a burst. */
+[data-fresh="true"] {
+  background: rgba(251, 191, 36, 0.18);
+  transition: background 1800ms ease-out 200ms;
+}
+
+.dark [data-fresh="true"] {
+  background: rgba(120, 53, 15, 0.35);
+}
+
+/* Reduced-motion fallback: no background fade — replace with a static
+   amber outline so the freshness affordance is still visible without
+   continuous animation. */
+@media (prefers-reduced-motion: reduce) {
+  [data-fresh="true"] {
+    background: none;
+    outline: 2px solid rgb(251 191 36);
+  }
+}

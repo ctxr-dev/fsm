@@ -8,7 +8,7 @@
  */
 
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 
 import {
   EmptyState,
@@ -20,6 +20,7 @@ import {
   ApiError,
   type CommitSignatureRecord,
 } from '../../../lib/api';
+import { signaturesRefreshNonce } from '../../../lib/runDetailRefresh';
 import { CollapsibleSection } from './CollapsibleSection';
 
 function shortHash(hash: string): string {
@@ -41,11 +42,19 @@ export function SignaturesSection({
 }: SignaturesSectionProps): JSX.Element {
   const [sigs, setSigs] = useState<CommitSignatureRecord[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // PR 6: SSE-driven refresh — refetch when the route bumps the
+  // signatures nonce, keeping the previously-loaded list visible
+  // across refetches so the panel does not flash empty on every tick.
+  const nonce = signaturesRefreshNonce.value;
+  const lastRunIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    setSigs(null);
-    setError(null);
+    if (lastRunIdRef.current !== runId) {
+      setSigs(null);
+      setError(null);
+      lastRunIdRef.current = runId;
+    }
     api
       .listCommitSignatures(runId, { page_size: 200 })
       .then((page) => {
@@ -59,7 +68,7 @@ export function SignaturesSection({
     return () => {
       cancelled = true;
     };
-  }, [runId]);
+  }, [runId, nonce]);
 
   const trailing = sigs ? (
     <Pill variant="neutral" size="sm">

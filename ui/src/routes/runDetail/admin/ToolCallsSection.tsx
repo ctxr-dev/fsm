@@ -13,7 +13,7 @@
  */
 
 import type { JSX } from 'preact';
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 
 import {
   EmptyState,
@@ -24,6 +24,7 @@ import {
   type FilterChip,
 } from '../../../components';
 import { api, ApiError, type ToolCall } from '../../../lib/api';
+import { toolCallsRefreshNonce } from '../../../lib/runDetailRefresh';
 import { CollapsibleSection } from './CollapsibleSection';
 
 function shortHash(hash: string): string {
@@ -48,11 +49,17 @@ export function ToolCallsSection({
   const [calls, setCalls] = useState<ToolCall[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+  // PR 6: refetch on SSE-driven tool-calls nonce bumps.
+  const nonce = toolCallsRefreshNonce.value;
+  const lastRunIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    setCalls(null);
-    setError(null);
+    if (lastRunIdRef.current !== runId) {
+      setCalls(null);
+      setError(null);
+      lastRunIdRef.current = runId;
+    }
     api
       .listToolCalls({ run_id: runId, page_size: 100 })
       .then((page) => {
@@ -66,7 +73,7 @@ export function ToolCallsSection({
     return () => {
       cancelled = true;
     };
-  }, [runId]);
+  }, [runId, nonce]);
 
   const filtered = useMemo(() => {
     if (!calls) return [];
