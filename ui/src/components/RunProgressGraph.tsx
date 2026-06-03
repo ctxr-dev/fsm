@@ -65,6 +65,24 @@ export interface RunProgressGraphProps {
   events: FsmEvent[];
   /** Optional className for layout integration. */
   className?: string;
+  /**
+   * Click handler for a node in the run graph (W22b PR 4). Receives
+   * the spec-state-id (== FlowGraph node id). Wired to
+   * ``openStateEntrySheet`` in the run-detail route so a click opens
+   * the per-state inspector sheet.
+   */
+  onNodeClick?: (nodeId: string) => void;
+  /**
+   * Click handler for an edge in the run graph (W22b PR 4). Receives
+   * the (from, to) spec-state-id pair. Wired to ``openEdgeSheet`` in
+   * the run-detail route so a click opens the edge inspector sheet.
+   *
+   * The pair is direction-sensitive: ``(source, target)`` matches the
+   * orientation of the spec-declared transition, NOT necessarily the
+   * order in which the run traversed it (a loop edge fires this same
+   * handler with its declared direction).
+   */
+  onEdgeClick?: (fromId: string, toId: string) => void;
 }
 
 interface SpecCache {
@@ -81,6 +99,8 @@ export function RunProgressGraph({
   stateTree,
   events,
   className = '',
+  onNodeClick,
+  onEdgeClick,
 }: RunProgressGraphProps): JSX.Element {
   const [spec, setSpec] = useState<SpecCache | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -214,6 +234,30 @@ export function RunProgressGraph({
         <FlowGraph
           nodes={overlaid.nodes}
           edges={overlaid.edges}
+          onNodeClick={
+            onNodeClick
+              ? (id: string) => onNodeClick(id)
+              : undefined
+          }
+          onEdgeClick={
+            onEdgeClick
+              ? (_id: string, data?: Record<string, unknown>) => {
+                  // FlowGraph's onEdgeClick forwards (edge.id, edge.data);
+                  // decorateEdges stamps `sourceId` + `targetId` onto
+                  // edge.data so consumers don't have to re-walk the
+                  // edge list to recover the endpoints. Falling back to
+                  // the id-split is intentionally avoided — edge ids are
+                  // not guaranteed to encode the (from, to) pair (e.g.
+                  // parallel edges between the same nodes get
+                  // disambiguating suffixes).
+                  const fromId = typeof data?.sourceId === 'string' ? data.sourceId : null;
+                  const toId = typeof data?.targetId === 'string' ? data.targetId : null;
+                  if (fromId !== null && toId !== null) {
+                    onEdgeClick(fromId, toId);
+                  }
+                }
+              : undefined
+          }
         />
       </div>
     </Card>

@@ -183,6 +183,12 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
   const currentRing = isCurrent
     ? 'ring-2 ring-amber-400 ring-offset-2 ring-offset-white dark:ring-offset-slate-900'
     : '';
+  // W22b PR 4: the run graph's current node gets a continuous amber
+  // ring pulse on top of the static ring above so the operator's eye
+  // lands on the active state at a glance even on a busy graph. The
+  // `fsm-pulse-current` class is owned by theme.css and respects
+  // prefers-reduced-motion (falls back to a static amber outline).
+  const currentPulse = isCurrent ? 'fsm-pulse-current' : '';
   // W23d 1-hop hover highlight. FlowGraph stamps three transient flags
   // onto node.data while a hover is active:
   //   data.isHovered    — this is the node the cursor is on (or one
@@ -218,6 +224,7 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
         paletteClass,
         selected ? 'ring-2 ring-emerald-400 ring-offset-1' : '',
         currentRing,
+        currentPulse,
         hoverRing,
         dimClass,
       ].join(' ')}
