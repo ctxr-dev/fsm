@@ -20,8 +20,9 @@ This module lets a spec author embed typed references inside the prompt:
 
 The renderer runs inside :class:`jinja2.sandbox.SandboxedEnvironment` so
 arbitrary attribute traversal and Python-eval style escapes are blocked.
-Templates that do NOT contain ``{{`` skip the renderer entirely, so the
-overwhelming majority of existing specs pay zero overhead.
+Templates that do NOT contain either ``{{`` or ``{%`` skip the renderer
+entirely (see :func:`needs_rendering`), so the overwhelming majority of
+existing specs pay zero overhead.
 
 The same renderer powers register-time validation: every Jinja template
 in a spec is parsed (Jinja syntax errors surface immediately) and
@@ -118,7 +119,9 @@ class PromptContext(BaseModel):
     iteration_n: int | None = None
     args: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
-    model_allowlist: tuple[str, ...] = ()
+    # NOTE: sandboxing is configured on PromptRenderer(model_allowlist=...),
+    # not on the per-call context. Keeping a no-op field here would mislead
+    # callers into thinking they can tighten the sandbox at call time.
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +135,14 @@ def _filter_json(value: Any) -> str:
     if value is None:
         return "null"
     if isinstance(value, BaseModel):
-        return value.model_dump_json(indent=2)
+        # model_dump_json does not sort keys; route through model_dump so
+        # the BaseModel branch matches the dict branch byte-for-byte.
+        return json.dumps(
+            value.model_dump(mode="json"),
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
     return json.dumps(value, indent=2, sort_keys=True, default=str)
 
 
@@ -222,8 +232,12 @@ def _filter_fields_table(value: Any) -> str:
     else:
         return "| (no fields available) |\n| --- |"
 
-    if "schema_" in schema and isinstance(schema["schema_"], Mapping):
-        schema = schema["schema_"]
+    # Match _filter_typescript: ResponseSchema serialises to ``schema_``
+    # with by_alias=False and ``schema`` with by_alias=True.
+    for key in ("schema_", "schema"):
+        if key in schema and isinstance(schema[key], Mapping):
+            schema = schema[key]
+            break
 
     props: Mapping[str, Any] = schema.get("properties") or {}
     required: set[str] = set(schema.get("required") or [])
@@ -259,7 +273,12 @@ class PromptRenderer:
     string.
     """
 
-    def __init__(self, *, model_allowlist: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        model_allowlist: tuple[str, ...] = (),
+        allow_model_import: bool = True,
+    ) -> None:
         self._env = SandboxedEnvironment(
             undefined=StrictUndefined,
             autoescape=False,
@@ -269,6 +288,7 @@ class PromptRenderer:
         self._env.filters["typescript"] = _filter_typescript
         self._env.filters["fields_table"] = _filter_fields_table
         self._model_allowlist = tuple(model_allowlist)
+        self._allow_model_import = allow_model_import
 
     # ------------------------------------------------------------------
     # Context construction
@@ -276,7 +296,15 @@ class PromptRenderer:
 
     def _resolve_model(self, path: str) -> Any:
         if not isinstance(path, str) or not path:
-            raise PromptRenderError("spec.model(path=…) requires a non-empty string")
+            raise PromptRenderError("spec.model(path=...) requires a non-empty string")
+        if not self._allow_model_import:
+            # Register-time validation paths construct renderers with
+            # allow_model_import=False so an untrusted spec cannot trigger
+            # importlib.import_module() during fsm.register_spec.
+            raise PromptRenderError(
+                "spec.model(path=...) is disabled in this renderer "
+                "(register-time validation does not import user modules)"
+            )
         module_path, _, attr = path.rpartition(".")
         if not module_path or not attr:
             raise PromptRenderError(
@@ -297,12 +325,22 @@ class PromptRenderer:
                 f"spec.model could not import '{module_path}': {exc}"
             ) from exc
         try:
-            return getattr(module, attr)
+            obj = getattr(module, attr)
         except AttributeError as exc:
             raise PromptRenderError(
                 f"spec.model('{path}') resolved module '{module_path}' but it has no "
                 f"attribute '{attr}'"
             ) from exc
+        # Without this guard spec.model() is a general-purpose import
+        # primitive (e.g. ``spec.model(path='os.environ')`` leaks process
+        # env). Constrain the surface to Pydantic model classes, which is
+        # the only shape the registered filters know how to render.
+        if not (isinstance(obj, type) and issubclass(obj, BaseModel)):
+            raise PromptRenderError(
+                f"spec.model('{path}') resolved to {type(obj).__name__!s}, "
+                "but only pydantic BaseModel subclasses are allowed"
+            )
+        return obj
 
     def _build_jinja_context(self, context: PromptContext) -> dict[str, Any]:
         spec_ns = {
@@ -360,17 +398,25 @@ class PromptRenderer:
             ) from exc
 
     def validate(self, template: str, *, state_id: str | None = None) -> None:
-        """Smoke-render ``template`` with an empty context.
+        """Smoke-render ``template`` with a dummy context.
 
-        Surfaces Jinja syntax errors + obvious model-resolution failures
-        at register time. Templates that legitimately reference run-time
-        values pass (the StrictUndefined check is per-access and an
-        empty context still satisfies tokens like ``allowed_tools``,
-        which default to an empty list).
+        Surfaces Jinja syntax errors and unknown-token references at
+        register time. The smoke context fills every optional scalar
+        with a non-empty placeholder so templates that legitimately
+        call string methods at runtime (``{{ spec.slug.upper() }}``,
+        ``{{ state.id | length }}``) are not rejected against a ``None``
+        value the validator constructed.
         """
 
+        smoke_context = PromptContext(
+            spec_slug=state_id or "smoke",
+            spec_version=0,
+            state_id=state_id or "smoke",
+            state_kind="worker",
+            iteration_n=0,
+        )
         try:
-            self.render(template, PromptContext())
+            self.render(template, smoke_context)
         except PromptRenderError as exc:
             # Re-raise with the state id attached so the spec-level
             # validator can roll multiple state failures into one

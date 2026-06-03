@@ -591,6 +591,20 @@ class GateBinding(BaseModel):
             raise ValueError("GateBinding field must be a non-empty string")
         return value
 
+    @field_validator("source_run_id", "source_spec_slug")
+    @classmethod
+    def _optional_non_empty(cls, value: str | None) -> str | None:
+        # Optional identifiers: ``None`` keeps the "unset" semantics, but
+        # an explicit empty/whitespace-only string is ambiguous and would
+        # silently bypass the spec-slug safety check or produce a binding
+        # against a phantom run id. Reject at the boundary.
+        if value is not None and not value.strip():
+            raise ValueError(
+                "GateBinding optional field, when provided, must be a "
+                "non-empty string"
+            )
+        return value
+
 
 class Gate(BaseModel):
     """A cross-FSM gate body for a :class:`State`.
@@ -813,12 +827,15 @@ class State(BaseModel):
 
         The kind is derived from which body fields are set, not stored:
 
-        * :attr:`StateKind.loop`     — :attr:`loop` is non-None.
-        * :attr:`StateKind.inline`   — :attr:`inline` is non-None
+        * :attr:`StateKind.loop`     - :attr:`loop` is non-None.
+        * :attr:`StateKind.inline`   - :attr:`inline` is non-None
           (and :attr:`loop` is None).
-        * :attr:`StateKind.worker`   — :attr:`worker` is non-None
-          (and :attr:`loop` / :attr:`inline` are None).
-        * :attr:`StateKind.terminal` — all three body fields are None
+        * :attr:`StateKind.gate`     - :attr:`gate` is non-None
+          (and :attr:`loop` / :attr:`inline` are None). Exclusive with
+          worker / loop / inline; enforced by the model_validator.
+        * :attr:`StateKind.worker`   - :attr:`worker` is non-None
+          (and :attr:`loop` / :attr:`inline` / :attr:`gate` are None).
+        * :attr:`StateKind.terminal` - all four body fields are None
           AND :attr:`transitions` is empty.
 
         A state with no body fields but a non-empty :attr:`transitions`

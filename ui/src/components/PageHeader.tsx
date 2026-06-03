@@ -60,7 +60,19 @@ export function PageHeader({
     ? (projectNameFromRoot(metadata.project_root) ?? metadata.project_slug)
     : null;
 
-  const showEyebrow = projectAware && (projectName !== null || loading);
+  // The eyebrow renders in three modes:
+  //   1. loading — italic "loading…" placeholder.
+  //   2. metadata present + name resolved — bold project name.
+  //   3. metadata present but name is null (older API / in-memory
+  //      backend with null project_root + null project_slug, or a
+  //      drive-root-only path on Windows) — explicit "no project bound"
+  //      affordance so the operator sees that the dashboard is running
+  //      without a bound project rather than the header silently
+  //      dropping the eyebrow.
+  const metadataPresentButNoName =
+    projectAware && metadata !== null && projectName === null;
+  const showEyebrow =
+    projectAware && (projectName !== null || loading || metadataPresentButNoName);
 
   return (
     <header class={`space-y-1.5 ${className}`}>
@@ -69,7 +81,13 @@ export function PageHeader({
           <span>
             Project:{' '}
             <span class="font-semibold normal-case tracking-normal text-slate-700 dark:text-slate-200">
-              {projectName ?? <span class="italic text-slate-400 dark:text-slate-500">loading…</span>}
+              {projectName !== null ? (
+                projectName
+              ) : loading ? (
+                <span class="italic text-slate-400 dark:text-slate-500">loading…</span>
+              ) : (
+                <span class="italic text-slate-400 dark:text-slate-500">no project bound</span>
+              )}
             </span>
           </span>
           {rightSlot ? <div class="flex items-center gap-2">{rightSlot}</div> : null}

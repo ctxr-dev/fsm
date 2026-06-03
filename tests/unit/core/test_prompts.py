@@ -9,7 +9,6 @@ allowlist enforcement, and the smoke-render `validate` entry point.
 from __future__ import annotations
 
 import pytest
-from pydantic import BaseModel
 
 from ctxr.fsm.core.prompts import (
     PromptContext,
@@ -109,15 +108,12 @@ def test_typescript_filter_unwraps_response_schema_wrapper() -> None:
         assert "ok: boolean;" in out
 
 
-def test_fields_table_filter_renders_pydantic_model_class() -> None:
-    class Verdict(BaseModel):
-        verdict: str
-        notes: str | None = None
-
+def test_spec_model_rejects_colon_delimited_path() -> None:
+    # spec.model expects a fully dotted path. A colon (entry-point style)
+    # is rejected because rpartition('.') leaves ``attr`` containing the
+    # ':Verdict' suffix, which the renderer flags before any import.
     renderer = PromptRenderer()
     template = "{{ spec.model(path='tests.unit.core.test_prompts:Verdict') | fields_table }}"
-    # spec.model expects a dotted path; we deliberately use ':' here to
-    # show it must be dotted.
     with pytest.raises(PromptRenderError):
         renderer.render(template, PromptContext())
 

@@ -8,6 +8,7 @@ other state body kinds.
 
 from __future__ import annotations
 
+import pydantic
 import pytest
 
 from ctxr.fsm.core.models import (
@@ -69,8 +70,29 @@ def test_gate_binding_is_frozen() -> None:
     b = GateBinding(
         source_state_id="qa", source_field="verdict", target_field="v"
     )
-    with pytest.raises(Exception):  # noqa: B017 - Pydantic frozen-instance
+    with pytest.raises(pydantic.ValidationError):
         b.source_run_id = "run-uuidv7"  # type: ignore[misc]
+
+
+def test_gate_binding_rejects_whitespace_optional_fields() -> None:
+    # source_run_id and source_spec_slug are optional, but when explicitly
+    # provided they must not be empty/whitespace-only - otherwise the
+    # binding silently bypasses the spec-slug safety check or points at a
+    # phantom run id.
+    with pytest.raises(pydantic.ValidationError, match="non-empty"):
+        GateBinding(
+            source_run_id="   ",
+            source_state_id="qa",
+            source_field="verdict",
+            target_field="v",
+        )
+    with pytest.raises(pydantic.ValidationError, match="non-empty"):
+        GateBinding(
+            source_spec_slug="",
+            source_state_id="qa",
+            source_field="verdict",
+            target_field="v",
+        )
 
 
 # ---------------------------------------------------------------------------

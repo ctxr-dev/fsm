@@ -25,6 +25,13 @@ export function projectNameFromRoot(root: string | null | undefined): string | n
   // ``/Users/x/proj/`` resolve identically.
   const normalised = root.replace(/\\/g, '/').replace(/\/+$/u, '');
   if (normalised === '' || normalised === '/') return null;
+  // Windows drive-root inputs (``C:\``, ``D:\\``) collapse to ``C:`` /
+  // ``D:`` after the slash-strip above. Treat those as root-only and
+  // return null, matching the documented contract — the operator is
+  // not bound to a real project, the dashboard should render the "no
+  // project bound" affordance rather than label the eyebrow with the
+  // drive letter.
+  if (/^[A-Za-z]:$/u.test(normalised)) return null;
   const segments = normalised.split('/').filter(Boolean);
   return segments.length === 0 ? null : segments[segments.length - 1];
 }
