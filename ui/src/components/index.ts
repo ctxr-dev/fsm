@@ -66,6 +66,9 @@ export type { PaginationPage, PaginationProps } from './Pagination';
 export { RunProgressGraph } from './RunProgressGraph';
 export type { RunProgressGraphProps } from './RunProgressGraph';
 
+export { RunEventTimeline } from './RunEventTimeline';
+export type { RunEventTimelineProps } from './RunEventTimeline';
+
 export { RunsSummaryStats } from './RunsSummaryStats';
 export type { RunsSummaryStatsProps } from './RunsSummaryStats';
 

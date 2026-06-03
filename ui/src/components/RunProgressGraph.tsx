@@ -63,8 +63,19 @@ export interface RunProgressGraphProps {
   /** The recent event slice (used by the overlay builder as a future
    *  refinement source for accurate transition tracking). */
   events: FsmEvent[];
-  /** Optional className for layout integration. */
+  /** Optional className for layout integration. Apply ``h-full min-h-0``
+   *  alongside ``fill`` so the graph stretches into its grid / flex
+   *  parent rather than the legacy fixed 420px frame. */
   className?: string;
+  /**
+   * Fill the parent's height instead of using the legacy fixed
+   * 420-pixel frame. The PR 7 50/50 grid sets this so the graph and
+   * timeline columns share the available viewport height; the legacy
+   * "above the three-pane grid" usage left ``fill`` at the default
+   * ``false`` so its visual didn't shift mid-cascade. With the cascade
+   * complete this prop becomes the only call shape.
+   */
+  fill?: boolean;
   /**
    * Click handler for a node in the run graph (W22b PR 4). Receives
    * the spec-state-id (== FlowGraph node id). Wired to
@@ -106,6 +117,7 @@ export function RunProgressGraph({
   stateTree,
   events,
   className = '',
+  fill = false,
   onNodeClick,
   onEdgeClick,
   onIterationClick,
@@ -174,16 +186,29 @@ export function RunProgressGraph({
     [overlay, baseGraph],
   );
 
+  // PR 7: when ``fill`` is on, the Card must turn into a column flex
+  // container so the FlowGraph wrapper can claim the leftover height
+  // via flex-1. Without the inner flex-col on the Card, the FlowGraph
+  // div's ``h-full`` would resolve against the Card's intrinsic height
+  // (zero — the Card has no explicit height of its own) and the graph
+  // would collapse to a 320px min-height strip. ``min-h-0`` on the
+  // outer Card is what allows the grid parent's row to shrink the
+  // Card if the viewport is short, instead of growing the page.
+  const cardFillClass = fill ? 'flex flex-col h-full min-h-0' : '';
+  const composedCardClass = [className, cardFillClass]
+    .filter(Boolean)
+    .join(' ');
+
   if (error) {
     return (
-      <Card className={className} title="Progress graph">
+      <Card className={composedCardClass} title="Progress graph">
         <EmptyState title="Spec unavailable" message={error} />
       </Card>
     );
   }
   if (!spec || !baseGraph || !overlaid) {
     return (
-      <Card className={className} title="Progress graph">
+      <Card className={composedCardClass} title="Progress graph">
         <div class="flex items-center justify-center py-12">
           <Spinner label="Loading spec topology" />
         </div>
@@ -192,7 +217,7 @@ export function RunProgressGraph({
   }
   if (baseGraph.nodes.length === 0) {
     return (
-      <Card className={className} title="Progress graph">
+      <Card className={composedCardClass} title="Progress graph">
         <EmptyState
           title="No states in this spec"
           message="The registered spec declares no states; nothing to render."
@@ -202,7 +227,7 @@ export function RunProgressGraph({
   }
 
   return (
-    <Card className={className} title="Progress graph">
+    <Card className={composedCardClass} title="Progress graph">
       <header class="flex flex-wrap items-center gap-3 px-3 pt-2 pb-3 text-xs">
         <span class="text-slate-700 dark:text-slate-300">
           <strong class="font-semibold">{progress.visited}</strong>
@@ -238,7 +263,14 @@ export function RunProgressGraph({
           </span>
         ) : null}
       </header>
-      <div class="px-1 pb-1" style={{ height: '420px' }}>
+      <div
+        class={
+          fill
+            ? 'px-1 pb-1 flex-1 min-h-0'
+            : 'px-1 pb-1'
+        }
+        style={fill ? undefined : { height: '420px' }}
+      >
         <FlowGraph
           nodes={overlaid.nodes}
           edges={overlaid.edges}
