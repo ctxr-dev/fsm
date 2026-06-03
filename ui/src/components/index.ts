@@ -74,3 +74,9 @@ export type { PageHeaderProps } from './PageHeader';
 
 export { MultiSelectCombobox } from './MultiSelectCombobox';
 export type { MultiSelectComboboxProps } from './MultiSelectCombobox';
+
+export { StateInspectorBody } from './StateInspectorBody';
+export type { StateInspectorBodyProps } from './StateInspectorBody';
+
+export { DriftGauge } from './DriftGauge';
+export type { DriftGaugeProps } from './DriftGauge';
