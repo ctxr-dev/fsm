@@ -16,7 +16,7 @@
  * recomputing the static layer.
  */
 
-import { MarkerType, type Edge, type Node } from '@xyflow/react';
+import type { Edge, Node } from '@xyflow/react';
 
 import type { FlowNodeData } from '../components/FlowGraph';
 import type { Event as FsmEvent, RunManifest, StateNode } from './api';
@@ -52,9 +52,18 @@ export interface RunOverlay {
   faultedStateId: string | null;
 }
 
-/** Flatten the state tree into a chronological list (DFS pre-order
- *  matches engine entry order because the tree is built by appending
- *  children at the bottom). */
+/** Flatten the state tree into a CHRONOLOGICAL list.
+ *
+ *  StateNode already carries ``entry_seq`` (the engine's monotonic
+ *  per-run counter, the same field the rest of the UI uses to order
+ *  events). We walk the tree to collect every node then sort by
+ *  ``entry_seq`` ascending — this is correct for branching trees
+ *  (where a single state entry can have multiple children written in
+ *  whatever order the engine produced them) and idempotent regardless
+ *  of how the parent traversed children. DFS pre-order, which the
+ *  pre-fix draft used, only matched entry order when the tree was a
+ *  linear chain.
+ */
 function flattenEntries(root: StateNode | null): StateNode[] {
   if (!root) return [];
   const out: StateNode[] = [];
@@ -63,7 +72,27 @@ function flattenEntries(root: StateNode | null): StateNode[] {
     for (const child of node.children) walk(child);
   };
   walk(root);
+  out.sort((a, b) => a.entry_seq - b.entry_seq);
   return out;
+}
+
+/** Walk the tree and emit every parent -> child pair as a transition.
+ *
+ *  The state tree's parent/child relation IS the transition graph
+ *  the engine took: an entry's children are precisely the states it
+ *  transitioned into. This is more accurate than the
+ *  adjacency-on-the-flattened-list approach, which conflated
+ *  branches at a fork point (two children of the same parent) with
+ *  an actual sibling-to-sibling transition that never happened.
+ */
+function emitTreeTransitions(root: StateNode | null, out: Set<string>): void {
+  if (!root) return;
+  for (const child of root.children) {
+    if (root.state_id !== child.state_id) {
+      out.add(`${root.state_id}::${child.state_id}`);
+    }
+    emitTreeTransitions(child, out);
+  }
 }
 
 /** Promote ``a`` over ``b`` per the status hierarchy. */
@@ -92,38 +121,43 @@ export function buildRunOverlay(
   for (const entry of entries) {
     const stateId = entry.state_id;
     const prev = statusByStateId.get(stateId) ?? 'not_visited';
-    // StateNode.status is one of "entered" / "exited" / "faulted"
-    // (StateStatus enum). Fall back to "entered" on unknown values so
-    // the visualisation still renders something.
+    // Derive entered/exited from ``exited_at`` (the timestamp is the
+    // engine's source of truth: null = still active; non-null = the
+    // engine has moved on). Only the ``faulted`` status string is
+    // treated as a special case because the engine flags it
+    // explicitly and a faulted entry typically also carries a
+    // non-null exited_at. The earlier "fall back to entered on
+    // unknown values" shortcut misclassified any unrecognised /
+    // future status string as still-active (Copilot review on
+    // PR #62).
     const status: RunNodeStatus =
-      entry.status === 'exited'
-        ? 'exited'
-        : entry.status === 'faulted'
+      entry.status === 'faulted'
         ? 'faulted'
-        : 'entered';
+        : entry.exited_at === null
+        ? 'entered'
+        : 'exited';
     if (status === 'faulted' && faultedStateId === null) {
       faultedStateId = stateId;
     }
     statusByStateId.set(stateId, strongerStatus(prev, status));
   }
 
-  // Compute taken transitions by walking the chronological entry list
-  // and recording each parent -> child pair. The engine inserts a new
-  // entry whenever a state is entered, so adjacent entries in DFS
-  // pre-order correspond to actually-taken transitions in the run's
-  // history.
+  // Compute taken transitions from the state tree's parent/child
+  // relation — every (parent.state_id, child.state_id) edge in the
+  // tree is by definition a transition the engine took. The pre-fix
+  // adjacency-on-the-flattened-list approach was wrong for branching
+  // trees: two children of the same parent are not adjacent
+  // transitions of each other, they're two outbound transitions from
+  // the same fork point.
   const takenTransitions = new Set<string>();
-  for (let i = 0; i < entries.length - 1; i++) {
-    const from = entries[i].state_id;
-    const to = entries[i + 1].state_id;
-    if (from !== to) takenTransitions.add(`${from}::${to}`);
-  }
+  emitTreeTransitions(stateTree, takenTransitions);
   // ``events`` is reserved for a future refinement where the
   // ``transition_taken`` event would carry an explicit
-  // ``from``/``to`` pair (more accurate than DFS adjacency for loops
-  // that revisit a state). Today the engine doesn't surface those
-  // fields on the event, so we use the state-tree adjacency. Leaving
-  // the parameter here keeps the call site stable when that lands.
+  // ``from``/``to`` pair (the most accurate signal for loops that
+  // revisit a state via a non-tree edge). Today the engine doesn't
+  // surface those fields on the event, so we use the tree-derived
+  // adjacency. Leaving the parameter in the signature keeps the call
+  // site stable when that wire-format upgrade lands.
   void events;
 
   return {
@@ -133,6 +167,15 @@ export function buildRunOverlay(
     faultedStateId,
   };
 }
+
+/**
+ * Per-status edge stroke colours. Node colours are owned by FsmNode
+ * (which switches Tailwind classes off ``data.runStatus`` /
+ * ``data.isCurrent``); this single source for the taken/untaken edge
+ * stroke means we don't have to duplicate the Tailwind class map.
+ */
+const TAKEN_EDGE_STROKE = '#10b981';
+const UNTAKEN_EDGE_STROKE = '#cbd5e1';
 
 /**
  * Apply the overlay to the base spec graph and return a new
@@ -157,58 +200,57 @@ export function overlayRunOnSpecGraph(
         : baseStatus;
     const isCurrent = overlay.currentStateId === stateId;
 
-    // W23b regression fix: status is conveyed ONLY through fields on
-    // ``data`` so the inner FsmNode component owns the colour-mapping
-    // via its STATUS_CLASSES palette + currentRing. Setting an outer
-    // wrapper ``style`` here would double-render (kind palette on the
-    // card, status palette on the wrapper) and produce the nested-box
-    // effect the user flagged. The inner card now shows the status
-    // colour directly, the ring marks the current node, and the
-    // labelPrefix prepends the textual badge.
+    // Compose the per-status badge prefix INTO ``data.label`` rather
+    // than into a parallel ``labelPrefix`` field. FlowGraph renders
+    // ``data.label`` verbatim and has no labelPrefix concept, so the
+    // pre-fix draft's prefix never reached the DOM. The badge needs
+    // to land in the actual label string for the colour-coded view
+    // to also read correctly under reduced-motion / desaturated
+    // dark-mode tweaks where the background tint may be subtle.
+    const badge =
+      status === 'faulted'
+        ? '⚠ '
+        : status === 'entered'
+        ? '▸ '
+        : status === 'exited'
+        ? '✓ '
+        : '';
+    // Preserve the original spec label unmodified so re-applying the
+    // overlay multiple times doesn't stack prefixes (idempotent).
+    const originalLabel =
+      typeof node.data.label === 'string' ? node.data.label : '';
+    const decoratedLabel = badge ? `${badge}${originalLabel}` : originalLabel;
+    // Status is conveyed via ``data.runStatus`` / ``data.isCurrent``
+    // — FsmNode (in FlowGraph.tsx) switches its Tailwind palette off
+    // them. We deliberately do NOT set ``node.style`` here: FsmNode
+    // renders its own padded/rounded card inside the React Flow node
+    // wrapper and ignores wrapper-level inline styles, so the earlier
+    // border/background/boxShadow on node.style produced no visible
+    // overlay (Copilot review on PR #62).
     return {
       ...node,
       data: {
         ...node.data,
-        labelPrefix:
-          status === 'faulted'
-            ? 'fault: '
-            : status === 'entered'
-            ? '> '
-            : status === 'exited'
-            ? 'ok: '
-            : '',
+        label: decoratedLabel,
         runStatus: status,
         isCurrent,
       } as FlowNodeData & {
-        labelPrefix?: string;
         runStatus?: RunNodeStatus;
         isCurrent?: boolean;
       },
     };
   });
 
-  // W23b regression fix: edges set both stroke AND markerEnd colour so
-  // taken-edge arrowheads match their stroke (no more green line with
-  // grey arrow). Plain ``Edge.markerEnd`` is a {type, color, width,
-  // height} object which FlowGraph.decorateEdges then preserves via
-  // ``e.markerEnd ?? {...}``.
   const edges = base.edges.map((edge) => {
     const taken = overlay.takenTransitions.has(`${edge.source}::${edge.target}`);
-    const stroke = taken ? '#10b981' : '#94a3b8';
     return {
       ...edge,
       animated: taken && overlay.currentStateId === edge.source,
       style: {
         ...(edge.style ?? {}),
-        stroke,
+        stroke: taken ? TAKEN_EDGE_STROKE : UNTAKEN_EDGE_STROKE,
         strokeWidth: taken ? 2.2 : 1.4,
         opacity: taken ? 1 : 0.55,
-      },
-      markerEnd: {
-        type: MarkerType.ArrowClosed,
-        color: stroke,
-        width: 18,
-        height: 18,
       },
       labelStyle: {
         ...((edge.labelStyle as object) ?? {}),

@@ -49,6 +49,7 @@ from ctxr.fsm.core.models import (
     FsmSpec,
     Gate,
     GateBinding,
+    GateSourceKind,
     InlineExecutionResult,
     InlineFaultReason,
     Loop,
@@ -1036,6 +1037,9 @@ class GateResolutionError(ValueError):
       binding was supplied.
     * ``gate_value_and_binding_conflict`` — both were supplied; the
       contract requires exactly one.
+    * ``gate_source_kind_mismatch`` — the supplied resolution shape
+      did not match the gate's ``source_kind`` (``binding`` on an
+      ``llm_supplied`` gate, or ``value`` on a ``run_output`` gate).
 
     The MCP tool layer (:func:`ctxr.fsm.mcp.tools_runs.fsm_resolve_gate`)
     catches this and maps the ``code`` straight onto the wire envelope
@@ -1054,11 +1058,13 @@ class GateResolution(BaseModel):
     """The outcome of :func:`resolve_gate`.
 
     * :attr:`env_update` — the dict of ``{target_field: resolved_value}``
-      entries the caller should merge into the run's env. For
-      ``llm_supplied`` gates this is a single entry keyed off the gate
-      state's first declared output; for ``run_output`` gates it is one
-      entry per supplied binding (each carrying its own
-      ``target_field``).
+      entries the caller should merge into the run's env. The current
+      :func:`resolve_gate` API accepts a single optional
+      :class:`GateBinding` and a single optional ``value``, so
+      ``env_update`` always carries exactly one entry: for
+      ``llm_supplied`` gates it is keyed off the gate state's first
+      declared output; for ``run_output`` gates it is keyed off the
+      supplied binding's ``target_field``.
     * :attr:`transitions` — the list of :class:`Transition` declared on
       the gate state, surfaced for the caller so the persistence layer
       can drive the outgoing transition without re-walking the spec.
@@ -1161,6 +1167,10 @@ def resolve_gate(
         * ``gate_value_and_binding_conflict`` — both ``value`` and
           ``binding`` were supplied; the contract requires exactly
           one.
+        * ``gate_source_kind_mismatch`` — the supplied resolution
+          shape does not match the gate's ``source_kind`` (a
+          ``run_output`` gate was handed a literal ``value``, or an
+          ``llm_supplied`` gate was handed a ``binding``).
         * ``gate_schema_mismatch`` — the resolved value did not pass
           the gate's response schema.
     """
@@ -1180,6 +1190,30 @@ def resolve_gate(
         raise GateResolutionError(
             "gate_value_and_binding_conflict",
             "fsm.resolve_gate requires exactly one of `value` or `binding`, not both",
+        )
+
+    # source_kind enforcement: the gate's declared source_kind dictates
+    # which resolution shape is legal. A run_output gate resolved via a
+    # literal `value` would bypass the binding-lookup + max_age_ms
+    # staleness semantics; an llm_supplied gate resolved via a
+    # `binding` would persist an unintended cross-run dependency (and
+    # advertise it in the gate_bindings topology index). Reject both
+    # before we touch the schema validator or persistence layer.
+    if binding is not None and gate.source_kind is not GateSourceKind.run_output:
+        raise GateResolutionError(
+            "gate_source_kind_mismatch",
+            (
+                f"gate {state.id!r} has source_kind={gate.source_kind.value!r}; "
+                "a `binding` is only valid for source_kind='run_output'"
+            ),
+        )
+    if value is not None and gate.source_kind is not GateSourceKind.llm_supplied:
+        raise GateResolutionError(
+            "gate_source_kind_mismatch",
+            (
+                f"gate {state.id!r} has source_kind={gate.source_kind.value!r}; "
+                "a literal `value` is only valid for source_kind='llm_supplied'"
+            ),
         )
 
     env_update: dict[str, Any] = {}

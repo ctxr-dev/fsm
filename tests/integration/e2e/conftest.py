@@ -95,14 +95,15 @@ def _run_ensure(project_root: Path, timeout_s: float = 60.0) -> dict:
 def _read_supervisor_logs(project_root: Path, *, tail_bytes: int = 32_768) -> str:
     """Return the tail of the supervisor log dir, joined for diagnostics.
 
-    The supervisor's own stdout/stderr (and the UI child's inherited
-    stdio — Vite's banner, dep-optimise progress, any startup error
-    trace) is captured by ``ensure_cmd._spawn_supervisor`` into a
-    date-sharded log under ``<project_root>/.ctxr-fsm/logs/``. On CI
-    we can only see what we print, so when a wait-for-url times out
-    we dump the tail of every file there so the next failure surfaces
-    the real Vite/uvicorn error rather than a bare
-    ``ConnectionRefused``.
+    The supervisor forwards each child's stdout/stderr (the UI
+    child's inherited stdio — Vite's banner, dep-optimise progress,
+    any startup error trace) into a date-sharded log under
+    ``<project_root>/.ctxr-fsm/logs/``. On CI we can only see what we
+    print, so when a wait-for-url times out we dump the tail of every
+    file there so the failure is diagnosable instead of opaque (the
+    symptom was ``ConnectionRefusedError`` without any hint about
+    whether npm crashed, Vite was still pre-bundling, or the port was
+    simply taken).
     """
     logs_dir = project_root / ".ctxr-fsm" / "logs"
     if not logs_dir.is_dir():
@@ -137,11 +138,13 @@ def _wait_for_url(
     Vite's dev server and uvicorn typically need 1-3s after the
     supervisor reports them as "spawned" before they actually accept
     sockets. The Vite ready signal in particular is asynchronous to
-    the child-process PID being live. We poll on a 100ms cadence.
+    the child-process PID being live, and on a GH-hosted runner cold
+    start (first esbuild prebundle + uvicorn import-graph priming)
+    the wait can routinely exceed 20s. We poll on a 100ms cadence.
 
     On timeout, if ``project_root`` is provided, dump the tail of the
-    supervisor log files so CI failures surface the real cause rather
-    than an opaque ``ConnectionRefusedError``.
+    supervisor log files so a CI failure is diagnosable instead of
+    surfacing only ``ConnectionRefusedError``.
     """
     deadline = time.monotonic() + timeout_s
     last_error: Exception | None = None

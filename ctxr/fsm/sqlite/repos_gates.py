@@ -54,10 +54,14 @@ def _canonical_json(obj: Any) -> str:
 
     Same shape every other ctxr.fsm.sqlite repo uses for JSON-shaped
     columns so byte-level equality across rows is stable and signature
-    comparisons are deterministic.
+    comparisons are deterministic. We deliberately do NOT pass
+    ``default=str``: non-JSON-serializable values must raise
+    :class:`TypeError` at the boundary so callers cannot silently smuggle
+    in objects that stringify non-deterministically and break dedup /
+    signature assumptions downstream.
     """
 
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
 
 class GateBindingRecord(BaseModel):

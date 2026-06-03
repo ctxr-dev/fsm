@@ -77,6 +77,8 @@ from ctxr.fsm.core.models import (
     TransitionEvaluation,
     TransitionKind,
     VerifierVerdict,
+    _sha256_hex,
+    _to_canonical_json,
 )
 from ctxr.fsm.core.verifier import VerifierOutcome, run_verifier
 from ctxr.fsm.mcp import mcp
@@ -2768,14 +2770,21 @@ def _read_run_output_value(
     source_run_id: str,
     source_state_id: str,
     source_field: str,
+    max_age_ms: int | None = None,
 ) -> tuple[Any, McpToolError | None]:
     """Read ``source_field`` from ``source_state_id``'s outputs on ``source_run_id``.
 
     Returns ``(value, None)`` on success or ``(None, error_envelope)``
     on every failure documented in GATE_CONTRACT.md
-    (``gate_source_run_not_found``, ``gate_source_state_not_completed``).
-    Picks the most-recent matching state entry (latest ``entry_seq``)
-    so a re-entered state's prior visit doesn't silently win.
+    (``gate_source_run_not_found``, ``gate_source_state_not_completed``,
+    ``gate_source_stale``). Picks the most-recent matching state entry
+    (latest ``entry_seq``) so a re-entered state's prior visit doesn't
+    silently win.
+
+    When ``max_age_ms`` is supplied (the gate's :attr:`Gate.max_age_ms`
+    window), the source's ``exited_at`` timestamp is compared against
+    "now" and a stale source returns ``gate_source_stale`` so an old
+    upstream verdict cannot silently land in a fresh downstream run.
     """
     source_run = project.get_run(source_run_id)
     if source_run is None:
@@ -2804,6 +2813,40 @@ def _read_run_output_value(
     # Pick the most-recent (highest entry_seq) exit so a re-entered
     # state's earlier visit cannot shadow the latest committed value.
     latest = max(matching, key=lambda e: e.entry_seq)
+
+    # Stale-source enforcement (GATE_CONTRACT.md: a run_output gate
+    # with a ``max_age_ms`` window must reject sources whose
+    # ``exited_at`` is older than the window with ``gate_source_stale``).
+    if max_age_ms is not None and latest.exited_at:
+        exited_at_raw = latest.exited_at
+        try:
+            # ``_iso_now_ms`` writes ``...Z``; Python's fromisoformat
+            # accepts ``+00:00`` only, so normalise the suffix.
+            normalised = (
+                exited_at_raw[:-1] + "+00:00"
+                if exited_at_raw.endswith("Z")
+                else exited_at_raw
+            )
+            exited_at = datetime.fromisoformat(normalised)
+        except ValueError:
+            exited_at = None
+        if exited_at is not None:
+            now = datetime.now(exited_at.tzinfo)
+            age_ms = int((now - exited_at).total_seconds() * 1000)
+            if age_ms > max_age_ms:
+                return None, as_error(
+                    "gate_source_stale",
+                    detail=(
+                        f"source state {source_state_id!r} on run "
+                        f"{source_run_id!r} exited {age_ms}ms ago, "
+                        f"exceeding the gate's max_age_ms={max_age_ms}"
+                    ),
+                    run_id=source_run_id,
+                    state_id=source_state_id,
+                    age_ms=age_ms,
+                    max_age_ms=max_age_ms,
+                )
+
     outputs = dict(latest.outputs or {})
     return outputs.get(source_field), None
 
@@ -2868,7 +2911,8 @@ def fsm_resolve_gate(input: ResolveGateInput) -> ResolveGateResult | McpToolErro
     4. Delegate to :func:`ctxr.fsm.core.engine.resolve_gate` for
        validation + env-update derivation. Typed errors
        (``gate_schema_mismatch`` / ``gate_value_or_binding_required`` /
-       ``gate_value_and_binding_conflict``) are caught and mapped onto
+       ``gate_value_and_binding_conflict`` /
+       ``gate_source_kind_mismatch``) are caught and mapped onto
        the wire envelope verbatim.
     5. Mark the gate state exited (its outputs are the env_update),
        emit ``gate_resolved`` (+ ``gate_binding_recorded`` for the
@@ -2937,8 +2981,15 @@ def fsm_resolve_gate(input: ResolveGateInput) -> ResolveGateResult | McpToolErro
             try:
                 binding_obj = GateBinding.model_validate(input.binding)
             except Exception as exc:
+                # GATE_CONTRACT.md reserves ``gate_value_or_binding_required``
+                # for the case where neither ``value`` nor ``binding`` was
+                # supplied. A binding that IS supplied but cannot be parsed
+                # into a :class:`GateBinding` is a distinct failure mode and
+                # gets its own envelope so clients can distinguish "you
+                # forgot to send a binding" from "your binding payload was
+                # malformed".
                 return as_error(
-                    "gate_value_or_binding_required",
+                    "gate_binding_invalid",
                     detail=f"malformed binding payload: {exc}",
                 )
             # run_output source: spec must agree; fetch the value.
@@ -2978,6 +3029,7 @@ def fsm_resolve_gate(input: ResolveGateInput) -> ResolveGateResult | McpToolErro
                     source_run_id=binding_obj.source_run_id,
                     source_state_id=binding_obj.source_state_id,
                     source_field=binding_obj.source_field,
+                    max_age_ms=state.gate.max_age_ms,
                 )
                 binding_value, err = value_or_err
                 if err is not None:
@@ -3000,6 +3052,31 @@ def fsm_resolve_gate(input: ResolveGateInput) -> ResolveGateResult | McpToolErro
             payload: dict[str, Any] = {}
             if exc.errors:
                 payload["errors"] = exc.errors
+            # GATE_CONTRACT.md: every resolver failure surfaces a
+            # ``gate_resolution_failed`` event alongside the wire error
+            # envelope so subscribers (dashboard, observability) see the
+            # same failure stream regardless of which branch tripped.
+            try:
+                with project.session_factory() as session, session.begin():
+                    project.events.emit(
+                        session,
+                        producer_id=producer_id,
+                        kind=EventKind.gate_resolution_failed.value,
+                        payload={
+                            "run_id": run.id,
+                            "state_entry_seq": input.state_entry_seq,
+                            "error": exc.code,
+                            "detail": exc.detail,
+                            "errors": exc.errors,
+                        },
+                        run_id=run.id,
+                    )
+            except Exception:
+                # Best-effort event emission: never let an event-bus
+                # failure mask the original resolver error envelope.
+                _LOG.exception(
+                    "fsm.resolve_gate: failed to emit gate_resolution_failed event"
+                )
             return as_error(exc.code, detail=exc.detail, **payload)
 
         env_update = dict(resolution.env_update)
@@ -3014,21 +3091,63 @@ def fsm_resolve_gate(input: ResolveGateInput) -> ResolveGateResult | McpToolErro
         # omits / under-specifies it.
         with project.session_factory() as session:
             entries = project.states.list_by_run(session, run.id)
+        open_gate_seq: int | None = None
+        for entry in reversed(entries):
+            if (
+                entry.state_id == current_state_id
+                and entry.status == "entered"
+            ):
+                open_gate_seq = entry.entry_seq
+                break
         gate_entry_seq = input.state_entry_seq
         if gate_entry_seq <= 0:
-            for entry in reversed(entries):
-                if (
-                    entry.state_id == current_state_id
-                    and entry.status == "entered"
-                ):
-                    gate_entry_seq = entry.entry_seq
-                    break
+            if open_gate_seq is None:
+                # No open gate state-entry row exists: writing a binding
+                # with ``target_state_entry_seq=0`` would corrupt the
+                # binding index (the natural key is
+                # ``(target_run_id, target_state_entry_seq)``). Surface a
+                # typed envelope instead so the caller learns the gate
+                # is not actually open and we never persist a zero seq.
+                return as_error(
+                    "gate_state_entry_not_found",
+                    detail=(
+                        f"no open gate state-entry row for state "
+                        f"{current_state_id!r} on run {run.id!r}; "
+                        "resolve_gate requires the gate state to be "
+                        "currently entered"
+                    ),
+                    run_id=run.id,
+                    state_id=current_state_id,
+                )
+            gate_entry_seq = open_gate_seq
+        elif open_gate_seq is None or gate_entry_seq != open_gate_seq:
+            # Caller supplied an explicit seq, but it doesn't line up with
+            # the actual open gate entry — refuse rather than silently
+            # writing a binding against a stale / wrong row.
+            return as_error(
+                "gate_state_entry_not_found",
+                detail=(
+                    f"state_entry_seq={gate_entry_seq} does not match the "
+                    f"open gate state-entry row "
+                    f"({open_gate_seq!r}) for state "
+                    f"{current_state_id!r} on run {run.id!r}"
+                ),
+                run_id=run.id,
+                state_id=current_state_id,
+                supplied=gate_entry_seq,
+                expected=open_gate_seq,
+            )
 
         # Persist the gate exit + emit gate_resolved (+
         # gate_binding_recorded for the run_output path) + write the
         # gate_bindings row. All in one atomic block so subscribers see
         # them together.
         target_field_for_event = next(iter(env_update.keys()), None)
+        # GATE_CONTRACT.md: the ``gate_resolved`` event payload carries a
+        # ``value_hash`` (sha256 of the canonical-JSON env_update) so
+        # subscribers can de-duplicate / correlate resolutions without
+        # rehydrating the full value.
+        value_hash = _sha256_hex(_to_canonical_json(env_update))
         with project.session_factory() as session, session.begin():
             if from_pk is not None:
                 project.states.mark_exited(session, from_pk, env_update)
@@ -3048,6 +3167,7 @@ def fsm_resolve_gate(input: ResolveGateInput) -> ResolveGateResult | McpToolErro
                     "state_entry_seq": gate_entry_seq,
                     "source_kind": state.gate.source_kind.value,
                     "target_field": target_field_for_event,
+                    "value_hash": value_hash,
                 },
                 run_id=run.id,
             )

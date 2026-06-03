@@ -357,42 +357,25 @@ def main(
             mcp.settings.host = host
             mcp.settings.port = port
             _LOG.info("starting MCP server on http://%s:%s (sse)", host, port)
-            # Inline of FastMCP.run_sse_async so we can wrap the
-            # Starlette app with CORS middleware before handing it to
-            # uvicorn. The UI's InfoTopBar probes every subsystem's
-            # /healthz from the browser, including MCP; without an
-            # Access-Control-Allow-Origin header those fetches surface
-            # as console.error in dev mode (the W23a console-error
-            # audit then fails every e2e test). The CORS allowlist
-            # mirrors the API server's (``ctxr.fsm.api`` — Vite dev
-            # server on both loopback names).
-            import anyio
+            # Wrap FastMCP's Starlette app with CORSMiddleware so the
+            # browser-side InfoTopBar can probe ``/healthz`` cross-origin
+            # from the Vite dev server (any loopback port). FastMCP's
+            # built-in ``mcp.run(transport='sse')`` would skip this; we
+            # call uvicorn directly with the wrapped app instead. The
+            # regex matches every loopback dev origin so the e2e harness
+            # (ephemeral Vite port) Just Works without per-port wiring.
             import uvicorn
             from starlette.middleware.cors import CORSMiddleware
 
-            starlette_app = mcp.sse_app()
-            starlette_app.add_middleware(
+            sse_app = mcp.sse_app()
+            sse_app.add_middleware(
                 CORSMiddleware,
-                allow_origins=[
-                    "http://localhost:5173",
-                    "http://127.0.0.1:5173",
-                ],
+                allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
                 allow_credentials=True,
                 allow_methods=["*"],
                 allow_headers=["*"],
             )
-
-            async def _serve() -> None:
-                config = uvicorn.Config(
-                    starlette_app,
-                    host=mcp.settings.host,
-                    port=mcp.settings.port,
-                    log_level=mcp.settings.log_level.lower(),
-                )
-                server = uvicorn.Server(config)
-                await server.serve()
-
-            anyio.run(_serve)
+            uvicorn.run(sse_app, host=host, port=port, log_level="info")
         else:
             # Defensive — Literal narrows at the type level but a
             # runtime caller (e.g. a typo from the CLI shim) could

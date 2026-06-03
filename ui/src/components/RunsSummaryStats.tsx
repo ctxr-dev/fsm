@@ -58,8 +58,17 @@ const TILES: readonly TileSpec[] = [
 ];
 
 export interface RunsSummaryStatsProps {
-  /** Bump to force a refetch (e.g. after an abort + reload). */
-  reloadKey?: number;
+  /**
+   * Composite reload key. Accepts ``string | number`` so callers can
+   * thread multiple inputs (page, status, refresh-stamp) into a
+   * single dependency without inventing a parent-side reducer; e.g.
+   * ``reloadKey={\`${page}:${status}:${tick}\`}``.
+   *
+   * Pre-fix this was a bare ``number`` so a caller-side composite
+   * value had to be JSON-encoded or hashed; the wider type matches
+   * what useEffect actually allows as a dep.
+   */
+  reloadKey?: string | number;
   /**
    * Called when the user clicks a tile. Receives the tile's
    * ``statusFilter`` value (``null`` for Total). The parent route
@@ -81,35 +90,56 @@ export function RunsSummaryStats({
     let cancelled = false;
     setError(null);
     (async () => {
-      try {
-        // ``incomplete`` / ``resumable`` are the only special-keyword
-        // statuses the /runs endpoint accepts; ``in_progress`` is a
-        // literal status value (matches the StateStatus enum in the
-        // engine). The "Total" tile sends no ``status`` so the server
-        // returns the full population.
-        const settled = await Promise.allSettled(
-          TILES.map((t) =>
-            api.listRuns({
-              page_size: 1,
-              page: 1,
-              ...(t.statusFilter ? { status: t.statusFilter } : {}),
-            }),
-          ),
+      // ``incomplete`` / ``resumable`` are the only special-keyword
+      // statuses the /runs endpoint accepts; ``in_progress`` is a
+      // literal status value (matches the StateStatus enum in the
+      // engine). The "Total" tile sends no ``status`` so the server
+      // returns the full population.
+      //
+      // ``Promise.allSettled`` NEVER rejects, so the outer try/catch
+      // around it was dead code in the pre-fix draft — a 5xx on every
+      // tile would leave the component in a "loading-forever" state
+      // with no error surface. We now surface a degraded mode
+      // explicitly: when ALL four tiles fail we set ``error`` (using
+      // the first failure reason so the operator can grep / file a
+      // bug from a single screenshot); when SOME succeed we render
+      // the partial counts with ``—`` for the failed ones. Partial
+      // failures do NOT surface the failure reason today — the
+      // ``firstFailure`` value is consumed only on the all-failed
+      // branch — so the operator sees a working subset and a dash
+      // for the broken tiles without an error banner.
+      const settled = await Promise.allSettled(
+        TILES.map((t) =>
+          api.listRuns({
+            page_size: 1,
+            page: 1,
+            ...(t.statusFilter ? { status: t.statusFilter } : {}),
+          }),
+        ),
+      );
+      const next: Record<string, number> = {};
+      let allFailed = true;
+      let firstFailure: unknown = null;
+      for (let i = 0; i < TILES.length; i++) {
+        const result = settled[i];
+        if (result.status === 'fulfilled') {
+          next[TILES[i].key] = result.value.total;
+          allFailed = false;
+        } else {
+          next[TILES[i].key] = -1;
+          if (firstFailure === null) firstFailure = result.reason;
+        }
+      }
+      if (cancelled) return;
+      if (allFailed && firstFailure !== null) {
+        setError(
+          firstFailure instanceof ApiError
+            ? firstFailure.message
+            : String(firstFailure),
         );
-        const next: Record<string, number> = {};
-        for (let i = 0; i < TILES.length; i++) {
-          const result = settled[i];
-          if (result.status === 'fulfilled') {
-            next[TILES[i].key] = result.value.total;
-          } else {
-            next[TILES[i].key] = -1;
-          }
-        }
-        if (!cancelled) setCounts(next);
-      } catch (err) {
-        if (!cancelled) {
-          setError(err instanceof ApiError ? err.message : String(err));
-        }
+        setCounts(null);
+      } else {
+        setCounts(next);
       }
     })();
     return () => {

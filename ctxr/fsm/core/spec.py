@@ -297,6 +297,17 @@ def validate_fsm_spec(spec: FsmSpec) -> FsmValidationResult:
        :func:`ctxr.fsm.core.predicates.validate_expression`. If the
        predicates module is not importable in the current environment
        (e.g. early bootstrap), this check is skipped silently.
+    6. **Prompt template parsability (W23f).** Every worker
+       ``prompt_template`` that contains a Jinja construct
+       (``{{`` or ``{%``) is smoke-rendered through the sandboxed
+       :class:`~ctxr.fsm.core.prompts.PromptRenderer` so syntax
+       errors and unknown tokens fail at register time rather than at
+       ``build_brief`` time. The renderer is constructed with
+       ``allow_model_import=False`` so an untrusted spec cannot trigger
+       arbitrary ``importlib.import_module`` calls during validation;
+       templates that rely on ``spec.model(...)`` must therefore be
+       wired with a renderer at run time. The check is skipped silently
+       if ``jinja2`` is not installed in the current environment.
 
     What is **not** validated here:
 
@@ -381,7 +392,10 @@ def validate_fsm_spec(spec: FsmSpec) -> FsmValidationResult:
         # jinja2 not installed at runtime; skip template validation.
         pass
     else:
-        renderer = PromptRenderer()
+        # allow_model_import=False so a register-time smoke render of a
+        # user-supplied spec cannot trigger arbitrary importlib calls
+        # (e.g. spec.model(path='os.environ') leaking host env).
+        renderer = PromptRenderer(allow_model_import=False)
         for state in spec.states:
             for location, template in _iter_prompt_templates(state):
                 if not needs_rendering(template):
