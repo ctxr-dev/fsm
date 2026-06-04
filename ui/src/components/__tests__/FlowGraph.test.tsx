@@ -663,6 +663,160 @@ describe('FlowGraph', () => {
     });
   });
 
+  describe('ELK layout engine wiring', () => {
+    // FlowGraph reads the layout engine from window.location.search on
+    // each render. The default jsdom URL has no query string -> ELK is
+    // the default. Tests that want the dagre branch use
+    // history.replaceState to set ?layout=dagre BEFORE rendering and
+    // restore on cleanup.
+
+    function setSearch(search: string): void {
+      window.history.replaceState(null, '', `${window.location.pathname}${search}`);
+    }
+    function clearSearch(): void {
+      window.history.replaceState(null, '', window.location.pathname);
+    }
+
+    test('uses ELK by default (calls applyElkLayout for autoLayout graphs)', async () => {
+      clearSearch();
+      const elkMod = await import('../../lib/elkLayout');
+      const spy = vi.spyOn(elkMod, 'applyElkLayout').mockResolvedValue({
+        nodePositions: new Map([
+          ['a', { x: 0, y: 0 }],
+          ['b', { x: 0, y: 100 }],
+        ]),
+        edgeRouting: new Map([
+          [
+            'a-b',
+            {
+              sections: [
+                { id: 's0', startPoint: { x: 50, y: 50 }, endPoint: { x: 50, y: 150 } },
+              ],
+              labelPos: { x: 60, y: 100 },
+            },
+          ],
+        ]),
+      });
+      const nodes: Node<FlowNodeData>[] = [
+        { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+        { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
+      ];
+      const edges: Edge[] = [{ id: 'a-b', source: 'a', target: 'b' }];
+      render(<FlowGraph nodes={nodes} edges={edges} autoLayout={true} />);
+      // applyElkLayout is invoked asynchronously inside a useEffect;
+      // wait one microtask for the promise to resolve.
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(spy).toHaveBeenCalled();
+      spy.mockRestore();
+    });
+
+    test('uses dagre when ?layout=dagre is present (does NOT call applyElkLayout)', async () => {
+      setSearch('?layout=dagre');
+      try {
+        const elkMod = await import('../../lib/elkLayout');
+        const spy = vi.spyOn(elkMod, 'applyElkLayout').mockResolvedValue({
+          nodePositions: new Map(),
+          edgeRouting: new Map(),
+        });
+        const nodes: Node<FlowNodeData>[] = [
+          { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+          { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
+        ];
+        const edges: Edge[] = [{ id: 'a-b', source: 'a', target: 'b' }];
+        render(<FlowGraph nodes={nodes} edges={edges} autoLayout={true} />);
+        await act(async () => {
+          await Promise.resolve();
+        });
+        expect(spy).not.toHaveBeenCalled();
+        // The wrapper exposes the active engine for e2e tests to query.
+        const wrapper = document.querySelector('.flow-graph') as HTMLElement;
+        expect(wrapper.getAttribute('data-layout-engine')).toBe('dagre');
+        // Dagre output (positions differ across the two nodes) is what
+        // was handed to ReactFlow.
+        const positioned = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
+        const ys = positioned.map((n) => n.position.y);
+        expect(new Set(ys).size).toBe(2);
+        spy.mockRestore();
+      } finally {
+        clearSearch();
+      }
+    });
+
+    test('default wrapper data-layout-engine is "elk"', () => {
+      clearSearch();
+      const nodes: Node<FlowNodeData>[] = [
+        { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+      ];
+      render(<FlowGraph nodes={nodes} edges={[]} />);
+      const wrapper = document.querySelector('.flow-graph') as HTMLElement;
+      expect(wrapper.getAttribute('data-layout-engine')).toBe('elk');
+    });
+
+    test('shows spinner overlay while ELK promise is pending; removes it when resolved', async () => {
+      clearSearch();
+      const elkMod = await import('../../lib/elkLayout');
+      // Build a promise we resolve manually so we can observe both
+      // the in-flight + post-resolve states.
+      let resolveLayout: (r: import('../../lib/elkLayout').LayoutResult) => void = () => {};
+      const pendingPromise = new Promise<import('../../lib/elkLayout').LayoutResult>(
+        (r) => {
+          resolveLayout = r;
+        },
+      );
+      const spy = vi.spyOn(elkMod, 'applyElkLayout').mockReturnValue(pendingPromise);
+      const nodes: Node<FlowNodeData>[] = [
+        { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+      ];
+      const edges: Edge[] = [];
+      const { queryByTestId } = render(
+        <FlowGraph nodes={nodes} edges={edges} autoLayout={true} />,
+      );
+      // Spinner should be present while the promise is pending.
+      expect(queryByTestId('fsm-graph-spinner')).not.toBeNull();
+      // Resolve the promise and wait for the effect cleanup to run.
+      await act(async () => {
+        resolveLayout({
+          nodePositions: new Map([['a', { x: 0, y: 0 }]]),
+          edgeRouting: new Map(),
+        });
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(queryByTestId('fsm-graph-spinner')).toBeNull();
+      spy.mockRestore();
+    });
+
+    test('falls back to dagre when applyElkLayout throws (data-layout-fallback=dagre)', async () => {
+      clearSearch();
+      const elkMod = await import('../../lib/elkLayout');
+      const spy = vi
+        .spyOn(elkMod, 'applyElkLayout')
+        .mockRejectedValue(new Error('synthetic ELK failure'));
+      const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const nodes: Node<FlowNodeData>[] = [
+        { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+        { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'b' } },
+      ];
+      const edges: Edge[] = [{ id: 'a-b', source: 'a', target: 'b' }];
+      render(<FlowGraph nodes={nodes} edges={edges} autoLayout={true} />);
+      // Drain microtasks so the rejection + setState lands.
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const wrapper = document.querySelector('.flow-graph') as HTMLElement;
+      expect(wrapper.getAttribute('data-layout-fallback')).toBe('dagre');
+      // The dagre useMemo result is what got forwarded to ReactFlow.
+      const positioned = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
+      const ys = positioned.map((n) => n.position.y);
+      expect(new Set(ys).size).toBe(2);
+      spy.mockRestore();
+      consoleWarn.mockRestore();
+    });
+  });
+
   test('default direction is TB (top-to-bottom) when not specified', () => {
     const nodes: Node<FlowNodeData>[] = [
       { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
