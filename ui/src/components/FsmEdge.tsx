@@ -40,6 +40,7 @@ import {
 
 import { Tooltip } from './Tooltip';
 import { tokenisePredicate, classForPredicateKind } from '../lib/predicateTokens';
+import type { ElkEdgeSection } from '../lib/elkLayout';
 
 /**
  * Context that carries the parent FlowGraph's `onEdgeClick` handler
@@ -65,6 +66,17 @@ export interface FsmEdgeData extends Record<string, unknown> {
    *  sibling labels on a fan-out from stacking on the same midpoint
    *  band even when dagre reserved distinct slack for each. */
   dagreLabel?: { x: number; y: number };
+  /** ELK-computed orthogonal polyline sections for this edge. When
+   *  present, FsmEdge builds its SVG path directly from these points
+   *  (with rounded 90-degree corners) instead of calling
+   *  ``getSmoothStepPath``. This is the orthogonal-by-construction
+   *  path the user actually sees on the default (ELK) layout engine. */
+  elkSections?: ElkEdgeSection[];
+  /** Label centre coords stamped by the active layout pass (ELK or
+   *  dagre). When present, FsmEdge anchors the label here. Replaces
+   *  ``dagreLabel`` going forward; ``dagreLabel`` is kept as a
+   *  fallback for the ``?layout=dagre`` URL path. */
+  layoutLabel?: { x: number; y: number };
   /** W23d 1-hop hover highlight. Set by FlowGraph while a hover is
    *  active. `isHovered` is the edge the cursor is on; `highlighted`
    *  is a 1-hop neighbour (an edge that shares an endpoint with the
@@ -92,6 +104,99 @@ export interface FsmEdgeData extends Record<string, unknown> {
  * straight run rather than on the corner bend, which is what xyflow's
  * built-in labelX/labelY would otherwise pick.
  */
+/**
+ * Build an SVG path string from an ELK orthogonal polyline. Each
+ * 90-degree bend gets a quarter-circle arc of the requested radius so
+ * the corner reads as a chamfered turn rather than a sharp right
+ * angle. Falls back to a straight L command when consecutive segments
+ * are too short for the arc (Math.min(radius, segmentLength / 2)).
+ *
+ * Polyline shape: [startPoint, ...bendPoints, endPoint]. ELK
+ * guarantees every consecutive pair is axis-aligned (horizontal or
+ * vertical) when the layout is configured with edgeRouting: ORTHOGONAL,
+ * which is what makes the chamfer math valid (radius applies along the
+ * incoming axis then perpendicular along the outgoing axis).
+ */
+export function buildOrthogonalPath(
+  points: ReadonlyArray<{ x: number; y: number }>,
+  radius = 6,
+): string {
+  if (points.length === 0) return '';
+  if (points.length === 1) return `M ${points[0].x} ${points[0].y}`;
+
+  let path = `M ${points[0].x} ${points[0].y}`;
+  for (let i = 1; i < points.length; i++) {
+    const prev = points[i - 1];
+    const curr = points[i];
+    const next = points[i + 1];
+    if (next === undefined) {
+      // Last segment: straight line to end.
+      path += ` L ${curr.x} ${curr.y}`;
+      continue;
+    }
+    // Distance to the corner. Clamp the chamfer radius so a short
+    // segment doesn't produce a backwards arc.
+    const dx1 = curr.x - prev.x;
+    const dy1 = curr.y - prev.y;
+    const dx2 = next.x - curr.x;
+    const dy2 = next.y - curr.y;
+    const len1 = Math.hypot(dx1, dy1);
+    const len2 = Math.hypot(dx2, dy2);
+    // Colinear (no actual bend): emit a plain L. The cross product is
+    // zero when the two segments point in the same OR opposite
+    // direction; either way there is no corner to round.
+    const cross = dx1 * dy2 - dy1 * dx2;
+    if (Math.abs(cross) < 0.5) {
+      path += ` L ${curr.x} ${curr.y}`;
+      continue;
+    }
+    const r = Math.min(radius, len1 / 2, len2 / 2);
+    if (r <= 0.5) {
+      path += ` L ${curr.x} ${curr.y}`;
+      continue;
+    }
+    // Arc start: r away from curr along the incoming direction
+    // (heading INTO curr from prev).
+    const inUnitX = len1 > 0 ? dx1 / len1 : 0;
+    const inUnitY = len1 > 0 ? dy1 / len1 : 0;
+    const arcStartX = curr.x - inUnitX * r;
+    const arcStartY = curr.y - inUnitY * r;
+    // Arc end: r away from curr along the outgoing direction
+    // (heading OUT of curr toward next).
+    const outUnitX = len2 > 0 ? dx2 / len2 : 0;
+    const outUnitY = len2 > 0 ? dy2 / len2 : 0;
+    const arcEndX = curr.x + outUnitX * r;
+    const arcEndY = curr.y + outUnitY * r;
+    path += ` L ${arcStartX} ${arcStartY}`;
+    // Q (quadratic Bezier) with the corner as the control point
+    // produces a visually correct rounded chamfer without requiring
+    // an A (arc) command. The bend's sweep direction is implied by
+    // the order of the start/end points so we don't need an explicit
+    // sweep flag.
+    path += ` Q ${curr.x} ${curr.y} ${arcEndX} ${arcEndY}`;
+  }
+  return path;
+}
+
+/**
+ * Convert an ElkEdgeSection list to the polyline FsmEdge will draw.
+ * Each section contributes [startPoint, ...bendPoints, endPoint];
+ * consecutive sections are stitched (the next section's startPoint
+ * follows the previous section's endPoint).
+ */
+function sectionsToPolyline(
+  sections: ReadonlyArray<ElkEdgeSection>,
+): Array<{ x: number; y: number }> {
+  const pts: Array<{ x: number; y: number }> = [];
+  for (let i = 0; i < sections.length; i++) {
+    const s = sections[i];
+    if (i === 0) pts.push(s.startPoint);
+    for (const b of s.bendPoints ?? []) pts.push(b);
+    pts.push(s.endPoint);
+  }
+  return pts;
+}
+
 function longestSegmentMidpoint(
   sx: number,
   sy: number,
@@ -158,26 +263,40 @@ export function FsmEdge(props: EdgeProps): JSX.Element {
   // unit-test render); the onClick path is a no-op in that case.
   const onLabelClick = useContext(FsmEdgeClickContext);
 
-  const [edgePath] = getSmoothStepPath({
-    sourceX,
-    sourceY,
-    targetX,
-    targetY,
-    sourcePosition,
-    targetPosition,
-    borderRadius: 4,
-  });
-
   const ed = (data ?? {}) as FsmEdgeData;
-  // Prefer dagre's layout-assigned label position when FlowGraph
-  // captured one for this edge. Dagre treats each label box as a
-  // first-class layout obstacle and assigns distinct (x, y) per edge,
-  // so sibling labels on a fan-out (one source -> N targets) don't
-  // stack on the same midpoint band. Fallback is the geometric
-  // longest-segment midpoint: it still wins for edges added by ad-hoc
-  // callers that bypass applyDagreLayout (e.g. unit-test fixtures).
-  const [labelX, labelY] = ed.dagreLabel
-    ? [ed.dagreLabel.x, ed.dagreLabel.y]
+
+  // ELK path takes priority when FlowGraph stamped elkSections onto
+  // edge.data — build the SVG path from the orthogonal polyline with
+  // rounded 90-degree corners. This is the default rendering path on
+  // ?layout=elk (the new default). When the layout fell back to dagre
+  // (?layout=dagre OR an ELK throw), elkSections is absent and we use
+  // xyflow's getSmoothStepPath as before.
+  let edgePath: string;
+  if (ed.elkSections && ed.elkSections.length > 0) {
+    const polyline = sectionsToPolyline(ed.elkSections);
+    edgePath = buildOrthogonalPath(polyline, 6);
+  } else {
+    [edgePath] = getSmoothStepPath({
+      sourceX,
+      sourceY,
+      targetX,
+      targetY,
+      sourcePosition,
+      targetPosition,
+      borderRadius: 4,
+    });
+  }
+
+  // Prefer the layout-assigned label position when FlowGraph captured
+  // one for this edge. ELK's pass writes ``data.layoutLabel``; the
+  // legacy dagre pass writes ``data.dagreLabel`` (kept for backwards
+  // compatibility on the ?layout=dagre fallback). Fallback is the
+  // geometric longest-segment midpoint: it still wins for edges added
+  // by ad-hoc callers that bypass either layout (e.g. unit-test
+  // fixtures).
+  const layoutLabelPos = ed.layoutLabel ?? ed.dagreLabel;
+  const [labelX, labelY] = layoutLabelPos
+    ? [layoutLabelPos.x, layoutLabelPos.y]
     : longestSegmentMidpoint(
         sourceX,
         sourceY,

@@ -46,6 +46,12 @@ import '@xyflow/react/dist/style.css';
 import { useGraphViewport } from '../lib/graphViewport';
 import { Tooltip } from './Tooltip';
 import { FsmEdge, FsmEdgeClickContext } from './FsmEdge';
+import { Spinner } from './Spinner';
+import {
+  applyElkLayout,
+  type ElkEdgeRouting,
+  type LayoutResult,
+} from '../lib/elkLayout';
 
 export type FlowNodeKind = 'state' | 'worker' | 'terminal' | 'producer' | 'consumer' | 'inline' | 'loop';
 
@@ -755,6 +761,7 @@ function truncateLabel(text: string): string {
 function decorateEdges(
   edges: readonly Edge[],
   edgeLabelPositions?: DagreEdgeLabelMap,
+  elkEdgeRouting?: Map<string, ElkEdgeRouting>,
 ): Edge[] {
   return edges.map((e) => {
     const original = typeof e.label === 'string' ? e.label : undefined;
@@ -764,7 +771,8 @@ function decorateEdges(
     // (specDetail's inspector Sheet) can render the full payload without
     // re-walking the spec.
     const incomingData = (e.data ?? {}) as Record<string, unknown>;
-    const dagrePos = edgeLabelPositions?.get(e.id);
+    const labelPos = edgeLabelPositions?.get(e.id);
+    const elkRouting = elkEdgeRouting?.get(e.id);
     const data: Record<string, unknown> = {
       ...incomingData,
       fullLabel: typeof incomingData.fullLabel === 'string'
@@ -772,11 +780,23 @@ function decorateEdges(
         : original,
       sourceId: e.source,
       targetId: e.target,
-      // dagreLabel propagates the layout-computed label centre to
-      // FsmEdge, which prefers it over the geometric longest-segment
+      // layoutLabel propagates the active-layout-engine's label centre
+      // to FsmEdge, which prefers it over the geometric longest-segment
       // midpoint when present. This is what stops sibling labels on a
-      // fan-out from stacking on the same midpoint band.
-      ...(dagrePos ? { dagreLabel: dagrePos } : {}),
+      // fan-out from stacking on the same midpoint band. Same field name
+      // for both ELK and dagre; FsmEdge does not care which engine
+      // produced it.
+      ...(labelPos ? { layoutLabel: labelPos } : {}),
+      // dagreLabel kept as a backwards-compat alias for any FsmEdge
+      // instance that didn't pick up the renamed field (e.g. a stale
+      // tab on a SW-cached build).
+      ...(labelPos ? { dagreLabel: labelPos } : {}),
+      // elkSections, when present, instructs FsmEdge to build its SVG
+      // path from the ELK orthogonal polyline with rounded corners
+      // instead of calling getSmoothStepPath.
+      ...(elkRouting && elkRouting.sections.length > 0
+        ? { elkSections: elkRouting.sections }
+        : {}),
     };
     return {
       ...e,
@@ -912,36 +932,167 @@ export function FlowGraph({
 
   const hoverActive = hoveredNodeId !== null || hoveredEdgeId !== null;
 
-  const { positioned, edgeLabelPositions } = useMemo(() => {
-    if (!autoLayout) {
-      // Preserve caller-supplied positions but still tag every node
-      // with the source/target Position that matches the active
-      // direction. Without this, FsmNode falls back to its Right/Left
-      // defaults and a TB graph would render edges attaching to the
-      // wrong sides (W20 Copilot finding on #56). The custom node
-      // type is also applied so callers don't have to set it manually.
-      const sp = direction === 'LR' ? Position.Right : Position.Bottom;
-      const tp = direction === 'LR' ? Position.Left : Position.Top;
-      const manual = nodes.map((n) => {
-        // PR 5: same loop dispatch as the auto-layout branch.
-        const isLoop = (n.data as { isLoop?: boolean } | undefined)?.isLoop === true;
-        return {
-          ...n,
-          // W22: stamp width/height so MiniMap renders thumbnails even
-          // for callers that supply manual positions. Only fill in
-          // defaults — callers that explicitly set per-node dimensions
-          // (a future cardinality-aware layout) keep their values.
-          width: n.width ?? NODE_WIDTH,
-          height: n.height ?? NODE_HEIGHT,
-          sourcePosition: n.sourcePosition ?? sp,
-          targetPosition: n.targetPosition ?? tp,
-          type: n.type ?? (isLoop ? 'loopNode' : 'fsmNode'),
-        };
-      });
-      return { positioned: manual, edgeLabelPositions: new Map() as DagreEdgeLabelMap };
-    }
+  // Detect the active layout engine from the URL. ?layout=dagre keeps
+  // the legacy dagre path alive for A/B comparison + emergency rollback.
+  // Any other value (or no query param) selects ELK, the new default.
+  // This lookup is deliberately synchronous + cheap; no useEffect, so
+  // it survives SSR (returns 'elk') and reads the latest search string
+  // every render.
+  const layoutEngine: 'elk' | 'dagre' = useMemo(() => {
+    if (typeof window === 'undefined') return 'elk';
+    const params = new URLSearchParams(window.location.search);
+    return params.get('layout') === 'dagre' ? 'dagre' : 'elk';
+  }, []);
+
+  // Manual-layout branch: identical to before — preserve caller
+  // positions, stamp direction-aware handle sides, dispatch loop vs
+  // fsm node type.
+  const manualPositioned = useMemo(() => {
+    if (autoLayout) return null;
+    const sp = direction === 'LR' ? Position.Right : Position.Bottom;
+    const tp = direction === 'LR' ? Position.Left : Position.Top;
+    return nodes.map((n) => {
+      const isLoop = (n.data as { isLoop?: boolean } | undefined)?.isLoop === true;
+      return {
+        ...n,
+        width: n.width ?? NODE_WIDTH,
+        height: n.height ?? NODE_HEIGHT,
+        sourcePosition: n.sourcePosition ?? sp,
+        targetPosition: n.targetPosition ?? tp,
+        type: n.type ?? (isLoop ? 'loopNode' : 'fsmNode'),
+      };
+    });
+  }, [nodes, autoLayout, direction]);
+
+  // Dagre auto-layout branch: synchronous and cheap (the existing
+  // implementation). Computed every render via useMemo and the result
+  // is used either directly (?layout=dagre OR autoLayout=false-with-
+  // dagre fallback) or as the fallback when ELK throws.
+  const dagreLayout = useMemo(() => {
+    if (!autoLayout) return null;
     return applyDagreLayout(nodes, edges, direction);
   }, [nodes, edges, autoLayout, direction]);
+
+  // ELK layout is async (Promise<LayoutResult>). We hold the result
+  // in state so the effect can write to it; while the promise is
+  // in-flight, isLayoutComputing flips the spinner overlay on. On
+  // throw, we log + fall back to the synchronous dagre result for
+  // the same nodes/edges identity, and remember the fallback in
+  // elkFailed so the spinner doesn't flicker on re-renders.
+  const [elkLayout, setElkLayout] = useState<LayoutResult | null>(null);
+  const [isLayoutComputing, setIsLayoutComputing] = useState<boolean>(false);
+  const [elkFailed, setElkFailed] = useState<boolean>(false);
+
+  // Recompute ELK whenever the engine, nodes/edges identity, or
+  // direction changes. We deliberately depend on `edges` and `nodes`
+  // identity (not contents) because the upstream owners (specGraph,
+  // runGraph) regenerate the arrays whenever the topology changes;
+  // a stable identity means "same topology" and we can reuse the
+  // previous ELK result.
+  useEffect(() => {
+    if (!autoLayout || layoutEngine !== 'elk') {
+      setElkLayout(null);
+      setIsLayoutComputing(false);
+      return;
+    }
+    let cancelled = false;
+    setIsLayoutComputing(true);
+    // Build the label-dimensions map from each edge's actual label
+    // text (same measurement we feed dagre, so ELK reserves matching
+    // slack for the pill).
+    const labelDimensions = new Map<string, { width: number; height: number }>();
+    for (const e of edges) {
+      const text = typeof e.label === 'string' ? e.label : '';
+      if (text.length > 0) labelDimensions.set(e.id, measureEdgeLabel(text));
+    }
+    applyElkLayout(nodes, edges, { labelDimensions })
+      .then((result) => {
+        if (cancelled) return;
+        setElkLayout(result);
+        setIsLayoutComputing(false);
+        setElkFailed(false);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        // ELK throws are non-fatal: log, mark the fallback, render
+        // through the existing dagre useMemo result.
+        // eslint-disable-next-line no-console -- defensive diagnostic
+        console.warn('ELK layout failed, falling back to dagre', err);
+        setElkLayout(null);
+        setIsLayoutComputing(false);
+        setElkFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [nodes, edges, direction, autoLayout, layoutEngine]);
+
+  // Resolve the active layout result to feed into the node/edge
+  // decoration steps. Priority:
+  //   1. Manual (autoLayout=false) — preserved positions + direction.
+  //   2. ELK auto-layout, when result is available + not failed.
+  //   3. Dagre auto-layout (legacy path OR ELK fallback).
+  const { positioned, edgeLabelPositions, elkEdgeRouting } = useMemo(() => {
+    if (manualPositioned !== null) {
+      return {
+        positioned: manualPositioned,
+        edgeLabelPositions: new Map() as DagreEdgeLabelMap,
+        elkEdgeRouting: new Map() as Map<string, ElkEdgeRouting>,
+      };
+    }
+    const usingElk =
+      layoutEngine === 'elk' && !elkFailed && elkLayout !== null;
+    if (usingElk) {
+      // Build positioned nodes from the ELK result.
+      const sp = direction === 'LR' ? Position.Right : Position.Bottom;
+      const tp = direction === 'LR' ? Position.Left : Position.Top;
+      const elkNodes = nodes.map((n) => {
+        const isLoop = (n.data as { isLoop?: boolean } | undefined)?.isLoop === true;
+        const w = typeof n.width === 'number' ? n.width : NODE_WIDTH;
+        const h = typeof n.height === 'number' ? n.height : NODE_HEIGHT;
+        const pos = elkLayout!.nodePositions.get(n.id) ?? { x: 0, y: 0 };
+        return {
+          ...n,
+          // ELK returns top-left coords directly; React Flow expects
+          // the same. No centre-then-offset arithmetic like the dagre
+          // path requires.
+          position: { x: pos.x, y: pos.y },
+          width: w,
+          height: h,
+          sourcePosition: sp,
+          targetPosition: tp,
+          type: isLoop ? 'loopNode' : 'fsmNode',
+        };
+      });
+      // Surface per-edge label positions through the same
+      // edgeLabelPositions map dagre uses, so decorateEdges can
+      // continue stamping data.layoutLabel uniformly.
+      const labelPositions: DagreEdgeLabelMap = new Map();
+      for (const [id, routing] of elkLayout!.edgeRouting) {
+        if (routing.labelPos) labelPositions.set(id, routing.labelPos);
+      }
+      return {
+        positioned: elkNodes,
+        edgeLabelPositions: labelPositions,
+        elkEdgeRouting: elkLayout!.edgeRouting,
+      };
+    }
+    // Fall through to dagre.
+    const dagre = dagreLayout ?? { positioned: [], edgeLabelPositions: new Map() };
+    return {
+      positioned: dagre.positioned,
+      edgeLabelPositions: dagre.edgeLabelPositions,
+      elkEdgeRouting: new Map() as Map<string, ElkEdgeRouting>,
+    };
+  }, [
+    manualPositioned,
+    dagreLayout,
+    elkLayout,
+    elkFailed,
+    layoutEngine,
+    nodes,
+    direction,
+  ]);
 
   const decoratedNodes = useMemo(
     () =>
@@ -975,7 +1126,7 @@ export function FlowGraph({
   // empty-graph early return, which threw when the same FlowGraph
   // flipped between 0 nodes and >0 nodes (Copilot finding on PR #57).
   const decoratedEdges = useMemo(() => {
-    const base = decorateEdges(edges, edgeLabelPositions);
+    const base = decorateEdges(edges, edgeLabelPositions, elkEdgeRouting);
     return base.map((e) => {
       const isHovered = hoveredEdgeId === e.id;
       const isHighlighted = !isHovered && highlight.edges.has(e.id);
@@ -1010,7 +1161,7 @@ export function FlowGraph({
       };
       return { ...e, data: nextData, style: nextStyle };
     });
-  }, [edges, edgeLabelPositions, hoveredEdgeId, hoverActive, highlight]);
+  }, [edges, edgeLabelPositions, elkEdgeRouting, hoveredEdgeId, hoverActive, highlight]);
 
   // React Flow's onNodeMouseEnter / Leave fire with (event, node);
   // collapse to just the id and clear any active edge hover so the two
@@ -1063,6 +1214,8 @@ export function FlowGraph({
         'text-slate-400 dark:text-slate-500',
         className ?? '',
       ].join(' ')}
+      data-layout-engine={layoutEngine}
+      data-layout-fallback={elkFailed ? 'dagre' : undefined}
     >
       <ReactFlow
         nodes={decoratedNodes}
@@ -1151,6 +1304,24 @@ export function FlowGraph({
           />
         ) : null}
       </ReactFlow>
+      {/* ELK layout overlay. The compute usually completes in 50-300 ms;
+          on the first paint the spinner sits above the canvas until the
+          ELK promise resolves. honour prefers-reduced-motion by letting
+          Spinner's animate-spin class collapse via the global rule. */}
+      {isLayoutComputing ? (
+        <div
+          class={[
+            'fsm-graph-spinner absolute inset-0 z-20 flex items-center justify-center',
+            'bg-white/60 dark:bg-slate-900/60',
+            'pointer-events-none',
+          ].join(' ')}
+          data-testid="fsm-graph-spinner"
+          role="status"
+          aria-live="polite"
+        >
+          <Spinner size="lg" label="Computing graph layout" />
+        </div>
+      ) : null}
       {/* W23b: discoverable wheel-mode help. Floating in the top-left
           (mirrors the bottom-right Controls position). Hover opens a
           small keybindings card so the operator who didn't already
