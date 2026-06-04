@@ -73,6 +73,7 @@ from ctxr.fsm.core.models import (
     InlineFaultReason,
     PostValidationResultEntry,
     RunCtx,
+    RunStatus,
     StateKind,
     TransitionEvaluation,
     TransitionKind,
@@ -536,6 +537,170 @@ def _cosignature_required(state: Any) -> bool:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Long-LLM-friendliness helpers: drift_paused commit gate + auto-clear
+# ---------------------------------------------------------------------------
+
+
+# Reasons surfaced on the auto-clear breadcrumb. Centralised so the
+# ``drift_pause_cleared`` payload uses a closed vocabulary the dashboard
+# can pivot on instead of free-text.
+_PAUSE_CLEAR_REASON_GET_BRIEF: str = "get_brief"
+_PAUSE_CLEAR_REASON_HEARTBEAT: str = "heartbeat"
+_PAUSE_CLEAR_REASON_COMMIT_OUTPUTS: str = "commit_outputs"
+
+
+def _signals_for_run(project: Project, run_id: str) -> list[Any]:
+    """Return every drift signal recorded against ``run_id`` (oldest first)."""
+    with project.session_factory() as session:
+        return list(project.drift_signals.by_run(session, run_id))
+
+
+def _emit_drift_pause_cleared(
+    project: Project,
+    *,
+    run_id: str,
+    producer_id: str,
+    cleared_by: str,
+    contributing_signal_kinds: list[str],
+) -> str:
+    """Flip ``drift_paused`` -> ``in_progress`` and emit the breadcrumb event.
+
+    Both writes share one ``session.begin()`` so a crash between them
+    leaves the substrate consistent. The persisted status flip is the
+    durable record; the breadcrumb event drives the dashboard and the
+    drift detector's eventual re-scoring on the next sweep.
+
+    Returns the ISO timestamp the clear was recorded at so the caller
+    can surface it on its tool-result envelope without a second
+    ``datetime.now`` call.
+    """
+    cleared_at = _iso_now_ms()
+    with project.session_factory() as session, session.begin():
+        project.runs.update_status(
+            session,
+            run_id=run_id,
+            status=RunStatus.in_progress.value,
+        )
+        project.events.emit(
+            session,
+            producer_id=producer_id,
+            kind=EventKind.drift_pause_cleared.value,
+            payload={
+                "run_id": run_id,
+                "cleared_by": cleared_by,
+                "contributing_signal_kinds": list(contributing_signal_kinds),
+                "cleared_at": cleared_at,
+            },
+            run_id=run_id,
+        )
+    return cleared_at
+
+
+def _auto_clear_drift_pause_if_idle_only(
+    project: Project,
+    *,
+    run: Any,
+    producer_id: str,
+    cleared_by: str,
+) -> tuple[bool, list[str]]:
+    """Auto-clear ``drift_paused`` when only idle signals contributed.
+
+    Returns ``(cleared, contributing_kinds)`` where ``cleared`` is
+    True when the status flip + breadcrumb emit fired. Contributing
+    kinds are returned regardless so the caller can decide whether to
+    surface a refusal envelope (real drift) or proceed silently
+    (idle-only clear).
+
+    A ``drift_paused`` run with NO signals on file is treated as
+    operator-driven and left alone — the auto-clear policy only fires
+    when the substrate's own evidence proves the pause was an idle
+    artefact.
+    """
+    # Import here to avoid a module-level cycle (drift imports models;
+    # this module imports models; the project facade exposes
+    # drift_signals).
+    from ctxr.fsm.sqlite.drift import only_idle_signals_contributed
+
+    signals = _signals_for_run(project, run.id)
+    contributing = sorted({s.signal_kind for s in signals})
+    if not signals:
+        # Defensive: nothing on file to support an idle-only verdict.
+        return False, contributing
+    if not only_idle_signals_contributed(signals):
+        return False, contributing
+    _emit_drift_pause_cleared(
+        project,
+        run_id=run.id,
+        producer_id=producer_id,
+        cleared_by=cleared_by,
+        contributing_signal_kinds=contributing,
+    )
+    return True, contributing
+
+
+def _drift_paused_error(
+    *,
+    run_id: str,
+    contributing_signal_kinds: list[str],
+) -> McpToolError:
+    """Build the structured refusal envelope for a real-drift pause.
+
+    Surfaced when ``commit_outputs`` / ``confirm_commit`` /
+    ``resolve_gate`` are called against a run whose pause is supported
+    by signals other than idle_too_long. The caller must call
+    ``fsm.resume_run`` explicitly to clear an operator-confirmed drift.
+    """
+    return as_error(
+        "run_drift_paused",
+        detail=(
+            "Run is drift_paused; real drift signals are on file. "
+            "Call fsm.resume_run to clear after operator review."
+        ),
+        run_id=run_id,
+        contributing_signal_kinds=list(contributing_signal_kinds),
+    )
+
+
+def _gate_run_or_auto_clear(
+    project: Project,
+    *,
+    run: Any,
+    producer_id: str,
+) -> McpToolError | None:
+    """Return a refusal envelope when ``run`` is paused on real drift.
+
+    Behaviour:
+
+    * Run not paused → ``None`` (proceed).
+    * Run paused, only idle signals contributed → auto-clear,
+      return ``None`` (proceed).
+    * Run paused, at least one real drift signal contributed →
+      return the structured ``run_drift_paused`` envelope so the
+      caller short-circuits with a typed refusal.
+
+    Called from ``fsm.commit_outputs``, ``fsm.confirm_commit``, and
+    ``fsm.resolve_gate`` so the three primary commit surfaces all
+    honour the same gate semantics. ``fsm.get_brief`` and
+    ``fsm.heartbeat`` take the looser auto-clear-only path because
+    they are read-side hand-offs that should not block on real drift
+    (the next commit will).
+    """
+    if getattr(run, "status", None) != RunStatus.drift_paused.value:
+        return None
+    cleared, contributing = _auto_clear_drift_pause_if_idle_only(
+        project,
+        run=run,
+        producer_id=producer_id,
+        cleared_by=_PAUSE_CLEAR_REASON_COMMIT_OUTPUTS,
+    )
+    if cleared:
+        return None
+    return _drift_paused_error(
+        run_id=run.id, contributing_signal_kinds=contributing
+    )
 
 
 def _ensure_engine_producer(project: Project) -> str:
@@ -1540,6 +1705,48 @@ def fsm_get_brief(input: GetBriefInput) -> Brief | McpToolError:
 
         env = _materialise_env(project, run)
         brief = build_brief(spec, state, env=env, run_id=uuid.UUID(run.id))
+
+        # Long-LLM-friendliness: a brief for a worker-bearing state is a
+        # hand-off to the LLM. We emit ``worker_dispatched`` so the
+        # drift detector treats this as an activity beat (it resets
+        # the idle window for this run) and so the timeline carries
+        # the "we briefed the worker at T" beat the dashboard wants.
+        # We also auto-clear an idle-only ``drift_paused`` status here
+        # — a brief is proof the orchestrator is still driving the
+        # run; the LLM hadn't stopped, just paused on a slow tool.
+        producer_id = _ensure_engine_producer(project)
+        if getattr(run, "status", None) == RunStatus.drift_paused.value:
+            _auto_clear_drift_pause_if_idle_only(
+                project,
+                run=run,
+                producer_id=producer_id,
+                cleared_by=_PAUSE_CLEAR_REASON_GET_BRIEF,
+            )
+
+        if brief.has_worker or brief.has_loop:
+            now = _iso_now_ms()
+            with project.session_factory() as session, session.begin():
+                # Bump ``runs.last_update_at`` so the drift detector's
+                # reference timestamp moves forward without a status
+                # change. The status itself is intentionally unchanged
+                # — this is just a liveness beat.
+                row = session.get(RunTable, run.id)
+                if row is not None:
+                    row.last_update_at = now
+                    session.add(row)
+                project.events.emit(
+                    session,
+                    producer_id=producer_id,
+                    kind=EventKind.worker_dispatched.value,
+                    payload={
+                        "run_id": run.id,
+                        "state_id": current_state_id,
+                        "brief_id": str(brief.brief_id),
+                        "iteration_n": brief.iteration_n,
+                        "dispatched_at": now,
+                    },
+                    run_id=run.id,
+                )
         return brief
     except KeyboardInterrupt:
         raise
@@ -1879,6 +2086,31 @@ def fsm_commit_outputs(input: CommitOutputsInput) -> CommitResult | McpToolError
             return _spec_hash_lock_error(
                 run_hash=run.fsm_spec_hash,
                 current_hash=current_hash,
+            )
+
+        # Long-LLM-friendliness: drift_paused is a REAL commit gate.
+        # We refuse the commit when real-drift signals supported the
+        # pause; idle-only pauses auto-clear in place (the LLM proved
+        # liveness by getting this far). Producer is the engine's own
+        # — same identity the rest of this function emits under.
+        producer_id_for_gate = _ensure_engine_producer(project)
+        gate_err = _gate_run_or_auto_clear(
+            project, run=run, producer_id=producer_id_for_gate
+        )
+        if gate_err is not None:
+            return gate_err
+        # Re-load the run so the post-clear status flows through to the
+        # rest of the body (cosignature path, signature persistence,
+        # token issue) — otherwise the in-memory ``run.status`` would
+        # still read ``drift_paused`` even after the auto-clear flipped
+        # the row. Bail if it vanished mid-call (paranoid; shouldn't
+        # happen under normal operator-facing flows).
+        run = project.get_run(run_id_str)
+        if run is None:
+            return as_error(
+                "run_not_found",
+                detail=f"no run with id {run_id_str!r}",
+                run_id=run_id_str,
             )
 
         current_state_id = _current_state_id(run, spec)
@@ -2402,6 +2634,18 @@ def fsm_confirm_commit(input: ConfirmCommitInput) -> ConfirmResult | McpToolErro
                 detail=f"token references missing run {run_id!r}",
                 run_id=run_id,
             )
+
+        # Long-LLM-friendliness: drift_paused gates confirm_commit too.
+        # A pause that landed between commit_outputs (token issued)
+        # and confirm_commit (replay) must refuse the replay so the
+        # staged writes don't silently land against a paused run.
+        # Idle-only pauses auto-clear; real drift refuses.
+        gate_producer_id = _ensure_engine_producer(project)
+        gate_err = _gate_run_or_auto_clear(
+            project, run=run, producer_id=gate_producer_id
+        )
+        if gate_err is not None:
+            return gate_err
 
         # Reload the spec so we can rebuild the next brief during replay.
         with project.session_factory() as session:
@@ -2946,6 +3190,25 @@ def fsm_resolve_gate(input: ResolveGateInput) -> ResolveGateResult | McpToolErro
         # Side-effect import binds FsmSpec.hash / validate.
         from ctxr.fsm.core import spec as _spec_module  # noqa: F401
         spec = FsmSpec.model_validate(registered.definition)
+
+        # Long-LLM-friendliness: drift_paused gates resolve_gate too.
+        # Same semantics as commit_outputs / confirm_commit — real
+        # drift refuses; idle-only auto-clears in place.
+        gate_producer_id = _ensure_engine_producer(project)
+        drift_gate_err = _gate_run_or_auto_clear(
+            project, run=run, producer_id=gate_producer_id
+        )
+        if drift_gate_err is not None:
+            return drift_gate_err
+        # Reload after a potential auto-clear so the rest of the body
+        # sees the post-clear status.
+        run = project.get_run(run_id_str)
+        if run is None:
+            return as_error(
+                "run_not_found",
+                detail=f"no run with id {run_id_str!r}",
+                run_id=run_id_str,
+            )
 
         current_state_id = _current_state_id(run, spec)
         try:

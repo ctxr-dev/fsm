@@ -66,20 +66,22 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, text
 
 from ctxr.fsm import __version__ as _PACKAGE_VERSION  # noqa: N812
-from ctxr.fsm.core.models import EventKind, FsmSpec
+from ctxr.fsm.core.models import EventKind, FsmSpec, RunStatus
 from ctxr.fsm.core.spec import validate_fsm_spec
 from ctxr.fsm.mcp import mcp
 from ctxr.fsm.mcp._drain_decorator import drain_aware
 from ctxr.fsm.mcp._errors import McpToolError, as_error
 from ctxr.fsm.mcp._state import get_project
-from ctxr.fsm.sqlite.models_core import FsmSpecTable, ProjectTable
+from ctxr.fsm.sqlite.models_core import FsmSpecTable, ProjectTable, RunTable
 
 __all__ = [
     "HealthcheckResult",
+    "HeartbeatResult",
     "ObserveResult",
     "SpecRegisteredPayload",
     "SpecSummary",
     "fsm_healthcheck",
+    "fsm_heartbeat",
     "fsm_list_specs",
     "fsm_observe_tool_call",
     "fsm_register_spec",
@@ -186,6 +188,36 @@ class SpecRegisteredPayload(BaseModel):
     project_slug: str = Field(description="Human-readable slug of the owning project.")
     created: bool = Field(
         description="True iff a new row was inserted; False on hash-dedup match."
+    )
+
+
+class HeartbeatResult(BaseModel):
+    """Return value of :func:`fsm_heartbeat`.
+
+    ``ok`` is always True on success — the field is kept as a positive
+    acknowledgement so the wire shape never needs a bare bool.
+    ``idle_reset_at`` is the ISO-8601 timestamp the drift detector
+    will see as the run's new ``last_update_at`` on its next sweep —
+    surfaced so an orchestrator can correlate its periodic pings with
+    the dashboard's "last activity" pill.
+    ``drift_pause_cleared`` is True iff the heartbeat also flipped a
+    ``drift_paused`` run back to ``in_progress`` (always paired with
+    a ``drift_pause_cleared`` event on the bus).
+    """
+
+    model_config = _VO_CFG
+
+    ok: bool = Field(default=True, description="Always True on success.")
+    idle_reset_at: str = Field(
+        description="ISO-8601 timestamp the run's last_update_at was bumped to."
+    )
+    event_id: str = Field(description="Row PK of the emitted heartbeat event.")
+    drift_pause_cleared: bool = Field(
+        default=False,
+        description=(
+            "True iff this heartbeat auto-cleared an idle-only drift_paused "
+            "status. Real-drift pauses are never cleared by heartbeat."
+        ),
     )
 
 
@@ -620,6 +652,150 @@ def fsm_observe_tool_call(
         return as_error("invalid_argument", detail=str(exc))
     except Exception as exc:
         _LOG.exception("fsm.observe_tool_call: unexpected error")
+        return as_error("internal_error", detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# fsm.heartbeat
+# ---------------------------------------------------------------------------
+
+
+# Producer identity used when this module emits engine-attributed
+# liveness events (heartbeat, drift_pause_cleared). Mirrors the
+# identity used by tools_runs.py so the audit trail attributes every
+# engine-side emit to one logical producer regardless of which surface
+# drove it.
+_ENGINE_PRODUCER_KIND: str = "engine"
+_ENGINE_PRODUCER_NAME: str = "fsm.runtime"
+
+
+@mcp.tool(
+    name="fsm.heartbeat",
+    description=(
+        "Refresh a run's idle window without committing outputs. "
+        "Long-LLM-friendliness hook: orchestrators call this every "
+        "~60s while a slow worker is in flight so the drift detector "
+        "treats the run as alive even though no state has advanced. "
+        "Idempotent. Auto-clears idle-only drift_paused status."
+    ),
+)
+@drain_aware
+def fsm_heartbeat(
+    run_id: UUID,
+    message: str = "",
+) -> HeartbeatResult | McpToolError:
+    """Bump ``runs.last_update_at`` and emit a ``heartbeat`` event.
+
+    Contract for callers
+    --------------------
+
+    An orchestrator (claude-code skill, custom worker harness, etc.)
+    that knows a worker dispatch will take longer than the global
+    idle window calls this on a timer (typical cadence: every 60s
+    once the dispatch has been in flight for ~30s). The call is
+    idempotent: making it twice in the same second is harmless.
+
+    The tool does THREE things inside one transaction:
+
+    1. Bumps ``runs.last_update_at`` to ``now`` so the drift detector's
+       reference timestamp moves forward.
+    2. Emits an ``EventKind.heartbeat`` event carrying ``message``
+       (a free-form note the operator can read in the timeline) and
+       the new timestamp.
+    3. If the run is currently ``drift_paused`` AND only idle
+       signals contributed to that pause, flips the status back to
+       ``in_progress`` and emits ``drift_pause_cleared``. Real-drift
+       pauses are NEVER cleared by heartbeat — those require
+       ``fsm.resume_run``.
+
+    A ``run_not_found`` envelope is returned for unknown ids;
+    ``invalid_argument`` for malformed run_id text.
+    """
+    try:
+        project = get_project()
+        run_id_str = str(run_id)
+
+        run = project.get_run(run_id_str)
+        if run is None:
+            return as_error(
+                "run_not_found",
+                detail=f"no run with id {run_id_str!r}",
+                run_id=run_id_str,
+            )
+
+        # Lazy import: tools_runs.py is the source of truth for the
+        # engine producer identity + auto-clear policy. Importing at
+        # module scope would create a cycle (tools_runs imports models;
+        # models doesn't touch this module).
+        from ctxr.fsm.mcp.tools_runs import (
+            _PAUSE_CLEAR_REASON_HEARTBEAT,
+            _auto_clear_drift_pause_if_idle_only,
+        )
+
+        with project.session_factory() as session, session.begin():
+            producer = project.producers.upsert(
+                session,
+                kind=_ENGINE_PRODUCER_KIND,
+                name=_ENGINE_PRODUCER_NAME,
+            )
+            producer_id = producer.id
+
+        # Compute the new timestamp once and use it for both the row
+        # bump and the event payload so subscribers see a single,
+        # consistent "alive at T" reading.
+        from ctxr.fsm.sqlite.repos_core import _iso_now_ms
+
+        now = _iso_now_ms()
+        with project.session_factory() as session, session.begin():
+            row = session.get(RunTable, run_id_str)
+            if row is not None:
+                row.last_update_at = now
+                session.add(row)
+            event = project.events.emit(
+                session,
+                producer_id=producer_id,
+                kind=EventKind.heartbeat.value,
+                payload={
+                    "run_id": run_id_str,
+                    "message": message,
+                    "idle_reset_at": now,
+                },
+                run_id=run_id_str,
+            )
+
+        # Auto-clear ONLY when paused on idle signals alone. We
+        # re-read the run row to pick up the just-bumped status (the
+        # bump above only touches last_update_at, but a paused run
+        # still carries status=drift_paused which the helper reads).
+        run_after = project.get_run(run_id_str)
+        cleared = False
+        if (
+            run_after is not None
+            and run_after.status == RunStatus.drift_paused.value
+        ):
+            cleared, _kinds = _auto_clear_drift_pause_if_idle_only(
+                project,
+                run=run_after,
+                producer_id=producer_id,
+                cleared_by=_PAUSE_CLEAR_REASON_HEARTBEAT,
+            )
+
+        return HeartbeatResult(
+            ok=True,
+            idle_reset_at=now,
+            event_id=event.id,
+            drift_pause_cleared=cleared,
+        )
+    except KeyboardInterrupt:  # pragma: no cover
+        raise
+    except RuntimeError as exc:
+        _LOG.exception("fsm.heartbeat: project handle not bound")
+        return as_error("project_not_bound", detail=str(exc))
+    except ValueError as exc:
+        _LOG.info("fsm.heartbeat: invalid argument")
+        return as_error("invalid_argument", detail=str(exc))
+    except Exception as exc:
+        _LOG.exception("fsm.heartbeat: unexpected error")
         return as_error("internal_error", detail=str(exc))
 
 
