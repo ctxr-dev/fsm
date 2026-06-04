@@ -88,9 +88,11 @@ if TYPE_CHECKING:
     from ctxr.fsm.sqlite.project import Project
 
 __all__ = [
+    "DEFAULT_IDLE_WINDOW_SECONDS",
     "DRIFT_DISABLED_ENV_VAR",
     "DRIFT_PRODUCER_KIND",
     "DRIFT_PRODUCER_NAME",
+    "IDLE_TIMEOUT_ENV_VAR",
     "DriftConfig",
     "RunScoreboard",
     "classify_event",
@@ -110,11 +112,40 @@ _LOG = logging.getLogger(__name__)
 # literal at every site.
 DRIFT_DISABLED_ENV_VAR: str = "CTXR_FSM_DRIFT_DISABLED"
 
+# Operator-facing override for the default idle window. Long-LLM
+# friendliness: a 60s default trips legitimately-slow workers (large
+# codebase scans, deep analyses). Default raised to 300s (5min); ops
+# tune via this env var when their workloads need a different budget.
+# Per-state ``Worker.expected_max_wait_seconds`` always wins over this
+# global default when set.
+IDLE_TIMEOUT_ENV_VAR: str = "CTXR_FSM_IDLE_TIMEOUT_SECONDS"
+DEFAULT_IDLE_WINDOW_SECONDS: float = 300.0
+
 # The producer identity the drift detector registers + emits under.
 # Stable across restarts so subscribers can filter on this pair to see
 # every drift-detector-generated event.
 DRIFT_PRODUCER_KIND: str = "engine"
 DRIFT_PRODUCER_NAME: str = "fsm.drift_detector"
+
+
+def _resolve_default_idle_window() -> float:
+    """Return the effective idle window default (env var > module default).
+
+    The env var is parsed once at :class:`DriftConfig` construction
+    time; a non-positive or unparseable value falls back to
+    :data:`DEFAULT_IDLE_WINDOW_SECONDS` silently (operators discover
+    typos through the boot log line that names the resolved value).
+    """
+    raw = os.environ.get(IDLE_TIMEOUT_ENV_VAR)
+    if raw is None or not raw.strip():
+        return DEFAULT_IDLE_WINDOW_SECONDS
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return DEFAULT_IDLE_WINDOW_SECONDS
+    if parsed <= 0:
+        return DEFAULT_IDLE_WINDOW_SECONDS
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +203,7 @@ class DriftConfig:
     """
 
     score_threshold: float = 10.0
-    window_seconds: float = 60.0
+    window_seconds: float = field(default_factory=_resolve_default_idle_window)
     kind_weights: dict[str, float] = field(default_factory=_default_kind_weights)
 
 
@@ -192,9 +223,17 @@ class RunScoreboard:
       classifier uses to suppress the first ``validation_failed``
       event in a row. Any non-``validation_failed`` event resets the
       counter to zero.
-    * ``paused`` is sticky: once True the loop refuses to re-emit
-      ``drift_pause_triggered`` even if new evidence accrues. This is
-      the at-most-once contract spelled out at the top of the module.
+    * ``paused`` is sticky on a per-loop-lifetime basis: once True the
+      loop refuses to re-emit ``drift_pause_triggered`` even if new
+      evidence accrues. The MCP-side auto-clear (commit_outputs /
+      get_brief / heartbeat) can flip it back to False when an idle
+      pause is cleared via :func:`clear_pause_state`.
+    * ``last_activity_seq`` records the seq of the most recent
+      "activity" event (``worker_dispatched`` / ``heartbeat`` /
+      ``state_entered``). Idle-window calculations consult the event
+      log when this is set so a long worker dispatch followed by a
+      heartbeat refreshes the budget even though ``runs.last_update_at``
+      hasn't been bumped by the engine itself.
 
     A scoreboard is allocated lazily the first time the loop touches a
     run and lives for the lifetime of the loop task (process
@@ -205,6 +244,64 @@ class RunScoreboard:
     last_seq: int | None = None
     consecutive_validation_failed: int = 0
     paused: bool = False
+    last_activity_at: str | None = None
+
+
+# Event kinds the drift detector treats as "still alive" beats.
+# ``worker_dispatched`` is emitted by ``fsm.get_brief`` when handing a
+# brief to a worker; ``heartbeat`` is the explicit liveness ping; the
+# lifecycle events refresh activity on any real state movement.
+_ACTIVITY_EVENT_KINDS: frozenset[str] = frozenset(
+    {
+        EventKind.worker_dispatched.value,
+        EventKind.heartbeat.value,
+        EventKind.state_entered.value,
+        EventKind.state_exited.value,
+        EventKind.transition_taken.value,
+        EventKind.worker_committed.value,
+    }
+)
+
+
+def clear_pause_state(scoreboards: dict[str, RunScoreboard], run_id: str) -> None:
+    """Reset the in-process ``paused`` sticky flag for ``run_id``.
+
+    The MCP-side auto-clear paths (commit_outputs / get_brief /
+    heartbeat) call this after they have already flipped the persisted
+    ``runs.status`` back to ``in_progress`` so the next sweep does not
+    refuse to score the run.
+
+    Safe to call when the scoreboard is absent (a freshly-restarted
+    supervisor has no in-process scoreboards yet): we just no-op.
+    """
+    sb = scoreboards.get(run_id)
+    if sb is None:
+        return
+    sb.paused = False
+
+
+def only_idle_signals_contributed(
+    signals: Iterable[object],
+) -> bool:
+    """Return True iff every drift signal for the run is ``idle_too_long``.
+
+    Used by the MCP-side auto-clear path to decide whether a paused
+    run is paused purely on the slow-LLM evidence (safe to auto-clear
+    once the LLM proves it is alive) or whether real drift signals
+    (off-allowlist tools, signature mismatch, verifier rejection)
+    participated (must be cleared by an operator via fsm.resume_run).
+    """
+    saw_one = False
+    for sig in signals:
+        saw_one = True
+        kind = getattr(sig, "signal_kind", None)
+        if kind != SignalKind.idle_too_long.value:
+            return False
+    # Defensive: zero signals means nothing contributed, which is not
+    # "idle only" — treat as "needs operator review" to stay on the
+    # conservative side. In practice the caller only invokes this when
+    # at least one signal exists.
+    return saw_one
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +616,13 @@ async def _sweep_once(
                         "event_seq": event.seq,
                     },
                 )
+            if event.kind in _ACTIVITY_EVENT_KINDS:
+                # Activity beat: refresh the in-process activity
+                # timestamp. This is the per-event signal the idle
+                # detector falls back to when the run's
+                # ``last_update_at`` (bumped only by status writes) is
+                # stale because the engine is mid-worker-dispatch.
+                scoreboard.last_activity_at = event.created_at
             if event.seq is not None and (
                 highest_seq is None or event.seq > highest_seq
             ):
@@ -528,15 +632,39 @@ async def _sweep_once(
         # gets re-classified on the next sweep.
         scoreboard.last_seq = highest_seq
 
-        # Idle synthesis. Skip when ``last_update_at`` is unparseable
+        # Per-state idle budget override. The Worker spec field
+        # ``expected_max_wait_seconds`` lets a slow state declare its
+        # own budget (e.g. a 10-minute codebase scan). When set we use
+        # it; otherwise the global ``cfg.window_seconds`` default
+        # applies. Resolution failures (missing spec, no current state,
+        # state has no worker) silently fall back to the global default
+        # — same conservative shape as ``_allowed_tools_for``.
+        effective_window = _effective_idle_window(
+            project, run_summary, default_window=cfg.window_seconds
+        )
+
+        # Idle synthesis. We use the LATER of (a) the run row's
+        # ``last_update_at`` and (b) the scoreboard's
+        # ``last_activity_at`` — the latter captures heartbeat /
+        # worker_dispatched events that refresh liveness without
+        # bumping the run row. Skip when both are unparseable
         # (defensive — the repo always writes a parseable shape) or
         # when the run has produced no event yet (a brand-new run is
         # not "idle" — it's just starting).
         last_update_dt = _parse_iso(run_summary.last_update_at)
-        if last_update_dt is not None:
+        last_activity_dt = _parse_iso(scoreboard.last_activity_at or "")
+        reference_dt: datetime | None
+        if last_update_dt is None:
+            reference_dt = last_activity_dt
+        elif last_activity_dt is None:
+            reference_dt = last_update_dt
+        else:
+            reference_dt = max(last_update_dt, last_activity_dt)
+
+        if reference_dt is not None:
             now = datetime.now(tz=UTC)
-            idle_for = (now - last_update_dt).total_seconds()
-            if idle_for > cfg.window_seconds:
+            idle_for = (now - reference_dt).total_seconds()
+            if idle_for > effective_window:
                 _record_signal(
                     project,
                     run_id=run_id,
@@ -547,7 +675,7 @@ async def _sweep_once(
                     ),
                     payload={
                         "idle_seconds": idle_for,
-                        "window_seconds": cfg.window_seconds,
+                        "window_seconds": effective_window,
                     },
                 )
 
@@ -613,6 +741,63 @@ def _allowed_tools_for(project: Project, run_summary: object) -> list[str]:
             return [str(t) for t in tools]
         return []
     return []
+
+
+def _effective_idle_window(
+    project: Project,
+    run_summary: object,
+    *,
+    default_window: float,
+) -> float:
+    """Return the idle window budget for ``run_summary``'s current state.
+
+    Precedence (most-specific wins):
+
+    1. The current state's :attr:`Worker.expected_max_wait_seconds`
+       — set when a spec author has declared an explicit per-state
+       budget. Looped states read it from ``state.loop.worker``.
+    2. The ``default_window`` argument — usually
+       ``DriftConfig.window_seconds`` which itself respects the
+       ``CTXR_FSM_IDLE_TIMEOUT_SECONDS`` env override.
+
+    Any lookup failure (no current_state, missing spec row, no worker
+    on the current state, etc.) falls through to the default — the
+    drift detector must never crash because of a benign spec gap.
+    """
+    current_state = getattr(run_summary, "current_state", None)
+    fsm_spec_id = getattr(run_summary, "fsm_spec_id", None)
+    if not current_state or not fsm_spec_id:
+        return default_window
+    with project.session_factory() as session:
+        spec = project.specs.get(session, fsm_spec_id)
+    if spec is None:
+        return default_window
+    states = spec.definition.get("states") if isinstance(spec.definition, dict) else None
+    if not isinstance(states, list):
+        return default_window
+    for state_def in states:
+        if not isinstance(state_def, dict):
+            continue
+        if state_def.get("id") != current_state:
+            continue
+        worker = state_def.get("worker")
+        if not isinstance(worker, dict):
+            loop = state_def.get("loop")
+            if isinstance(loop, dict):
+                worker = loop.get("worker")
+        if not isinstance(worker, dict):
+            return default_window
+        raw = worker.get("expected_max_wait_seconds")
+        if raw is None:
+            return default_window
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError):
+            return default_window
+        if parsed <= 0:
+            return default_window
+        return parsed
+    return default_window
 
 
 def _record_signal(

@@ -172,6 +172,16 @@ class EventKind(StrEnum):
     tool_call_observed = "tool_call_observed"
     drift_signal_recorded = "drift_signal_recorded"
     drift_pause_triggered = "drift_pause_triggered"
+    # Drift-friendly liveness signals (long-LLM-friendliness fix).
+    # ``heartbeat`` is emitted by ``fsm.heartbeat`` so an orchestrator can
+    # actively assert "still alive" while a long worker call is in flight;
+    # ``drift_pause_cleared`` is emitted when an idle-only pause is
+    # auto-cleared by activity (worker_dispatched / heartbeat / commit).
+    # ``worker_dispatched`` already existed in the enum but was unused;
+    # ``fsm.get_brief`` now emits it for every worker-bearing state so
+    # the drift detector treats brief hand-off as activity.
+    heartbeat = "heartbeat"
+    drift_pause_cleared = "drift_pause_cleared"
     verifier_passed = "verifier_passed"
     verifier_rejected = "verifier_rejected"
     commit_token_issued = "commit_token_issued"
@@ -386,6 +396,16 @@ class Worker(BaseModel):
     inputs: list[str] = Field(default_factory=list)
     response_schema: ResponseSchema | None = None
     inputs_schema: ResponseSchema | None = None
+    expected_max_wait_seconds: int | None = Field(
+        default=None,
+        description=(
+            "Optional per-state idle budget the drift detector honours "
+            "instead of the global default. Spec authors set this when a "
+            "worker is known to take longer than the global idle window "
+            "(e.g. a multi-minute codebase scan). When None the drift "
+            "detector falls back to DriftConfig.window_seconds."
+        ),
+    )
 
     @field_validator("role", "prompt_template")
     @classmethod
@@ -411,6 +431,18 @@ class Worker(BaseModel):
                 "(or omitted entirely if no hint applies)"
             )
         return stripped
+
+    @field_validator("expected_max_wait_seconds")
+    @classmethod
+    def _expected_max_wait_positive(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        if value <= 0:
+            raise ValueError(
+                "expected_max_wait_seconds must be a positive integer "
+                "(or omitted entirely to use the global drift window)"
+            )
+        return value
 
 
 class VerifierSpec(BaseModel):
