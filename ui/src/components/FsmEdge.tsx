@@ -208,39 +208,27 @@ function longestSegmentMidpoint(
   const vertical =
     sPos === Position.Top || sPos === Position.Bottom ||
     tPos === Position.Top || tPos === Position.Bottom;
-  const pts: Array<[number, number]> = vertical
-    ? (() => {
-        const mid = (sy + ty) / 2;
-        return [
-          [sx, sy],
-          [sx, mid],
-          [tx, mid],
-          [tx, ty],
-        ];
-      })()
-    : (() => {
-        const mid = (sx + tx) / 2;
-        return [
-          [sx, sy],
-          [mid, sy],
-          [mid, ty],
-          [tx, ty],
-        ];
-      })();
-  let best = -1;
-  let bx = pts[0][0];
-  let by = pts[0][1];
-  for (let i = 0; i < pts.length - 1; i++) {
-    const [x1, y1] = pts[i];
-    const [x2, y2] = pts[i + 1];
-    const len = Math.abs(x2 - x1) + Math.abs(y2 - y1);
-    if (len > best) {
-      best = len;
-      bx = (x1 + x2) / 2;
-      by = (y1 + y2) / 2;
+  // Criterion 7: anchor label on the CROSS segment (horizontal in TB,
+  // vertical in LR). For sibling edges that share both endpoints' axis
+  // (rare), use the midpoint of the longest segment. Multi-sibling
+  // staggering is handled by the caller passing siblingIndex/total.
+  if (vertical) {
+    const mid = (sy + ty) / 2;
+    // Cross segment is from (sx, mid) to (tx, mid). When source and
+    // target are vertically aligned (sx == tx) the cross has zero
+    // length — use the stub midpoint as fallback so the label still
+    // sits ON the line.
+    if (sx !== tx) {
+      return [(sx + tx) / 2, mid];
     }
+    return [sx, mid];
+  } else {
+    const mid = (sx + tx) / 2;
+    if (sy !== ty) {
+      return [mid, (sy + ty) / 2];
+    }
+    return [mid, sy];
   }
-  return [bx, by];
 }
 
 export function FsmEdge(props: EdgeProps): JSX.Element {
@@ -287,24 +275,21 @@ export function FsmEdge(props: EdgeProps): JSX.Element {
     });
   }
 
-  // Prefer the layout-assigned label position when FlowGraph captured
-  // one for this edge. ELK's pass writes ``data.layoutLabel``; the
-  // legacy dagre pass writes ``data.dagreLabel`` (kept for backwards
-  // compatibility on the ?layout=dagre fallback). Fallback is the
-  // geometric longest-segment midpoint: it still wins for edges added
-  // by ad-hoc callers that bypass either layout (e.g. unit-test
-  // fixtures).
-  const layoutLabelPos = ed.layoutLabel ?? ed.dagreLabel;
-  const [labelX, labelY] = layoutLabelPos
-    ? [layoutLabelPos.x, layoutLabelPos.y]
-    : longestSegmentMidpoint(
-        sourceX,
-        sourceY,
-        targetX,
-        targetY,
-        sourcePosition,
-        targetPosition,
-      );
+  // Criterion 7: labels must sit ON the actual line xyflow renders.
+  // Neither dagre's reserved label position nor ELK's edgeLabels.placement
+  // CENTER consistently coincides with the orthogonal smooth-step
+  // polyline we draw (dagre uses graph coords from its own routing
+  // diagram; ELK occasionally drops labels onto the perpendicular stub).
+  // Always anchor on the longest-segment midpoint so the line visually
+  // passes through the pill's geometric centre.
+  const [labelX, labelY] = longestSegmentMidpoint(
+    sourceX,
+    sourceY,
+    targetX,
+    targetY,
+    sourcePosition,
+    targetPosition,
+  );
   const fullText = typeof ed.fullLabel === 'string' && ed.fullLabel.length > 0
     ? ed.fullLabel
     : typeof label === 'string'
@@ -378,24 +363,24 @@ export function FsmEdge(props: EdgeProps): JSX.Element {
               // text mid-character. The Tooltip below still surfaces
               // the full text on hover for any edge label long enough
               // to feel cramped.
+              // Criterion 7: pill must fully mask the line behind it.
+              // Solid (no opacity) background + relative z-index so the
+              // edge stroke passes UNDER the pill, making it visually
+              // read as "line enters one side, exits the other".
               const badgeClass = isPredicate
                 ? [
-                    'inline-block max-w-[280px] whitespace-normal break-words cursor-pointer text-left',
+                    'inline-block max-w-[170px] whitespace-normal break-words cursor-pointer text-left relative z-10',
                     'rounded px-1.5 py-0.5 text-[10px] leading-tight font-semibold font-mono',
-                    // Dark amber background in BOTH themes so the
-                    // syntax-coloured tokens (lime / cyan / fuchsia /
-                    // amber-50) stay legible. The previous light-mode
-                    // amber-100 background washed light tokens out.
-                    'bg-amber-900/80 dark:bg-amber-900/70',
+                    'bg-amber-900 dark:bg-amber-900',
                     'border border-amber-500 dark:border-amber-600',
                     'text-amber-50',
                     'focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500',
                   ].join(' ')
                 : [
-                    'inline-block max-w-[280px] whitespace-normal break-words cursor-pointer text-left',
+                    'inline-block max-w-[170px] whitespace-normal break-words cursor-pointer text-left relative z-10',
                     'rounded px-1.5 py-0.5 text-[10px] leading-tight',
-                    'bg-[var(--xy-label-bg,#f8fafc)]/90',
-                    'border border-slate-200 dark:border-slate-700',
+                    'bg-white dark:bg-slate-800',
+                    'border border-slate-300 dark:border-slate-600',
                     'text-slate-700 dark:text-slate-200',
                     'focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500',
                   ].join(' ');

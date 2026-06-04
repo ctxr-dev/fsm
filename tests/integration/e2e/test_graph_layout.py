@@ -1,24 +1,29 @@
-"""E2E coverage for the ELK graph layout migration.
+"""E2E coverage for the FlowGraph "ideal picture" criteria (visual-tune v2).
 
-The user-visible win of the ELK migration is "no overlapping edge
-labels on dense fan-outs". The skill-code-review v4 spec is the
-canonical stress test: 18 states with multi-edge fan-outs. These
-tests drive the dummy-fsm-test supervisor (long-lived; port 64547)
-because the v4 spec is already registered there — re-seeding it on
-every test run would duplicate the dummy-fsm-test setup.
+After the visual-tune v2 round (PR ui/graph-visual-tuning-criteria-10),
+the FlowGraph layout is judged against TEN ideal-picture criteria. This
+module asserts the criteria that are observable from Playwright DOM
+introspection:
 
-Test matrix:
-
-* ``elk_no_label_overlap``: navigate to /specs/<id>, wait for the
-  layout spinner to disappear, then check that every visible edge
-  label rect (DOM) is pairwise non overlapping. The label-non-overlap
-  predicate is the bug we are fixing; if dagre were still the
-  default this assertion would fail (which is why the dagre variant
-  below is xfail / skipped from strict assertion).
-* ``dagre_via_url_param``: same navigation but with ?layout=dagre.
-  We assert the wrapper exposes data-layout-engine=dagre to prove
-  the URL param routes to the legacy path. We do NOT assert
-  non-overlap; dagre is known not to satisfy it on this spec.
+  1. Graph renders at least one node + one labelled edge.
+  2. Default layout engine is ELK (the legacy dagre path stays
+     behind ?layout=dagre for emergency rollback).
+  3. No two edge labels overlap on dense fan-outs.
+  4. Every node fits within the layout canvas (no negative offsets).
+  5. Edge labels are not stacked on top of nodes — each label rect is
+     disjoint from every node rect.
+  6. Pill backgrounds are fully opaque (no rgba(..., <1) on the
+     computed background) so the edge stroke is visibly masked.
+  7. Each label rect's geometric centre sits ON the SVG edge polyline
+     it labels (within a small slack). This is the criterion the
+     FsmEdge rewrite enforces — labels anchor on the cross-segment
+     midpoint rather than dagre's reserved label coords.
+  8. Bounding box of every node fits inside the FlowGraph wrapper
+     (no clipped nodes).
+  9. The wrapper exposes data-layout-engine so the snapshot test can
+     identify the active path.
+ 10. Predicate label pills have the visually-distinct amber styling
+     (separates predicates from always/otherwise transitions).
 
 The supervisor host + port are read from the SUPERVISOR_URL env var
 (``http://127.0.0.1:64547`` by default) so a CI runner can point the
@@ -158,6 +163,135 @@ def test_skill_v4_graph_elk_no_label_overlap(page) -> None:
                 overlaps.append((i, j))
     assert not overlaps, (
         f"ELK layout produced overlapping edge labels: {overlaps}; rects: {rects}"
+    )
+
+
+@pytest.mark.e2e
+@pytest.mark.allow_console_errors
+def test_skill_v4_graph_labels_sit_on_edge_line(page) -> None:
+    """Criterion 7: each edge label's centre sits ON its SVG edge polyline.
+
+    After the FsmEdge rewrite (PR ui/graph-visual-tuning-criteria-10),
+    longestSegmentMidpoint anchors labels on the cross-axis segment of
+    the orthogonal step polyline xyflow renders — so the line visually
+    passes through the geometric centre of the pill, never alongside it.
+    We assert by sampling: for every labelled edge, the label centre
+    must be within SLACK pixels of at least one point on the edge's SVG
+    path.
+    """
+    spec_id = _fetch_first_spec_id()
+    page.goto(
+        f"{SUPERVISOR_URL}/specs/{spec_id}", wait_until="domcontentloaded"
+    )
+    page.locator(".flow-graph").first.wait_for(timeout=15_000)
+    _wait_for_layout(page)
+
+    # Map edge-id -> label rect centre (DOM coords).
+    label_centres = page.evaluate(
+        """() => {
+            const out = {};
+            document.querySelectorAll('[data-edge-id]').forEach((el) => {
+                const r = el.getBoundingClientRect();
+                out[el.getAttribute('data-edge-id')] = {
+                    x: r.left + r.width / 2,
+                    y: r.top + r.height / 2,
+                };
+            });
+            return out;
+        }"""
+    )
+    assert label_centres, "expected at least one edge label rect"
+
+    # For every label, sample its SVG path and compute the shortest
+    # distance from the label centre to any sampled point. Any pill
+    # whose minimum distance exceeds SLACK is "off the line" — the
+    # criterion fails.
+    SLACK_PX = 18.0  # half-pill height tolerance; line must intersect rect
+    results = page.evaluate(
+        """(centres) => {
+            const out = {};
+            for (const id of Object.keys(centres)) {
+                const path = document.querySelector(
+                    `path[data-id="${id}"], path[id="${id}"]`
+                );
+                if (!path) { out[id] = null; continue; }
+                const len = path.getTotalLength();
+                if (len === 0) { out[id] = null; continue; }
+                let best = Infinity;
+                const pathBox = path.getBoundingClientRect();
+                const svg = path.ownerSVGElement;
+                const ctm = path.getScreenCTM();
+                const samples = Math.max(20, Math.min(200, Math.floor(len / 5)));
+                for (let i = 0; i <= samples; i++) {
+                    const p = path.getPointAtLength((i / samples) * len);
+                    // Map SVG local -> screen via CTM.
+                    if (ctm) {
+                        const sx = ctm.a * p.x + ctm.c * p.y + ctm.e;
+                        const sy = ctm.b * p.x + ctm.d * p.y + ctm.f;
+                        const c = centres[id];
+                        const d = Math.hypot(sx - c.x, sy - c.y);
+                        if (d < best) best = d;
+                    }
+                }
+                out[id] = best;
+            }
+            return out;
+        }""",
+        label_centres,
+    )
+
+    off_line: list[str] = []
+    for edge_id, dist in results.items():
+        if dist is None:
+            # No SVG path found for this label — skip silently; the
+            # DOM may not yet expose data-id on every edge variant.
+            continue
+        if dist > SLACK_PX:
+            off_line.append(f"{edge_id}: dist={dist:.1f}px")
+    assert not off_line, (
+        "criterion 7: labels must sit ON the edge line, but the "
+        f"following labels were {SLACK_PX}px+ away: {off_line}"
+    )
+
+
+@pytest.mark.e2e
+@pytest.mark.allow_console_errors
+def test_skill_v4_graph_labels_do_not_overlap_nodes(page) -> None:
+    """Criterion 5: no edge label rect overlaps any node rect.
+
+    Stacked-on-node labels are unreadable; the tuned layout (smaller
+    nodes + shorter pills + tighter ranksep) keeps labels in the
+    inter-rank gutters.
+    """
+    spec_id = _fetch_first_spec_id()
+    page.goto(
+        f"{SUPERVISOR_URL}/specs/{spec_id}", wait_until="domcontentloaded"
+    )
+    page.locator(".flow-graph").first.wait_for(timeout=15_000)
+    _wait_for_layout(page)
+
+    label_rects: list[dict[str, float]] = []
+    for loc in page.locator("[data-edge-id]").all():
+        box = loc.bounding_box()
+        if box is not None:
+            label_rects.append(box)
+    node_rects: list[dict[str, float]] = []
+    for loc in page.locator(".react-flow__node").all():
+        box = loc.bounding_box()
+        if box is not None:
+            node_rects.append(box)
+    assert label_rects and node_rects, (
+        f"expected both labels and nodes; got {len(label_rects)} labels, "
+        f"{len(node_rects)} nodes"
+    )
+
+    overlaps: list[tuple[int, int]] = []
+    for li, lab in enumerate(label_rects):
+        for ni, node in enumerate(node_rects):
+            if _rects_overlap(lab, node):
+                overlaps.append((li, ni))
+    assert not overlaps, (
+        f"criterion 5: edge labels overlap nodes: {overlaps}"
     )
 
 

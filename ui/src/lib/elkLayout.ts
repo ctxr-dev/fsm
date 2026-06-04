@@ -129,11 +129,16 @@ const DEFAULT_LAYOUT_OPTIONS: LayoutOptions = {
   // perpendicular to the edge centreline, above it where possible.
   'elk.edgeLabels.placement': 'CENTER',
   'elk.edgeLabels.inline': 'false',
-  'elk.layered.spacing.nodeNodeBetweenLayers': '80',
-  'elk.layered.spacing.edgeNodeBetweenLayers': '30',
-  'elk.spacing.nodeNode': '80',
-  'elk.spacing.componentComponent': '100',
-  'elk.padding': '[top=40,left=40,bottom=40,right=40]',
+  // Visual-tune v2: shrink between-layer spacing so straight chains
+  // collapse vertically (matches dagre's longest-path ranker tuning);
+  // widen sibling spacing (nodeNode) so predicate pills don't stack
+  // on dense fan-outs. Padding shrunk to match the dagre marginx/y
+  // = 16/12 tuning so first-paint fitView leaves minimal slack.
+  'elk.layered.spacing.nodeNodeBetweenLayers': '50',
+  'elk.layered.spacing.edgeNodeBetweenLayers': '24',
+  'elk.spacing.nodeNode': '130',
+  'elk.spacing.componentComponent': '60',
+  'elk.padding': '[top=12,left=16,bottom=12,right=16]',
   'elk.layered.crossingMinimization.strategy': 'LAYER_SWEEP',
   'elk.layered.layering.strategy': 'NETWORK_SIMPLEX',
 };

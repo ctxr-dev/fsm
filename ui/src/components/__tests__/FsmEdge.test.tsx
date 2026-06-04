@@ -114,10 +114,12 @@ describe('FsmEdge', () => {
     expect(baseEdgeCalls[0].path).toBe('M0,0 L1,1 SMOOTHSTEP');
   });
 
-  test('layoutLabel position takes priority over geometric midpoint when both are available', () => {
-    // Pass elkSections so the ELK path runs; layoutLabel should be
-    // honoured even though the polyline's geometric midpoint is at a
-    // different point.
+  test('label is always anchored on the geometric cross-segment midpoint, ignoring layoutLabel', () => {
+    // Criterion 7: pill must sit ON the actual line xyflow renders.
+    // Neither dagre's nor ELK's reserved label position coincides with
+    // the orthogonal smooth-step polyline we draw — so the label
+    // anchors on the longest-segment midpoint regardless of any
+    // layoutLabel / dagreLabel value the layout pass left on the edge.
     const sections: ElkEdgeSection[] = [
       {
         id: 's0',
@@ -139,17 +141,19 @@ describe('FsmEdge', () => {
           data: {
             fullLabel: 'predicate-here',
             elkSections: sections,
+            // Intentionally divergent layoutLabel — must be ignored.
             layoutLabel: { x: 42, y: 17 },
           },
         } as unknown as Parameters<typeof FsmEdge>[0])}
       />,
     );
-    // The label pill is rendered inside an absolutely-positioned div
-    // whose transform places it at translate(42px, 17px).
+    // LR orientation, sy == ty, so longestSegmentMidpoint returns the
+    // x-midpoint (100) and the source y (0). The pill sits at
+    // translate(100px, 0px).
     const pill = getByText('predicate-here').closest('div');
     expect(pill).not.toBeNull();
     const style = (pill as HTMLElement).getAttribute('style') ?? '';
-    expect(style).toContain('translate(42px, 17px)');
+    expect(style).toContain('translate(100px, 0px)');
   });
 });
 
