@@ -152,8 +152,8 @@ export interface FlowGraphProps {
 // line and the kind badge no longer competes for horizontal room.
 // Dagre layout constants below are tuned proportionally to keep edges
 // clear of the larger node boxes.
-const NODE_WIDTH = 270;
-const NODE_HEIGHT = 84;
+const NODE_WIDTH = 200;
+const NODE_HEIGHT = 64;
 
 const NODE_KIND_CLASSES: Record<FlowNodeKind, string> = {
   state:
@@ -586,9 +586,9 @@ const EDGE_TYPES = { fsmEdge: FsmEdge };
  * the dropped label. Multigraph mode requires a per-edge `name` so
  * dagre distinguishes parallel edges; we pass the React Flow edge id.
  */
-// LABEL_PILL_MAX_WIDTH must match the FsmEdge pill's `max-w-[280px]`
+// LABEL_PILL_MAX_WIDTH must match the FsmEdge pill's `max-w-[170px]`
 // so dagre reserves slack matching the actual rendered width.
-const LABEL_PILL_MAX_WIDTH = 280;
+const LABEL_PILL_MAX_WIDTH = 170;
 // Width per glyph for the 10px non-monospace UI font used inside the
 // FsmEdge pill. The previous 7px estimate UNDERshot real rendered
 // width because the syntax-coloured token spans use a mix of bold +
@@ -646,14 +646,20 @@ function applyDagreLayout(
   //   nodesep: 280  horizontal gap between sibling nodes in same rank
   //   ranksep: 120  vertical gap between consecutive ranks (smaller)
   //   edgesep:  72  minimum gap between adjacent edges
+  // TB layout for 15-state chain with branches: wide horizontal slack
+  // (nodesep) keeps sibling predicate pills from stacking; ranks tight
+  // since longest-path collapses straight chains and we rely on fitView
+  // to scale the result. Predicate pills are anchored on cross-segment
+  // midpoints so a tight ranksep is fine — adjacent ranks' labels live
+  // on different horizontal segments and don't touch.
   g.setGraph({
     rankdir: direction,
-    nodesep: 280,
-    ranksep: 120,
-    edgesep: 72,
-    marginx: 48,
-    marginy: 48,
-    ranker: nodes.length > 8 ? 'network-simplex' : 'tight-tree',
+    nodesep: 130,
+    ranksep: 50,
+    edgesep: 24,
+    marginx: 16,
+    marginy: 12,
+    ranker: 'longest-path',
   });
   for (const n of nodes) {
     // PR 5: respect per-node width/height when the caller already
@@ -1226,7 +1232,9 @@ export function FlowGraph({
         // the operator has zoomed/panned and the viewport is saved,
         // restoring it on remount beats re-framing the whole graph.
         fitView={viewport.defaultViewport === undefined}
-        fitViewOptions={{ padding: 0.2, includeHiddenNodes: false }}
+        fitViewOptions={{ padding: 0.05, includeHiddenNodes: false, minZoom: 0.2, maxZoom: 1.5 }}
+        minZoom={0.15}
+        maxZoom={2}
         defaultViewport={viewport.defaultViewport}
         onMove={viewportKey ? viewport.onMove : undefined}
         // Wheel = pan vertically (xyflow's panOnScroll). The wrapper
