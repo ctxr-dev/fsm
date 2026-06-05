@@ -85,6 +85,12 @@ export interface FsmEdgeData extends Record<string, unknown> {
   isHovered?: boolean;
   highlighted?: boolean;
   dimmed?: boolean;
+  /** Detail level mirrored from the node-side render so the label pill
+   *  can shrink at compact zoom. At 'compact' we render a small 14x14
+   *  pip instead of the multi-line predicate badge; the pip carries
+   *  the kind colour and acts as a click target. The full pill returns
+   *  when the operator zooms in past the threshold. */
+  detailLevel?: 'full' | 'compact';
 }
 
 /**
@@ -275,21 +281,22 @@ export function FsmEdge(props: EdgeProps): JSX.Element {
     });
   }
 
-  // Criterion 7: labels must sit ON the actual line xyflow renders.
-  // Neither dagre's reserved label position nor ELK's edgeLabels.placement
-  // CENTER consistently coincides with the orthogonal smooth-step
-  // polyline we draw (dagre uses graph coords from its own routing
-  // diagram; ELK occasionally drops labels onto the perpendicular stub).
-  // Always anchor on the longest-segment midpoint so the line visually
-  // passes through the pill's geometric centre.
-  const [labelX, labelY] = longestSegmentMidpoint(
-    sourceX,
-    sourceY,
-    targetX,
-    targetY,
-    sourcePosition,
-    targetPosition,
-  );
+  // Prefer the layout engine's reserved label anchor when present —
+  // ELK (or dagre) ran a label-aware routing pass so its anchor sits
+  // on the polyline AND doesn't collide with sibling labels on a
+  // fan-out. Geometric longest-segment midpoint is the unit-test /
+  // no-layout fallback only.
+  const layoutAnchor = ed.layoutLabel ?? ed.dagreLabel;
+  const [labelX, labelY] = layoutAnchor
+    ? [layoutAnchor.x, layoutAnchor.y]
+    : longestSegmentMidpoint(
+        sourceX,
+        sourceY,
+        targetX,
+        targetY,
+        sourcePosition,
+        targetPosition,
+      );
   const fullText = typeof ed.fullLabel === 'string' && ed.fullLabel.length > 0
     ? ed.fullLabel
     : typeof label === 'string'
@@ -357,6 +364,37 @@ export function FsmEdge(props: EdgeProps): JSX.Element {
               // why the FSM branched.
               const kind = ed.kind;
               const isPredicate = kind === 'deterministic' || kind === 'judgement';
+              const isCompact = ed.detailLevel === 'compact';
+              // Compact pip: at low zoom, the multi-line predicate badge
+              // overflows the node footprint and rams into neighbours.
+              // Replace it with a 14x14 dot in the kind colour. Hover +
+              // click still surface the full text (Tooltip + the
+              // existing onLabelClick path), so no information is lost —
+              // the operator zooms in or clicks for detail.
+              if (isCompact) {
+                const pipClass = [
+                  'relative z-10 inline-block rounded-full cursor-pointer',
+                  isPredicate
+                    ? 'bg-amber-700 border border-amber-500'
+                    : 'bg-slate-500 dark:bg-slate-400 border border-slate-700 dark:border-slate-300',
+                  'focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500',
+                ].join(' ');
+                return (
+                  <Tooltip content={fullText} delay={400}>
+                    <button
+                      type="button"
+                      class={pipClass}
+                      // eslint-disable-next-line react/forbid-dom-props -- fixed pip dimensions
+                      style={{ width: '14px', height: '14px', padding: 0 }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onLabelClick?.(id, ed as Record<string, unknown>);
+                      }}
+                      aria-label={`Inspect transition: ${fullText}`}
+                    />
+                  </Tooltip>
+                );
+              }
               // W23b regression fix: no max-w + no truncate. Labels are
               // typically short DSL predicates; a 280px soft cap with
               // wrapping handles the rare long case without cutting

@@ -557,6 +557,38 @@ export function RunDetailRoute(): JSX.Element {
 
   const nodeIndex = useMemo(() => indexStateNodes(stateTree), [stateTree]);
 
+  // Clean-slate rebuild: single sheet opener used by the graph node
+  // click, the loop chip click, AND the "Iterations" chip strip inside
+  // StateEntrySheetBody. Wiring all three to one helper keeps the
+  // per-entry title + content composition in one place; the strip
+  // re-uses ``openIteration`` via the ``onSelectIteration`` prop so
+  // clicking a sibling iteration replaces the current sheet with a
+  // fresh one pointed at the picked entry_id.
+  const openIteration = useCallback(
+    (entryId: string) => {
+      const entry = nodeIndex.get(entryId);
+      const stateLabel = entry?.state_id ?? entryId;
+      const iterLabel =
+        entry?.iteration_n != null ? ` · iter ${entry.iteration_n}` : '';
+      openStateEntrySheetOpener({
+        entryId,
+        runId,
+        title: `State entry · ${stateLabel}${iterLabel}`,
+        content: (
+          <StateEntrySheetBody
+            entryId={entryId}
+            runId={runId}
+            stateTree={stateTree}
+            spec={spec}
+            events={events}
+            onSelectIteration={(next) => openIteration(next)}
+          />
+        ),
+      });
+    },
+    [nodeIndex, runId, stateTree, spec, events],
+  );
+
   // W18d: subscribe to the cross-pane filter set so the timeline
   // rerenders when chips change. The right column applies the filter
   // before passing events into RunEventTimeline.
@@ -817,7 +849,6 @@ export function RunDetailRoute(): JSX.Element {
         class="grid grid-cols-1 lg:grid-cols-2 gap-4 flex-1 min-h-0"
         data-testid="run-detail-grid"
       >
-        {/* LEFT — run progress graph */}
         <RunProgressGraph
           manifest={run.manifest}
           stateTree={stateTree}
@@ -844,20 +875,7 @@ export function RunDetailRoute(): JSX.Element {
                 target = node.entry_id;
               }
             }
-            openStateEntrySheetOpener({
-              entryId: target,
-              runId: runId,
-              title: `State entry · ${stateId}`,
-              content: (
-                <StateEntrySheetBody
-                  entryId={target}
-                  runId={runId}
-                  stateTree={stateTree}
-                  spec={spec}
-                  events={events}
-                />
-              ),
-            });
+            openIteration(target);
           }}
           onEdgeClick={(fromId, toId) => {
             openEdgeSheetOpener({
@@ -878,29 +896,10 @@ export function RunDetailRoute(): JSX.Element {
             });
           }}
           onIterationClick={(entryId) => {
-            // PR 5: loop chip click. The entry_id is the exact iteration
-            // the operator picked, so we open StateEntrySheetBody with
-            // THAT entry_id (not the loop state's first entry).
-            const entry = nodeIndex.get(entryId);
-            const stateLabel = entry?.state_id ?? entryId;
-            const iterLabel =
-              entry?.iteration_n != null
-                ? ` · iter ${entry.iteration_n}`
-                : '';
-            openStateEntrySheetOpener({
-              entryId,
-              runId: runId,
-              title: `State entry · ${stateLabel}${iterLabel}`,
-              content: (
-                <StateEntrySheetBody
-                  entryId={entryId}
-                  runId={runId}
-                  stateTree={stateTree}
-                  spec={spec}
-                  events={events}
-                />
-              ),
-            });
+            // Clean-slate rebuild: loop chip click still routes through
+            // openIteration so a future on-graph affordance can drop in
+            // without re-implementing the sheet opener.
+            openIteration(entryId);
           }}
         />
 

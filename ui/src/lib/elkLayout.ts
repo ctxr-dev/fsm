@@ -42,9 +42,11 @@ import type { Edge, Node } from '@xyflow/react';
 
 // Default node dimensions when a caller didn't pre-stamp width/height.
 // Kept in sync with FlowGraph's NODE_WIDTH / NODE_HEIGHT so the two
-// layout engines reserve the same slack.
-const DEFAULT_NODE_WIDTH = 270;
-const DEFAULT_NODE_HEIGHT = 84;
+// layout engines reserve the same slack. Clean-slate rebuild: every
+// node uses 200x80 (loop nodes included — the chip strip moved to the
+// inspector Sheet, so the card no longer needs extra width).
+const DEFAULT_NODE_WIDTH = 160;
+const DEFAULT_NODE_HEIGHT = 60;
 
 /**
  * Singleton ELK instance. Construction is cheap (the bundle is the
@@ -117,30 +119,33 @@ export class ElkLayoutError extends Error {
  *     enough breathing room so a 15-state spec doesn't sprawl off the
  *     viewport but also doesn't pack edges through node corners.
  */
+// Clean-slate rebuild options. `inline=true` is the load-bearing
+// change: it tells ELK to route the edge polyline THROUGH the label
+// rectangle (rather than perpendicular to it), so the line visually
+// passes behind a pill that has a solid background. Combined with
+// NETWORK_SIMPLEX node placement and bk edge-straightening, the result
+// is a layout where every edge crosses its label centrally and the
+// polylines bend in as few places as possible.
 const DEFAULT_LAYOUT_OPTIONS: LayoutOptions = {
   'elk.algorithm': 'layered',
   'elk.direction': 'DOWN',
   'elk.layered.edgeRouting': 'ORTHOGONAL',
-  'elk.spacing.edgeLabel': '14',
-  'elk.layered.edgeLabels.sideSelection': 'SMART_UP',
-  // CENTER placement is what actually makes ELK position each label
-  // along the edge (the default 'HEAD'/'TAIL' modes leave x/y at 0).
-  // Combined with sideSelection: SMART_UP this lands the label
-  // perpendicular to the edge centreline, above it where possible.
   'elk.edgeLabels.placement': 'CENTER',
-  'elk.edgeLabels.inline': 'false',
-  // Visual-tune v2: shrink between-layer spacing so straight chains
-  // collapse vertically (matches dagre's longest-path ranker tuning);
-  // widen sibling spacing (nodeNode) so predicate pills don't stack
-  // on dense fan-outs. Padding shrunk to match the dagre marginx/y
-  // = 16/12 tuning so first-paint fitView leaves minimal slack.
+  // inline=true: edge polyline passes THROUGH the label rectangle so
+  // the rendered FsmEdge pill sits ON the line (criterion 7). With
+  // a small label box reservation, this keeps layer-to-layer gap
+  // narrow because the label parallel-extent gets absorbed into the
+  // existing layer-to-layer gap rather than added.
+  'elk.edgeLabels.inline': 'true',
+  'elk.spacing.edgeLabel': '6',
   'elk.layered.spacing.nodeNodeBetweenLayers': '50',
   'elk.layered.spacing.edgeNodeBetweenLayers': '24',
   'elk.spacing.nodeNode': '130',
   'elk.spacing.componentComponent': '60',
   'elk.padding': '[top=12,left=16,bottom=12,right=16]',
   'elk.layered.crossingMinimization.strategy': 'LAYER_SWEEP',
-  'elk.layered.layering.strategy': 'NETWORK_SIMPLEX',
+  'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX',
+  'elk.layered.nodePlacement.bk.edgeStraightening': 'IMPROVE_STRAIGHTNESS',
 };
 
 interface NodeWithLayoutDims {

@@ -327,28 +327,30 @@ describe('specToGraph', () => {
     ).toBe(0);
   });
 
-  test('PR 5: loop node carries width/height baked from max_iterations', () => {
-    // 5 chips × 40px + 270px header = 470px
+  test('clean-slate: loop node carries no pre-baked width (uniform card size)', () => {
+    // Clean-slate rebuild: the loop chip strip moved to the inspector
+    // Sheet, so a loop card is the same dimensions as every other node.
+    // specToGraph leaves width/height unset; FlowGraph fills in the
+    // uniform NODE_WIDTH/NODE_HEIGHT defaults during the layout pass.
     const g = specToGraph({
       states: [{ id: 'l', kind: 'loop', loop: { max_iterations: 5 } }],
     });
-    expect(g.nodes[0].width).toBe(270 + 5 * 40);
-    expect(g.nodes[0].height).toBeGreaterThan(0);
+    expect(g.nodes[0].width).toBeUndefined();
+    expect(g.nodes[0].height).toBeUndefined();
   });
 
-  test('PR 5: loop width caps at LOOP_NODE_CHIP_VISIBLE_MAX (20)', () => {
-    // 200 iterations capped at 20 chips × 40 + 270 = 1070px (not 8270)
+  test('clean-slate: a 200-iteration loop spec still emits a uniform-size node', () => {
     const g = specToGraph({
       states: [{ id: 'l', kind: 'loop', loop: { max_iterations: 200 } }],
     });
-    expect(g.nodes[0].width).toBe(270 + 20 * 40);
+    expect(g.nodes[0].width).toBeUndefined();
   });
 
-  test('PR 5: loop with 0 iterations gets header-only width', () => {
+  test('clean-slate: loop with 0 iterations is still uniform-size', () => {
     const g = specToGraph({
       states: [{ id: 'l', kind: 'loop', loop: {} }],
     });
-    expect(g.nodes[0].width).toBe(270);
+    expect(g.nodes[0].width).toBeUndefined();
   });
 
   test('W21: bare predicate-string when is treated as deterministic', () => {

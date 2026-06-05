@@ -19,7 +19,6 @@
 import type { Edge, Node } from '@xyflow/react';
 
 import type { FlowNodeData } from '../components/FlowGraph';
-import { LOOP_NODE_HEIGHT, loopNodeExpandedWidth } from '../components/FlowGraph';
 import type { Event as FsmEvent, RunManifest, StateNode } from './api';
 
 /**
@@ -246,24 +245,10 @@ export function overlayRunOnSpecGraph(
     const iterationEntries =
       overlay.iterationEntriesByStateId.get(stateId) ?? [];
     const iterationCount = iterationEntries.length;
-    // Re-derive the per-node width from the OBSERVED iteration count
-    // when it exceeds the spec-declared ceiling (defensive: a loop
-    // that ran past its declared max_iterations because the engine
-    // bumped the cap mid-run would otherwise have its chips clipped
-    // off the right edge of the card).
-    const isLoop =
-      typeof (node.data as { isLoop?: boolean }).isLoop === 'boolean'
-        ? (node.data as { isLoop?: boolean }).isLoop === true
-        : false;
-    const loopMaxIterations =
-      typeof (node.data as { loopMaxIterations?: number }).loopMaxIterations ===
-      'number'
-        ? (node.data as { loopMaxIterations?: number }).loopMaxIterations!
-        : 0;
-    const widthDriver = isLoop
-      ? Math.max(loopMaxIterations, iterationCount)
-      : 0;
-    const loopWidth = isLoop ? loopNodeExpandedWidth(widthDriver) : undefined;
+    // Clean-slate rebuild: loop cards are uniform-size; no per-iteration
+    // width adjustment. The chip strip lives in the inspector Sheet, so
+    // an N-iteration loop renders the same card as a 1-iteration one
+    // (just with a different ×N badge in the top-right corner).
 
     // Compose the per-status badge prefix INTO ``data.label`` rather
     // than into a parallel ``labelPrefix`` field. FlowGraph renders
@@ -294,14 +279,9 @@ export function overlayRunOnSpecGraph(
     // overlay (Copilot review on PR #62).
     return {
       ...node,
-      // Re-stamp the per-node width so dagre's MiniMap thumbnail +
-      // any downstream re-layout sees the iteration-aware size. We
-      // only set width/height for loop nodes so non-loop nodes keep
-      // their xyflow defaults (the FlowGraph layout pass fills in
-      // NODE_WIDTH/NODE_HEIGHT for those).
-      ...(loopWidth !== undefined
-        ? { width: loopWidth, height: LOOP_NODE_HEIGHT }
-        : {}),
+      // Loop nodes use the same uniform dimensions as every other node
+      // (FlowGraph stamps NODE_WIDTH/NODE_HEIGHT during the layout
+      // pass), so we don't touch width/height here.
       data: {
         ...node.data,
         label: decoratedLabel,

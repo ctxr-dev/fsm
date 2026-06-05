@@ -50,6 +50,15 @@ vi.mock('@xyflow/react', () => ({
   BaseEdge: () => null,
   EdgeLabelRenderer: (p: { children?: unknown }) => <>{p.children as any}</>,
   getSmoothStepPath: () => ['M0,0 L1,1', 0, 0, 0, 0],
+  // ZoomDetailWatcher reads state.transform[2] for the live viewport
+  // zoom; mock it as 1 so the detail toggle stays on 'full' and the
+  // existing run-graph assertions (which target the full card class
+  // chain) keep matching.
+  useStore: (selector: (s: { transform: [number, number, number] }) => unknown) =>
+    selector({ transform: [0, 0, 1] }),
+  // RefitOnDetailChange calls useReactFlow().fitView when the detail
+  // level flips. Mock no-ops so the test render doesn't blow up.
+  useReactFlow: () => ({ fitView: () => undefined }),
   Position: { Left: 'left', Right: 'right', Top: 'top', Bottom: 'bottom' },
   BackgroundVariant: { Dots: 'dots', Lines: 'lines', Cross: 'cross' },
   MarkerType: { ArrowClosed: 'arrowclosed', Arrow: 'arrow' },

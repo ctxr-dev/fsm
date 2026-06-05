@@ -32,6 +32,7 @@ import { Tabs, type TabSpec } from '../../components/Tabs';
 import { Timeline, type TimelineItem } from '../../components/Timeline';
 import { EmptyState } from '../../components/EmptyState';
 import { Pill, type PillVariant } from '../../components/Pill';
+import { loopChipClass } from '../../components/FlowGraph';
 import type {
   Event as FsmEvent,
   SpecDetail,
@@ -51,6 +52,12 @@ export interface StateEntrySheetBodyProps {
    *  We dedupe + filter inside the sheet rather than ask the parent to
    *  pre-filter so the sheet stays self-contained for testing. */
   events: FsmEvent[];
+  /** Clean-slate rebuild: when this entry belongs to a loop state with
+   *  2+ iterations, the "Run values" tab renders a chip strip near the
+   *  top so the operator can hop between sibling iterations without
+   *  closing the sheet. The handler re-opens the sheet pointed at the
+   *  picked entry_id; omit to render the chips as static (no-op click). */
+  onSelectIteration?: (entryId: string) => void;
 }
 
 /** Tab ids — exported so tests can target them by string instead of
@@ -68,6 +75,26 @@ function findEntry(root: StateNode | null, entryId: string): StateNode | null {
     if (hit !== null) return hit;
   }
   return null;
+}
+
+/** Collect every entry in the tree whose ``state_id`` matches the
+ *  given id, ordered by ``entry_seq``. Used to surface sibling
+ *  iterations for a loop state inside the "Run values" tab — when the
+ *  list has 2+ entries, the sheet renders a chip strip so the operator
+ *  can hop between iterations without closing the sheet. */
+function findSiblingIterations(
+  root: StateNode | null,
+  stateId: string,
+): StateNode[] {
+  if (!root) return [];
+  const out: StateNode[] = [];
+  const walk = (n: StateNode): void => {
+    if (n.state_id === stateId) out.push(n);
+    for (const c of n.children) walk(c);
+  };
+  walk(root);
+  out.sort((a, b) => a.entry_seq - b.entry_seq);
+  return out;
 }
 
 /** Find the spec-side state object for ``state_id``. The spec
@@ -195,6 +222,7 @@ export function StateEntrySheetBody({
   stateTree,
   spec,
   events,
+  onSelectIteration,
 }: StateEntrySheetBodyProps): JSX.Element {
   const [activeTab, setActiveTab] = useState<StateEntryTabId>('run');
 
@@ -211,6 +239,17 @@ export function StateEntrySheetBody({
     () => findCommitEvent(matchingEvents, entryId),
     [matchingEvents, entryId],
   );
+
+  // Clean-slate rebuild: when this entry is one of N iterations of the
+  // same state (loop body), surface every sibling iteration as a chip
+  // strip near the top of the Run values tab. The chip strip is only
+  // rendered when there are 2+ siblings — a one-shot worker entry
+  // gets nothing extra so the sheet stays compact.
+  const siblingIterations = useMemo(
+    () => (entry ? findSiblingIterations(stateTree, entry.state_id) : []),
+    [stateTree, entry],
+  );
+  const hasIterations = siblingIterations.length >= 2;
 
   // -- Tab 1: run values --------------------------------------------------
   const runRows: KvRow[] = useMemo(() => {
@@ -251,6 +290,48 @@ export function StateEntrySheetBody({
           run {runId}
         </span>
       </div>
+      {hasIterations ? (
+        <section data-testid="iterations-section">
+          <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
+            iterations ({siblingIterations.length})
+          </h4>
+          <div
+            class="flex items-center gap-1 overflow-x-auto py-1"
+            role="list"
+            data-testid="iterations-chip-strip"
+            aria-label={`Iterations for ${entry.state_id}`}
+          >
+            {siblingIterations.map((it) => {
+              const isActive = it.entry_id === entryId;
+              return (
+                <button
+                  key={it.entry_id}
+                  type="button"
+                  role="listitem"
+                  data-testid="iterations-chip"
+                  data-entry-id={it.entry_id}
+                  data-active={isActive ? 'true' : 'false'}
+                  title={`Iteration ${it.iteration_n ?? '?'} (${it.status})`}
+                  onClick={() => {
+                    if (!isActive) onSelectIteration?.(it.entry_id);
+                  }}
+                  class={[
+                    'shrink-0 inline-flex items-center justify-center',
+                    'rounded border text-[10px] font-mono leading-none',
+                    'h-6 min-w-[36px] px-1',
+                    'focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400',
+                    'hover:brightness-110',
+                    isActive ? 'ring-2 ring-amber-400' : '',
+                    loopChipClass(it.status),
+                  ].join(' ')}
+                >
+                  {it.iteration_n ?? '·'}
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
       <KeyValueTable rows={runRows} caption="Run-recorded entry metadata" />
       <section>
         <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">

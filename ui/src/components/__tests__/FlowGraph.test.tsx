@@ -15,6 +15,12 @@ import { act, cleanup, render } from '@testing-library/preact';
 
 // Mock @xyflow/react before importing FlowGraph.
 let lastReactFlowProps: Record<string, unknown> | null = null;
+// Test seam for the live viewport zoom that ZoomDetailWatcher reads
+// via useStore. Defaults to 1 (well above DETAIL_LEVEL_ZOOM_THRESHOLD)
+// so the existing tests render at full detail without any per-test
+// setup. Per-test overrides set this before render to exercise the
+// compact path.
+let mockReactFlowZoom = 1;
 vi.mock('@xyflow/react', () => ({
   ReactFlow: (props: Record<string, unknown> & { children?: unknown }) => {
     lastReactFlowProps = props;
@@ -27,6 +33,15 @@ vi.mock('@xyflow/react', () => ({
   BaseEdge: () => null,
   EdgeLabelRenderer: (p: { children?: unknown }) => <>{p.children as any}</>,
   getSmoothStepPath: () => ['M0,0 L1,1', 0, 0, 0, 0],
+  // useStore is invoked by ZoomDetailWatcher with a selector that
+  // pulls state.transform[2] (the live zoom). We pass a synthetic
+  // ReactFlowState-shaped object so the selector returns
+  // mockReactFlowZoom without colliding with xyflow's internal store.
+  useStore: (selector: (s: { transform: [number, number, number] }) => unknown) =>
+    selector({ transform: [0, 0, mockReactFlowZoom] }),
+  // useReactFlow returns the imperative API. RefitOnDetailChange calls
+  // fitView when the detail level flips; the mock no-ops it.
+  useReactFlow: () => ({ fitView: () => undefined }),
   Position: { Left: 'left', Right: 'right', Top: 'top', Bottom: 'bottom' },
   BackgroundVariant: { Dots: 'dots', Lines: 'lines', Cross: 'cross' },
   MarkerType: { ArrowClosed: 'arrowclosed', Arrow: 'arrow' },
@@ -39,6 +54,7 @@ import type { Edge, Node } from '@xyflow/react';
 
 beforeEach(() => {
   lastReactFlowProps = null;
+  mockReactFlowZoom = 1;
 });
 afterEach(() => cleanup());
 
@@ -229,12 +245,20 @@ describe('FlowGraph', () => {
       ];
       render(<FlowGraph nodes={nodes} edges={edges} autoLayout={true} direction="TB" />);
 
-      // 1. Graph constructor was called with multigraph: true.
-      expect(ctorCalls).toEqual([{ multigraph: true }]);
+      // 1. Graph constructor was called with multigraph: true. W23e
+      //    runs the dagre layout twice per render (once per detail
+      //    level: full + compact) so the same options object lands in
+      //    ctorCalls twice — both must opt into multigraph mode.
+      expect(ctorCalls.length).toBeGreaterThanOrEqual(1);
+      for (const call of ctorCalls) {
+        expect(call).toEqual({ multigraph: true });
+      }
 
-      // 2. The live Graph instance built by FlowGraph has BOTH edges as
-      //    distinct dagre entries (edgeCount() reflects multigraph state).
-      expect(instances).toHaveLength(1);
+      // 2. Every live Graph instance built by FlowGraph has BOTH edges
+      //    as distinct dagre entries (edgeCount() reflects multigraph
+      //    state). Inspecting the first instance is sufficient — they
+      //    share the same input edges, only the node dims differ.
+      expect(instances.length).toBeGreaterThanOrEqual(1);
       const instance = instances[0] as unknown as {
         edgeCount: () => number;
         edges: () => Array<{ v: string; w: string; name?: string }>;
@@ -547,16 +571,10 @@ describe('FlowGraph', () => {
       expect(passed[0].type).toBe('fsmNode');
     });
 
-    test('loop node is collapsed by default; expanding renders the chip strip; chip click fires onIterationClick', async () => {
-      // Mount the loopNode renderer via the LoopIterationClickContext
-      // bridge — same pattern the FsmEdge test uses for FsmEdgeClickContext.
-      // The renderer is a Preact component (uses hooks), so it must be
-      // mounted via JSX inside render(), not invoked as a function.
-      const fg = await import('../FlowGraph');
-      const LoopIterationClickContext = (fg as unknown as {
-        LoopIterationClickContext: import('preact').Context<((id: string) => void) | null>;
-      }).LoopIterationClickContext;
-      const handler = vi.fn();
+    test('clean-slate: loop node renders the ×N badge (no chip strip on the card)', () => {
+      // Clean-slate rebuild: the per-iteration chip strip moved to the
+      // inspector Sheet so loop cards stay uniform-size. The card now
+      // carries only a small ×N badge in the top-right corner.
       const iterations = [
         { entry_id: 'e1', iteration_n: 1, status: 'exited' },
         { entry_id: 'e2', iteration_n: 2, status: 'entered' },
@@ -570,9 +588,6 @@ describe('FlowGraph', () => {
         iterationEntries: iterations,
       } as FlowNodeData;
 
-      // Pull the registered loopNode component out of FlowGraph's
-      // NODE_TYPES map via the captured ReactFlow props. That way we
-      // test the ACTUAL renderer FlowGraph wires up, not a copy.
       render(<FlowGraph nodes={[loopNode('tick', iterations, 5)]} edges={[]} autoLayout={false} />);
       const nodeTypes = lastReactFlowProps!.nodeTypes as Record<string, any>;
       const LoopComponent = nodeTypes.loopNode as (props: {
@@ -580,46 +595,47 @@ describe('FlowGraph', () => {
         selected?: boolean;
       }) => any;
 
-      const { getByTestId, queryByTestId, getAllByTestId } = render(
-        <LoopIterationClickContext.Provider value={handler}>
-          <LoopComponent data={data} />
-        </LoopIterationClickContext.Provider>,
+      const { getByTestId, queryByTestId } = render(
+        <LoopComponent data={data} />,
       );
 
-      // Collapsed by default: no chip strip yet.
+      // The card carries the ×N badge — "×2 / 5" since iterations=2,
+      // max=5.
+      const badge = getByTestId('loop-iteration-badge');
+      expect(badge.textContent).toContain('2');
+      expect(badge.textContent).toContain('5');
+      // The on-card chip strip + expand toggle are gone (they live in
+      // StateEntrySheetBody now, not on the graph card).
       expect(queryByTestId('loop-chip-strip')).toBeNull();
-      // Header has the ×N badge.
-      expect(getByTestId('loop-iteration-badge').textContent).toContain('2');
-      // Toggle to expand.
-      const toggle = getByTestId('loop-expand-toggle') as HTMLButtonElement;
-      act(() => {
-        toggle.click();
-      });
-      // Chip strip now visible with one chip per iteration.
-      const strip = getByTestId('loop-chip-strip');
-      expect(strip).not.toBeNull();
-      const chips = getAllByTestId('loop-chip');
-      expect(chips).toHaveLength(2);
-      expect(chips[0].getAttribute('data-entry-id')).toBe('e1');
-      expect(chips[1].getAttribute('data-entry-id')).toBe('e2');
-      // Clicking a chip fires onIterationClick with the entry_id.
-      act(() => {
-        (chips[1] as HTMLButtonElement).click();
-      });
-      expect(handler).toHaveBeenCalledWith('e2');
-      // Toggle back to collapsed.
-      act(() => {
-        toggle.click();
-      });
-      expect(queryByTestId('loop-chip-strip')).toBeNull();
+      expect(queryByTestId('loop-expand-toggle')).toBeNull();
+      expect(queryByTestId('loop-chip')).toBeNull();
     });
 
-    test('PR 5: layout width is bounded by min(20, iterations) * 40 + header for 0 / 1 / 5 / 200 iterations', () => {
-      // Use the auto-layout branch so dagre is actually exercised — the
-      // pre-stamped n.width must flow through to the positioned node.
-      const headerWidth = 270;
-      const chipWidth = 40;
-      const max = 20;
+    test('clean-slate: loop node hides the ×N badge when no iterations + no spec ceiling', () => {
+      const data = {
+        kind: 'loop',
+        label: 'idle',
+        isLoop: true,
+        loopMaxIterations: 0,
+        iterationCount: 0,
+        iterationEntries: [],
+      } as FlowNodeData;
+
+      render(<FlowGraph nodes={[loopNode('idle', [], 0)]} edges={[]} autoLayout={false} />);
+      const nodeTypes = lastReactFlowProps!.nodeTypes as Record<string, any>;
+      const LoopComponent = nodeTypes.loopNode as (props: { data: FlowNodeData }) => any;
+      const { queryByTestId } = render(<LoopComponent data={data} />);
+      expect(queryByTestId('loop-iteration-badge')).toBeNull();
+    });
+
+    test('clean-slate: loop nodes get the uniform NODE_WIDTH regardless of iteration count', () => {
+      // Clean-slate rebuild: no per-iteration width — a 0-iter loop and
+      // a 200-iter loop render the same uniform card. The chip strip
+      // lives in the inspector Sheet, not on the graph card, so the
+      // layout pass never has to reserve more slack for a wider loop.
+      // Width is shared with FsmNode; bump in lockstep with FlowGraph's
+      // NODE_WIDTH constant.
+      const NODE_WIDTH = 160;
       const cases = [0, 1, 5, 200];
       for (const count of cases) {
         const iter = Array.from({ length: count }, (_, i) => ({
@@ -627,39 +643,11 @@ describe('FlowGraph', () => {
           iteration_n: i + 1,
           status: 'exited',
         }));
-        // Pre-stamp width on the node the same way specGraph/runGraph
-        // does, so dagre sees the right dimensions.
-        const expanded = headerWidth + Math.min(max, count) * chipWidth;
-        const nodes: Node<FlowNodeData>[] = [
-          { ...loopNode('l', iter, count), width: expanded, height: 120 },
-        ];
+        const nodes: Node<FlowNodeData>[] = [loopNode('l', iter, count)];
         render(<FlowGraph nodes={nodes} edges={[]} autoLayout={true} />);
         const passed = lastReactFlowProps!.nodes as Array<Node<FlowNodeData> & { width?: number }>;
-        // The positioned node keeps the input width unchanged for loop
-        // nodes — non-default widths flow through dagre + back out.
-        expect(passed[0].width).toBe(expanded);
-        // The cap at 20 is the load-bearing assertion: 200 iterations
-        // must NOT produce 8000+ px.
-        expect(passed[0].width).toBeLessThanOrEqual(headerWidth + max * chipWidth);
+        expect(passed[0].width).toBe(NODE_WIDTH);
       }
-    });
-
-    test('PR 5: a loop with 50 iterations renders width bounded by min(20,50)*40 + header', () => {
-      const headerWidth = 270;
-      const chipWidth = 40;
-      const max = 20;
-      const iter = Array.from({ length: 50 }, (_, i) => ({
-        entry_id: `e${i}`,
-        iteration_n: i + 1,
-        status: 'exited',
-      }));
-      const expanded = headerWidth + Math.min(max, 50) * chipWidth;
-      const nodes: Node<FlowNodeData>[] = [
-        { ...loopNode('l', iter, 50), width: expanded, height: 120 },
-      ];
-      render(<FlowGraph nodes={nodes} edges={[]} autoLayout={true} />);
-      const passed = lastReactFlowProps!.nodes as Array<Node<FlowNodeData> & { width?: number }>;
-      expect(passed[0].width).toBe(headerWidth + max * chipWidth);
     });
   });
 
@@ -814,6 +802,108 @@ describe('FlowGraph', () => {
       expect(new Set(ys).size).toBe(2);
       spy.mockRestore();
       consoleWarn.mockRestore();
+    });
+  });
+
+  describe('W23e viewport-zoom-aware detail toggle', () => {
+    // ZoomDetailWatcher reads the live zoom via useStore; the mock at
+    // the top of this file exposes mockReactFlowZoom as the driver for
+    // that selector. Setting it BEFORE render lets us assert what the
+    // first paint forwards to ReactFlow without poking xyflow internals.
+
+    test('zoom above threshold renders detailLevel=full on every node', async () => {
+      const { DETAIL_LEVEL_ZOOM_THRESHOLD } = await import('../FlowGraph');
+      expect(DETAIL_LEVEL_ZOOM_THRESHOLD).toBe(0.7);
+      mockReactFlowZoom = 0.9; // > threshold
+      const nodes: Node<FlowNodeData>[] = [
+        { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'worker', label: 'plan' } },
+        { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'worker', label: 'execute' } },
+      ];
+      render(<FlowGraph nodes={nodes} edges={[]} autoLayout={false} />);
+      // ZoomDetailWatcher's useEffect runs after the first paint, so
+      // drain microtasks to let the setState propagate.
+      await act(async () => {
+        await Promise.resolve();
+      });
+      const forwarded = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
+      expect(forwarded.length).toBe(2);
+      for (const n of forwarded) {
+        expect(n.data.detailLevel).toBe('full');
+      }
+    });
+
+    test('zoom at or below threshold renders detailLevel=compact on every node', async () => {
+      mockReactFlowZoom = 0.5; // < threshold
+      const nodes: Node<FlowNodeData>[] = [
+        { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'worker', label: 'plan' } },
+        { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'worker', label: 'execute' } },
+      ];
+      render(<FlowGraph nodes={nodes} edges={[]} autoLayout={false} />);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      const forwarded = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
+      for (const n of forwarded) {
+        expect(n.data.detailLevel).toBe('compact');
+      }
+    });
+
+    test('threshold is exclusive on the upper side — exactly at threshold is compact', async () => {
+      mockReactFlowZoom = 0.7;
+      const nodes: Node<FlowNodeData>[] = [
+        { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'worker', label: 'plan' } },
+      ];
+      render(<FlowGraph nodes={nodes} edges={[]} autoLayout={false} />);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      const forwarded = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
+      expect(forwarded[0].data.detailLevel).toBe('compact');
+    });
+
+    test('compact mode shrinks the layout node dimensions (100x44 vs 160x60)', async () => {
+      // The dagre branch picks up the smaller default dims when the
+      // detail level flips, so a 3-node chain packs tighter horizontally.
+      // We compare the bounding box width across the two levels on the
+      // same input to assert the compact layout is strictly smaller.
+      const nodes: Node<FlowNodeData>[] = [
+        { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'worker', label: 'a' } },
+        { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'worker', label: 'b' } },
+        { id: 'c', position: { x: 0, y: 0 }, data: { kind: 'worker', label: 'c' } },
+      ];
+      const edges: Edge[] = [
+        { id: 'a-b', source: 'a', target: 'b' },
+        { id: 'b-c', source: 'b', target: 'c' },
+      ];
+      mockReactFlowZoom = 0.8;
+      const { rerender, unmount } = render(
+        <FlowGraph nodes={nodes} edges={edges} autoLayout={true} direction="LR" />,
+      );
+      await act(async () => {
+        await Promise.resolve();
+      });
+      const fullForwarded = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
+      const fullXs = fullForwarded.map((n) => n.position.x);
+      const fullSpan = Math.max(...fullXs) - Math.min(...fullXs);
+      unmount();
+
+      mockReactFlowZoom = 0.2;
+      render(<FlowGraph nodes={nodes} edges={edges} autoLayout={true} direction="LR" />);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      const compactForwarded = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
+      const compactXs = compactForwarded.map((n) => n.position.x);
+      const compactSpan = Math.max(...compactXs) - Math.min(...compactXs);
+      // dagre's LR span is dominated by node width * (n-1) + nodesep.
+      // Compact width (100) is smaller than full (160) so the span
+      // shrinks. We don't pin the exact pixel count (dagre tuning
+      // could move it) but the relative ordering is load-bearing.
+      expect(compactSpan).toBeLessThan(fullSpan);
+      // Width on the forwarded node also reflects the compact default.
+      expect(compactForwarded[0].width).toBe(100);
+      // Re-render to force unmount cleanup symmetry.
+      rerender(<div />);
     });
   });
 
