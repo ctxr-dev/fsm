@@ -23,7 +23,7 @@
  * onNodeClick.
  */
 
-import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
 import { createContext } from 'preact';
 import dagre from 'dagre';
@@ -37,9 +37,12 @@ import {
   MarkerType,
   MiniMap,
   Position,
+  useReactFlow,
+  useStore,
   type Edge,
   type Node,
   type NodeProps,
+  type ReactFlowState,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
@@ -97,6 +100,42 @@ export interface FlowNodeData extends Record<string, unknown> {
   /** PR 5: chronological list of per-iteration entries. Each chip in
    *  the loop node's strip is sourced from one element. */
   iterationEntries?: FlowLoopIteration[];
+  /**
+   * Viewport-zoom-aware render mode. When `'compact'`, the node renders a
+   * small card (~100×44) with just the truncated state name; when `'full'`
+   * (or undefined — back-compat default), the existing 160×60 card with
+   * the kind chip + full label is rendered. FlowGraph stamps this onto
+   * every node's data whenever the active viewport zoom crosses
+   * {@link DETAIL_LEVEL_ZOOM_THRESHOLD}.
+   */
+  detailLevel?: DetailLevel;
+}
+
+/** Zoom threshold below which (≤) the graph switches to compact cards.
+ *  Exported so tests + the LoopNode can share the same number.
+ *
+ *  Raised from 0.4 to 0.7 so the dense 14-layer chains (e.g.
+ *  skill-code-review v4) stay in compact mode at their natural
+ *  fit-view zoom (~0.55-0.65 with compact ELK spacing). The previous
+ *  0.4 threshold left them oscillating: full layout fit at 0.27 →
+ *  flip to compact → compact layout fit at 0.65 → flip back to full.
+ *  With 0.7 the compact layout's fit-view zoom stays in compact mode,
+ *  breaking the cycle without forcing every tiny graph into compact. */
+export const DETAIL_LEVEL_ZOOM_THRESHOLD = 0.7;
+
+/** Maximum visible characters for a state-name label in compact mode.
+ *  Anything longer is truncated to this prefix plus an ellipsis. The
+ *  full label remains available via tooltip + the inspector Sheet. */
+export const COMPACT_LABEL_MAX_CHARS = 14;
+
+export type DetailLevel = 'full' | 'compact';
+
+/** Truncate a label for compact-mode rendering. Returns the original
+ *  string when it already fits inside {@link COMPACT_LABEL_MAX_CHARS}. */
+export function truncateCompactLabel(label: string): string {
+  if (typeof label !== 'string') return '';
+  if (label.length <= COMPACT_LABEL_MAX_CHARS) return label;
+  return `${label.slice(0, COMPACT_LABEL_MAX_CHARS)}…`;
 }
 
 export interface FlowGraphProps {
@@ -147,13 +186,40 @@ export interface FlowGraphProps {
   viewportKey?: string;
 }
 
-// W21 user-requested: 50% bigger than the W20 sizes (180x56 → 270x84)
-// so long state ids (e.g. `synthesize_release_readiness`) fit on one
-// line and the kind badge no longer competes for horizontal room.
-// Dagre layout constants below are tuned proportionally to keep edges
-// clear of the larger node boxes.
-const NODE_WIDTH = 200;
-const NODE_HEIGHT = 64;
+// Clean-slate rebuild: every node uses the SAME card dimensions
+// (worker, inline, loop, terminal). The loop node carries a small ×N
+// badge but stays the same size as its siblings so a graph with many
+// loops doesn't have one node 30% of the canvas width. Detail surfaces
+// (iteration chip strip, per-iteration entries) live in the
+// StateEntrySheetBody, not on the graph card.
+// Card dimensions tuned to fit an 18-node FSM in a 1270×733 graph
+// viewport at sensible zoom without an unreadable shrink:
+//   LR layout: 14 layers × 140 (node + spacing) ≈ 2000 px wide;
+//              fit-view zoom ≈ 0.6 → nodes render ~85 px wide.
+//   TB layout: 14 layers × 100 (node + spacing) ≈ 1400 px tall;
+//              fit-view zoom ≈ 0.45 → nodes render ~63 px wide.
+// Card content is the kind chip + label, both still legible at
+// 130×56 since the font sizes stay 10-12 px.
+const NODE_WIDTH = 160;
+const NODE_HEIGHT = 60;
+
+/**
+ * Compact-mode card dimensions. Roughly 60 % of the full size so a
+ * 14-layer chain (e.g. skill-code-review v4) fits a 16:9 viewport at
+ * fit-view zoom 0.55-0.7 instead of the ~0.36 the full layout
+ * collapses to. The chip is hidden and the label is truncated so a
+ * smaller box stays legible at that zoom.
+ */
+const NODE_WIDTH_COMPACT = 100;
+const NODE_HEIGHT_COMPACT = 44;
+
+/** Per-detail-level node dimensions. Used by both the dagre and ELK
+ *  layout branches so the two engines reserve the same slack as the
+ *  card they render at the active detail level. */
+const NODE_DIMS_BY_DETAIL: Record<DetailLevel, { width: number; height: number }> = {
+  full: { width: NODE_WIDTH, height: NODE_HEIGHT },
+  compact: { width: NODE_WIDTH_COMPACT, height: NODE_HEIGHT_COMPACT },
+};
 
 const NODE_KIND_CLASSES: Record<FlowNodeKind, string> = {
   state:
@@ -176,7 +242,11 @@ const NODE_KIND_CLASSES: Record<FlowNodeKind, string> = {
     'border-cyan-500 bg-cyan-50 dark:bg-cyan-900/30 text-cyan-900 dark:text-cyan-100',
 };
 
-function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<Node<FlowNodeData>>): JSX.Element {
+/** Exported for FsmNode.test.tsx so the compact / full render paths
+ *  can be exercised directly without round-tripping through the full
+ *  FlowGraph orchestrator. Not part of the public surface — callers
+ *  outside this module should keep using FlowGraph + node.data. */
+export function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<Node<FlowNodeData>>): JSX.Element {
   const kind = data.kind;
   // Handles are the connection anchors xyflow draws edges into.
   // Without these, no edge has anywhere to land and the connection
@@ -254,14 +324,28 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
     ? 'ring-1 ring-amber-300 ring-offset-1 ring-offset-white dark:ring-offset-slate-900'
     : '';
   const dimClass = isDimmed ? 'opacity-30' : '';
+  // W23e: viewport-zoom-aware detail toggle. When the live zoom drops at
+  // or below DETAIL_LEVEL_ZOOM_THRESHOLD, FlowGraph stamps
+  // data.detailLevel='compact' on every node; we render a denser card
+  // here so a 14-layer chain stays legible at fit-view zoom without an
+  // unreadable text shrink. The full label remains accessible via the
+  // hover tooltip + the inspector Sheet.
+  const detailLevel: DetailLevel = data.detailLevel === 'compact' ? 'compact' : 'full';
+  const isCompact = detailLevel === 'compact';
+  const dims = NODE_DIMS_BY_DETAIL[detailLevel];
+  const labelPrefix = typeof data.labelPrefix === 'string' ? data.labelPrefix : '';
+  const visibleLabel = isCompact ? truncateCompactLabel(data.label) : data.label;
   return (
     <div
       class={[
-        'fsm-node relative rounded-md border-2 shadow-sm px-4 py-3',
+        'fsm-node relative rounded-md border-2 shadow-sm',
+        isCompact ? 'fsm-node-compact px-2 py-1' : 'px-4 py-3',
         // justify-center centers the kind/label block vertically within
         // the (fixed) node height. gap-1 gives the two rows even
         // breathing room.
-        'flex flex-col gap-1 justify-center overflow-hidden',
+        isCompact
+          ? 'flex items-center justify-center overflow-hidden'
+          : 'flex flex-col gap-1 justify-center overflow-hidden',
         // Smooth fade between dim / un-dim states. motion-reduce
         // disables the transition for users with
         // prefers-reduced-motion (existing pattern across the dashboard).
@@ -273,22 +357,45 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
         hoverRing,
         dimClass,
       ].join(' ')}
-      style={{ width: `${NODE_WIDTH}px`, minHeight: `${NODE_HEIGHT}px` }}
+      data-detail-level={detailLevel}
+      /* eslint-disable-next-line react/forbid-dom-props -- xyflow nodes need fixed pixel dimensions matched to dagre layout */
+      style={{ width: `${dims.width}px`, minHeight: `${dims.height}px` }}
     >
       <Handle
         type="target"
         position={tp}
         style={{ background: 'currentColor', width: 8, height: 8, border: 'none' }}
       />
-      <span class="text-[9px] uppercase tracking-wider opacity-60 leading-none">
-        {kind}
-      </span>
-      <Tooltip content={data.fullLabel ?? data.label} delay={400}>
-        <span class="font-semibold text-sm truncate block w-full leading-tight">
-          {typeof data.labelPrefix === 'string' ? data.labelPrefix : ''}
-          {data.label}
-        </span>
-      </Tooltip>
+      {isCompact ? (
+        // Compact card: no kind chip, no two-row stack. A single bigger
+        // label fills the small box so the text stays readable at low
+        // zoom. Truncated to COMPACT_LABEL_MAX_CHARS + ellipsis; full
+        // label surfaces via the existing Tooltip wrap below.
+        <Tooltip content={data.fullLabel ?? data.label} delay={400}>
+          <span
+            class="font-semibold text-[14px] truncate block w-full text-center leading-tight"
+            data-testid="fsm-node-label-compact"
+          >
+            {labelPrefix}
+            {visibleLabel}
+          </span>
+        </Tooltip>
+      ) : (
+        <>
+          <span
+            class="text-[9px] uppercase tracking-wider opacity-60 leading-none"
+            data-testid="fsm-node-kind-chip"
+          >
+            {kind}
+          </span>
+          <Tooltip content={data.fullLabel ?? data.label} delay={400}>
+            <span class="font-semibold text-sm truncate block w-full leading-tight">
+              {labelPrefix}
+              {data.label}
+            </span>
+          </Tooltip>
+        </>
+      )}
       <Handle
         type="source"
         position={sp}
@@ -299,42 +406,25 @@ function FsmNode({ data, selected, sourcePosition, targetPosition }: NodeProps<N
 }
 
 // ---------------------------------------------------------------------------
-// PR 5: loop node — header card + collapsible chip strip
+// Loop node — uniform card same shape/size as FsmNode, plus a ×N badge.
 // ---------------------------------------------------------------------------
+//
+// Clean-slate rebuild rationale: the previous loop node embedded a
+// per-iteration chip strip directly on the graph, which made the loop
+// card 30 %+ of the canvas width and forced every other node to flow
+// around it. That broke the layout the user wanted (uniform card grid).
+// Per-iteration affordances now live in the inspector Sheet
+// (StateEntrySheetBody → "Iterations" section); the graph card just
+// carries a small "×N" badge in the top-right so the operator can see
+// at a glance how many times the loop ran.
 
 /**
- * Width of the header band of a loop node (kind chip + state-id + ×N
- * badge + expand toggle). Matches the default FsmNode card so a loop
- * node collapsed reads at the same line height as its worker / inline
- * siblings on the same rank.
+ * Per-status palette for the iteration chip rendered inside the
+ * StateEntrySheetBody's "Iterations" section. Exported so the sheet
+ * (which owns the chip strip now) renders the same status colours as
+ * the rest of the run graph.
  */
-export const LOOP_NODE_HEADER_WIDTH = 270;
-/** Width of one iteration chip inside the strip. */
-export const LOOP_NODE_CHIP_WIDTH = 40;
-/** Hard cap on the number of chips contributed to the layout width;
- *  beyond this the strip uses horizontal scroll so a 200-iteration
- *  loop doesn't sprawl 8000px wide and break dagre. */
-export const LOOP_NODE_CHIP_VISIBLE_MAX = 20;
-/** Total node height (matches FsmNode for collapsed parity, plus a
- *  fixed chip-strip height that's allocated whether the strip is
- *  visible or not so the layout doesn't shift when the operator
- *  expands). */
-export const LOOP_NODE_HEIGHT = NODE_HEIGHT + 36;
-
-/**
- * Compute the layout width of a loop node given an iteration count.
- * Exposed so ``specGraph`` / ``runGraph`` can stamp the same number
- * onto the node BEFORE the dagre layout pass runs — that keeps dagre
- * from re-routing edges every time the operator collapses the chip
- * strip.
- */
-export function loopNodeExpandedWidth(iterations: number): number {
-  const visible = Math.min(LOOP_NODE_CHIP_VISIBLE_MAX, Math.max(0, iterations));
-  return LOOP_NODE_HEADER_WIDTH + visible * LOOP_NODE_CHIP_WIDTH;
-}
-
-/** Per-status chip palette inside the loop strip. */
-const LOOP_CHIP_STATUS_CLASSES: Record<string, string> = {
+export const LOOP_CHIP_STATUS_CLASSES: Record<string, string> = {
   faulted:
     'border-red-500 bg-red-100 dark:bg-red-900/50 text-red-900 dark:text-red-100',
   entered:
@@ -345,22 +435,24 @@ const LOOP_CHIP_STATUS_CLASSES: Record<string, string> = {
     'border-emerald-500 bg-emerald-100 dark:bg-emerald-900/50 text-emerald-900 dark:text-emerald-100',
 };
 
-function loopChipClass(status: string): string {
+/** Helper: pick the chip class for one iteration's status. */
+export function loopChipClass(status: string): string {
   return (
     LOOP_CHIP_STATUS_CLASSES[status.toLowerCase()] ??
     'border-slate-400 bg-slate-100 dark:bg-slate-800/60 text-slate-700 dark:text-slate-300'
   );
 }
 
-/** Context bridge for chip click dispatch.
- *  Mirrors the FsmEdgeClickContext pattern (the loop node renderer is
- *  instantiated by xyflow inside a portal, so prop-drilling
- *  ``onIterationClick`` through the nodeTypes map would lose it). */
+/** Context bridge for iteration-chip click dispatch from any
+ *  descendant of FlowGraph. Kept exported because the route still
+ *  passes ``onIterationClick`` and other future surfaces (the
+ *  inspector Sheet) can subscribe to it without prop-drilling. */
 export const LoopIterationClickContext = createContext<
   ((entryId: string) => void) | null
 >(null);
 
-function LoopNode({
+/** Exported for FsmNode.test.tsx — same rationale as `FsmNode`. */
+export function LoopNode({
   data,
   selected,
   sourcePosition,
@@ -368,14 +460,6 @@ function LoopNode({
 }: NodeProps<Node<FlowNodeData>>): JSX.Element {
   const sp = sourcePosition ?? Position.Bottom;
   const tp = targetPosition ?? Position.Top;
-  const onIterationClick = useContext(LoopIterationClickContext);
-
-  // PR 5: the operator controls expand/collapse with the ▸ toggle. The
-  // default is collapsed so a graph full of loop nodes doesn't drown
-  // the operator in chip strips before they ask for one; expanding is
-  // one keypress / click away. State lives in the node component (not
-  // on data) so toggling doesn't trigger an overlay rebuild.
-  const [expanded, setExpanded] = useState(false);
 
   const iterations = Array.isArray(data.iterationEntries)
     ? data.iterationEntries
@@ -390,9 +474,8 @@ function LoopNode({
   const runStatus = typeof data.runStatus === 'string' ? data.runStatus : undefined;
   const isCurrent = data.isCurrent === true;
 
-  // Reuse the status palette FsmNode owns for the header band so a
-  // loop card lights up the same emerald/amber/red as its worker
-  // siblings under the same run state.
+  // Status palette mirrors FsmNode so a loop card lights up the same
+  // emerald/amber/red as worker siblings in the same run state.
   const STATUS_CLASSES: Record<string, string> = {
     not_visited:
       'border-slate-400 bg-slate-100 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 opacity-70',
@@ -423,18 +506,37 @@ function LoopNode({
     : '';
   const dimClass = isDimmed ? 'opacity-30' : '';
 
-  // The card width matches the layout-baked value (header +
-  // min(MAX, iterations) chips) so dagre's slack remains correct.
-  // The chip strip itself is independently overflow-x:auto, which
-  // means an over-MAX iteration count scrolls horizontally inside
-  // the fixed card width.
-  const cardWidth = loopNodeExpandedWidth(Math.max(maxIterations, iterationCount));
+  // The badge is suppressed when the spec hasn't declared a loop body
+  // AND no run iterations have landed yet — otherwise we'd show a
+  // misleading "×0" on a static spec graph.
+  const showBadge = iterationCount > 0 || maxIterations > 0;
+  const badgeText =
+    iterationCount > 0
+      ? `×${iterationCount}${maxIterations > 0 ? ` / ${maxIterations}` : ''}`
+      : `×0 / ${maxIterations}`;
+  const badgeTitle =
+    maxIterations > 0
+      ? `${iterationCount} of ${maxIterations} iterations`
+      : `${iterationCount} iterations`;
+
+  // W23e: same detail-toggle contract as FsmNode. The ×N badge stays
+  // visible in compact mode at a smaller font so the operator still sees
+  // iteration counts at low zoom; the kind chip is dropped to free
+  // vertical space.
+  const detailLevel: DetailLevel = data.detailLevel === 'compact' ? 'compact' : 'full';
+  const isCompact = detailLevel === 'compact';
+  const dims = NODE_DIMS_BY_DETAIL[detailLevel];
+  const labelPrefix = typeof data.labelPrefix === 'string' ? data.labelPrefix : '';
+  const visibleLabel = isCompact ? truncateCompactLabel(data.label) : data.label;
 
   return (
     <div
       class={[
         'fsm-node fsm-loop-node relative rounded-md border-2 shadow-sm',
-        'flex flex-col overflow-hidden',
+        isCompact ? 'fsm-loop-node-compact px-2 py-1' : 'px-4 py-3',
+        isCompact
+          ? 'flex items-center justify-center overflow-hidden'
+          : 'flex flex-col gap-1 justify-center overflow-hidden',
         'transition-opacity duration-150 motion-reduce:transition-none',
         paletteClass,
         selected ? 'ring-2 ring-emerald-400 ring-offset-1' : '',
@@ -444,100 +546,58 @@ function LoopNode({
         dimClass,
       ].join(' ')}
       data-testid="loop-node"
-      /* eslint-disable-next-line react/forbid-dom-props -- xyflow loop node needs computed pixel width matched to dagre layout */
-      style={{ width: `${cardWidth}px`, minHeight: `${LOOP_NODE_HEIGHT}px` }}
+      data-detail-level={detailLevel}
+      /* eslint-disable-next-line react/forbid-dom-props -- xyflow nodes need fixed pixel dimensions matched to dagre layout */
+      style={{ width: `${dims.width}px`, minHeight: `${dims.height}px` }}
     >
       <Handle
         type="target"
         position={tp}
         style={{ background: 'currentColor', width: 8, height: 8, border: 'none' }}
       />
-      {/* Header band — kind chip + label + ×N badge + expand toggle */}
-      <div class="flex flex-col gap-1 px-4 py-3">
-        <div class="flex items-center justify-between gap-2">
-          <span class="text-[9px] uppercase tracking-wider opacity-60 leading-none">
-            loop
-          </span>
-          <div class="flex items-center gap-1">
-            <span
-              class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-black/10 dark:bg-white/10"
-              title={`${iterationCount} of ${maxIterations} iterations`}
-              data-testid="loop-iteration-badge"
-            >
-              ×{iterationCount}
-              {maxIterations > 0 ? ` / ${maxIterations}` : ''}
-            </span>
-            <button
-              type="button"
-              aria-expanded={expanded ? 'true' : 'false'}
-              aria-label={
-                expanded ? 'Collapse iteration chips' : 'Expand iteration chips'
-              }
-              data-testid="loop-expand-toggle"
-              onClick={(e) => {
-                // Stop the click from bubbling to xyflow's onNodeClick
-                // handler — toggling the chip strip is its own
-                // affordance, NOT a "select the loop node" gesture.
-                e.stopPropagation();
-                setExpanded((v) => !v);
-              }}
-              class={[
-                'text-[10px] font-semibold w-5 h-5 rounded',
-                'flex items-center justify-center',
-                'bg-black/5 dark:bg-white/5',
-                'hover:bg-black/10 dark:hover:bg-white/10',
-                'focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400',
-                'motion-safe:transition-transform',
-                expanded ? 'rotate-90' : '',
-              ].join(' ')}
-            >
-              ▸
-            </button>
-          </div>
-        </div>
+      {/* ×N badge floats in the top-right corner so it doesn't push the
+          kind/label rows around. position:absolute keeps it out of the
+          flex layout — the card visual matches FsmNode pixel-for-pixel
+          aside from this single decoration. In compact mode the badge
+          font shrinks so it doesn't dominate the smaller card. */}
+      {showBadge ? (
+        <span
+          class={[
+            'absolute font-mono leading-none rounded bg-black/10 dark:bg-white/10',
+            isCompact ? 'top-0 right-0 text-[8px] px-0.5' : 'top-1 right-1 text-[9px] px-1 py-0.5',
+          ].join(' ')}
+          title={badgeTitle}
+          data-testid="loop-iteration-badge"
+        >
+          {badgeText}
+        </span>
+      ) : null}
+      {isCompact ? (
         <Tooltip content={data.fullLabel ?? data.label} delay={400}>
-          <span class="font-semibold text-sm truncate block w-full leading-tight">
-            {data.label}
+          <span
+            class="font-semibold text-[14px] truncate block w-full text-center leading-tight"
+            data-testid="loop-node-label-compact"
+          >
+            {labelPrefix}
+            {visibleLabel}
           </span>
         </Tooltip>
-      </div>
-      {/* Chip strip — only painted when expanded. Width is fixed by
-          the outer card; overflow-x:auto handles the >20-iteration
-          case so the operator can scroll laterally rather than the
-          dagre layout shifting around. */}
-      {expanded && iterations.length > 0 ? (
-        <div
-          class="flex items-center gap-1 px-3 pb-2 overflow-x-auto"
-          data-testid="loop-chip-strip"
-          role="list"
-          aria-label={`Iteration entries for ${data.label}`}
-        >
-          {iterations.map((it) => (
-            <button
-              key={it.entry_id}
-              type="button"
-              role="listitem"
-              data-testid="loop-chip"
-              data-entry-id={it.entry_id}
-              title={`Iteration ${it.iteration_n ?? '?'} (${it.status})`}
-              onClick={(e) => {
-                e.stopPropagation();
-                onIterationClick?.(it.entry_id);
-              }}
-              class={[
-                'shrink-0 inline-flex items-center justify-center',
-                'rounded border text-[10px] font-mono leading-none',
-                'h-6 min-w-[36px] px-1',
-                'focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400',
-                'hover:brightness-110',
-                loopChipClass(it.status),
-              ].join(' ')}
-            >
-              {it.iteration_n ?? '·'}
-            </button>
-          ))}
-        </div>
-      ) : null}
+      ) : (
+        <>
+          <span
+            class="text-[9px] uppercase tracking-wider opacity-60 leading-none"
+            data-testid="loop-node-kind-chip"
+          >
+            loop
+          </span>
+          <Tooltip content={data.fullLabel ?? data.label} delay={400}>
+            <span class="font-semibold text-sm truncate block w-full leading-tight">
+              {labelPrefix}
+              {data.label}
+            </span>
+          </Tooltip>
+        </>
+      )}
       <Handle
         type="source"
         position={sp}
@@ -549,6 +609,75 @@ function LoopNode({
 
 const NODE_TYPES = { fsmNode: FsmNode, loopNode: LoopNode };
 const EDGE_TYPES = { fsmEdge: FsmEdge };
+
+/**
+ * Tiny child of <ReactFlow> that subscribes to the live viewport zoom
+ * via React Flow's internal store and lifts a `detailLevel` ('full'
+ * vs 'compact') up to FlowGraph via callback. Lives INSIDE the
+ * ReactFlow context (which is the only place `useStore` is allowed)
+ * but renders nothing — the actual card / layout swap happens up in
+ * the orchestrator.
+ *
+ * The threshold is exclusive: zoom > DETAIL_LEVEL_ZOOM_THRESHOLD →
+ * full, zoom ≤ threshold → compact. The check runs in a useEffect so
+ * the parent only re-renders when the level actually flips (not on
+ * every transform change while the user pans).
+ */
+function ZoomDetailWatcher({
+  onChange,
+}: {
+  onChange: (level: DetailLevel) => void;
+}): JSX.Element | null {
+  // transform = [x, y, zoom]; index 2 is the live zoom level.
+  const zoom = useStore((s: ReactFlowState) => s.transform[2]);
+  useEffect(() => {
+    const next: DetailLevel = zoom > DETAIL_LEVEL_ZOOM_THRESHOLD ? 'full' : 'compact';
+    onChange(next);
+  }, [zoom, onChange]);
+  return null;
+}
+
+/**
+ * Re-runs ``fitView`` whenever the detail level flips. The initial
+ * ``fitView`` on mount frames the FULL layout; once
+ * ``ZoomDetailWatcher`` flips us to compact (because the full-mode
+ * fit-zoom was <= DETAIL_LEVEL_ZOOM_THRESHOLD), the layout pass produces
+ * a much smaller bbox and we want the viewport to re-frame it so the
+ * compact card text is actually readable.
+ *
+ * Only refits when the persisted-viewport branch is OFF — once the
+ * operator has saved their own pan/zoom, we never auto-refit on top of
+ * it (matches the ``fitView=false`` guard in the parent ReactFlow).
+ */
+function RefitOnDetailChange({
+  detailLevel,
+  enabled,
+}: {
+  detailLevel: DetailLevel;
+  enabled: boolean;
+}): JSX.Element | null {
+  const { fitView } = useReactFlow();
+  // Track the previous level via ref so we ONLY refit on actual
+  // transitions, not on every re-render that happens to carry the
+  // current level.
+  const prev = useRef<DetailLevel | null>(null);
+  useEffect(() => {
+    if (!enabled) {
+      prev.current = detailLevel;
+      return;
+    }
+    if (prev.current === detailLevel) return;
+    prev.current = detailLevel;
+    // Defer to the next frame so the layout swap (which is a separate
+    // React state) has committed and the new node positions exist
+    // before we measure their bbox.
+    const handle = requestAnimationFrame(() => {
+      fitView({ padding: 0.05, includeHiddenNodes: false, minZoom: 0.2, maxZoom: 1.5 });
+    });
+    return () => cancelAnimationFrame(handle);
+  }, [detailLevel, enabled, fitView]);
+  return null;
+}
 
 /**
  * Run dagre layered layout to position nodes. Returns a fresh node
@@ -633,6 +762,11 @@ function applyDagreLayout(
   nodes: readonly Node<FlowNodeData>[],
   edges: readonly Edge[],
   direction: 'LR' | 'TB',
+  /** Default per-node dimensions used when the node didn't pre-stamp
+   *  its own width/height. W23e: callers pass compact dims when the
+   *  active viewport zoom drops below DETAIL_LEVEL_ZOOM_THRESHOLD so
+   *  the layout packs the chain tighter. */
+  defaultDims: { width: number; height: number } = NODE_DIMS_BY_DETAIL.full,
 ): { positioned: Node<FlowNodeData>[]; edgeLabelPositions: DagreEdgeLabelMap } {
   const g = new dagre.graphlib.Graph({ multigraph: true });
   g.setDefaultEdgeLabel(() => ({}));
@@ -652,23 +786,32 @@ function applyDagreLayout(
   // to scale the result. Predicate pills are anchored on cross-segment
   // midpoints so a tight ranksep is fine — adjacent ranks' labels live
   // on different horizontal segments and don't touch.
+  // Clean-slate constants: restore dagre defaults that work for moderate
+  // graphs (15-50 states). Previous tuning (nodesep=130 / ranksep=50)
+  // came from over-fitting to a 15-node v1 spec without the loop node;
+  // it collapsed adjacent ranks so far that predicate pills landed on
+  // top of node corners as soon as the spec grew. The conservative
+  // numbers below give dagre room to route around long edge labels and
+  // keep the graph readable without sprawling off the viewport — we
+  // rely on fitView (padding 0.15) to scale the final box.
   g.setGraph({
     rankdir: direction,
-    nodesep: 130,
-    ranksep: 50,
-    edgesep: 24,
-    marginx: 16,
-    marginy: 12,
-    ranker: 'longest-path',
+    nodesep: 120,
+    ranksep: 80,
+    edgesep: 36,
+    marginx: 20,
+    marginy: 20,
+    ranker: 'network-simplex',
   });
   for (const n of nodes) {
     // PR 5: respect per-node width/height when the caller already
     // stamped them (loop nodes do — their card width depends on the
     // iteration count, which the run-overlay layer knows BEFORE the
-    // layout pass). Fall back to the FSM defaults for every other
-    // node so the existing layout numbers stay unchanged.
-    const w = typeof n.width === 'number' ? n.width : NODE_WIDTH;
-    const h = typeof n.height === 'number' ? n.height : NODE_HEIGHT;
+    // layout pass). Fall back to the detail-level defaults for every
+    // other node (W23e: defaults flip between full + compact depending
+    // on the active viewport zoom).
+    const w = typeof n.width === 'number' ? n.width : defaultDims.width;
+    const h = typeof n.height === 'number' ? n.height : defaultDims.height;
     g.setNode(n.id, { width: w, height: h });
   }
   for (const e of edges) {
@@ -724,8 +867,8 @@ function applyDagreLayout(
 
   const positioned = nodes.map((n) => {
     const { x, y } = g.node(n.id);
-    const w = typeof n.width === 'number' ? n.width : NODE_WIDTH;
-    const h = typeof n.height === 'number' ? n.height : NODE_HEIGHT;
+    const w = typeof n.width === 'number' ? n.width : defaultDims.width;
+    const h = typeof n.height === 'number' ? n.height : defaultDims.height;
     // PR 5: dispatch to the loop custom node type for loop states.
     // The discriminator is data.isLoop — set by specGraph for loop
     // bodies. Every other node keeps the existing fsmNode renderer.
@@ -950,42 +1093,58 @@ export function FlowGraph({
     return params.get('layout') === 'dagre' ? 'dagre' : 'elk';
   }, []);
 
+  // W23e: viewport-zoom-aware detail toggle. The card render path + the
+  // layout pass both flip when the active zoom crosses
+  // DETAIL_LEVEL_ZOOM_THRESHOLD. We default to 'full' on mount so the
+  // first render (before any zoom is known) lines up with the
+  // pre-W23e visual baseline; the ZoomDetailWatcher mounted inside
+  // ReactFlow snaps us to 'compact' on the next frame when fitView
+  // computes a zoom <= the threshold.
+  const [detailLevel, setDetailLevel] = useState<DetailLevel>('full');
+
   // Manual-layout branch: identical to before — preserve caller
   // positions, stamp direction-aware handle sides, dispatch loop vs
-  // fsm node type.
+  // fsm node type. Defaults flip with the detail level so a manual
+  // layout's nodes still pick up the compact dims when active.
   const manualPositioned = useMemo(() => {
     if (autoLayout) return null;
     const sp = direction === 'LR' ? Position.Right : Position.Bottom;
     const tp = direction === 'LR' ? Position.Left : Position.Top;
+    const dims = NODE_DIMS_BY_DETAIL[detailLevel];
     return nodes.map((n) => {
       const isLoop = (n.data as { isLoop?: boolean } | undefined)?.isLoop === true;
       return {
         ...n,
-        width: n.width ?? NODE_WIDTH,
-        height: n.height ?? NODE_HEIGHT,
+        width: n.width ?? dims.width,
+        height: n.height ?? dims.height,
         sourcePosition: n.sourcePosition ?? sp,
         targetPosition: n.targetPosition ?? tp,
         type: n.type ?? (isLoop ? 'loopNode' : 'fsmNode'),
       };
     });
-  }, [nodes, autoLayout, direction]);
+  }, [nodes, autoLayout, direction, detailLevel]);
 
   // Dagre auto-layout branch: synchronous and cheap (the existing
-  // implementation). Computed every render via useMemo and the result
-  // is used either directly (?layout=dagre OR autoLayout=false-with-
-  // dagre fallback) or as the fallback when ELK throws.
-  const dagreLayout = useMemo(() => {
+  // implementation). W23e: we cache BOTH detail-level layouts and pick
+  // the one matching the active `detailLevel` so toggling zoom doesn't
+  // re-pay the (sync, but visible) dagre cost.
+  const dagreLayouts = useMemo(() => {
     if (!autoLayout) return null;
-    return applyDagreLayout(nodes, edges, direction);
+    return {
+      full: applyDagreLayout(nodes, edges, direction, NODE_DIMS_BY_DETAIL.full),
+      compact: applyDagreLayout(nodes, edges, direction, NODE_DIMS_BY_DETAIL.compact),
+    };
   }, [nodes, edges, autoLayout, direction]);
+  const dagreLayout = dagreLayouts?.[detailLevel] ?? null;
 
-  // ELK layout is async (Promise<LayoutResult>). We hold the result
-  // in state so the effect can write to it; while the promise is
-  // in-flight, isLayoutComputing flips the spinner overlay on. On
-  // throw, we log + fall back to the synchronous dagre result for
-  // the same nodes/edges identity, and remember the fallback in
-  // elkFailed so the spinner doesn't flicker on re-renders.
-  const [elkLayout, setElkLayout] = useState<LayoutResult | null>(null);
+  // ELK layout is async (Promise<LayoutResult>). W23e: we hold one
+  // result per detail level so the toggle switches between cached
+  // layouts instantly. Both layouts kick off in parallel on the same
+  // (nodes, edges, direction) change.
+  const [elkLayouts, setElkLayouts] = useState<{
+    full: LayoutResult | null;
+    compact: LayoutResult | null;
+  }>({ full: null, compact: null });
   const [isLayoutComputing, setIsLayoutComputing] = useState<boolean>(false);
   const [elkFailed, setElkFailed] = useState<boolean>(false);
 
@@ -997,7 +1156,7 @@ export function FlowGraph({
   // previous ELK result.
   useEffect(() => {
     if (!autoLayout || layoutEngine !== 'elk') {
-      setElkLayout(null);
+      setElkLayouts({ full: null, compact: null });
       setIsLayoutComputing(false);
       return;
     }
@@ -1011,10 +1170,69 @@ export function FlowGraph({
       const text = typeof e.label === 'string' ? e.label : '';
       if (text.length > 0) labelDimensions.set(e.id, measureEdgeLabel(text));
     }
-    applyElkLayout(nodes, edges, { labelDimensions })
-      .then((result) => {
+    // Stamp data.layoutWidth/layoutHeight per detail level so the ELK
+    // wrapper (which reads those as a fallback) reserves the matching
+    // slack. We rebuild the input arrays per level rather than mutate
+    // the caller's nodes.
+    const buildInput = (level: DetailLevel): Node<FlowNodeData>[] => {
+      const dims = NODE_DIMS_BY_DETAIL[level];
+      return nodes.map((n) => ({
+        ...n,
+        data: {
+          ...n.data,
+          // Only stamp the fallback when the node didn't already declare
+          // explicit width/height. Loop nodes pre-W23e never did this
+          // either, so the clean-slate uniform-width contract is intact.
+          ...(typeof n.width === 'number'
+            ? {}
+            : { layoutWidth: dims.width, layoutHeight: dims.height }),
+        } as FlowNodeData,
+      }));
+    };
+    const fullPromise = applyElkLayout(buildInput('full'), edges, {
+      labelDimensions,
+      layoutOptions: {
+        'elk.direction': direction === 'LR' ? 'RIGHT' : 'DOWN',
+      },
+    });
+    // Compact-mode layout: clamp the per-edge label box to a small
+    // square (24x12) so ELK reserves enough slack to keep labels OFF
+    // adjacent nodes, but doesn't blow the layer-to-layer gap out the
+    // way the full-pill (~170x40) reservation does. The pills still
+    // render at compact-mode font size (FsmEdge sizes them via
+    // detailLevel) so they fit the slack we reserved.
+    // Compact-mode labels render as a 14x14 pip (FsmEdge owns the
+    // compact-mode visual), so we reserve a matching 14x14 box on the
+    // layout side. Tight node-node spacing keeps the bbox compact so
+    // fit-view zoom lands above 0.55 where the compact-mode card text
+    // (truncated state names) is actually readable.
+    const compactLabelDimensions = new Map<string, { width: number; height: number }>();
+    for (const e of edges) {
+      const text = typeof e.label === 'string' ? e.label : '';
+      if (text.length > 0) compactLabelDimensions.set(e.id, { width: 14, height: 14 });
+    }
+    const compactPromise = applyElkLayout(buildInput('compact'), edges, {
+      labelDimensions: compactLabelDimensions,
+      layoutOptions: {
+        'elk.direction': direction === 'LR' ? 'RIGHT' : 'DOWN',
+        // Tight spacing — the compact pip + small card means we can
+        // pack 14 layers into ~1500 px wide and clear fit-view 0.6+.
+        // Tested with skill-code-review v4 (18 nodes / 14 layers LR):
+        // these constants produce fit-view zoom ~0.6 on a 1330x780
+        // viewport, putting the compact-mode 13px label text at ~7.8 px
+        // on-screen which is the readability floor for the truncated
+        // state names.
+        'elk.layered.spacing.nodeNodeBetweenLayers': '10',
+        'elk.layered.spacing.edgeNodeBetweenLayers': '6',
+        'elk.spacing.nodeNode': '20',
+        'elk.spacing.edgeLabel': '2',
+        'elk.padding': '[top=4,left=4,bottom=4,right=4]',
+      },
+    });
+    Promise.all([fullPromise, compactPromise])
+      .then(([full, compact]) => {
         if (cancelled) return;
-        setElkLayout(result);
+        setElkLayouts({ full, compact });
         setIsLayoutComputing(false);
         setElkFailed(false);
       })
@@ -1024,7 +1242,7 @@ export function FlowGraph({
         // through the existing dagre useMemo result.
         // eslint-disable-next-line no-console -- defensive diagnostic
         console.warn('ELK layout failed, falling back to dagre', err);
-        setElkLayout(null);
+        setElkLayouts({ full: null, compact: null });
         setIsLayoutComputing(false);
         setElkFailed(true);
       });
@@ -1032,6 +1250,8 @@ export function FlowGraph({
       cancelled = true;
     };
   }, [nodes, edges, direction, autoLayout, layoutEngine]);
+
+  const elkLayout = elkLayouts[detailLevel];
 
   // Resolve the active layout result to feed into the node/edge
   // decoration steps. Priority:
@@ -1052,10 +1272,11 @@ export function FlowGraph({
       // Build positioned nodes from the ELK result.
       const sp = direction === 'LR' ? Position.Right : Position.Bottom;
       const tp = direction === 'LR' ? Position.Left : Position.Top;
+      const dims = NODE_DIMS_BY_DETAIL[detailLevel];
       const elkNodes = nodes.map((n) => {
         const isLoop = (n.data as { isLoop?: boolean } | undefined)?.isLoop === true;
-        const w = typeof n.width === 'number' ? n.width : NODE_WIDTH;
-        const h = typeof n.height === 'number' ? n.height : NODE_HEIGHT;
+        const w = typeof n.width === 'number' ? n.width : dims.width;
+        const h = typeof n.height === 'number' ? n.height : dims.height;
         const pos = elkLayout!.nodePositions.get(n.id) ?? { x: 0, y: 0 };
         return {
           ...n,
@@ -1098,6 +1319,7 @@ export function FlowGraph({
     layoutEngine,
     nodes,
     direction,
+    detailLevel,
   ]);
 
   const decoratedNodes = useMemo(
@@ -1110,18 +1332,21 @@ export function FlowGraph({
         // (kind, label, runStatus, isCurrent, etc.). The three hover
         // flags are stripped back to undefined when nothing is hovered
         // so FsmNode's `=== true` checks render the un-highlighted
-        // baseline.
+        // baseline. detailLevel is stamped here (not on the source
+        // nodes array) so the toggle is a cheap re-decorate; the
+        // upstream owners stay detail-level-agnostic.
         const nextData = {
           ...n.data,
           isHovered,
           highlighted: isHighlighted,
           dimmed: isDimmed,
+          detailLevel,
         } as FlowNodeData;
         const withSelection =
           selectedNodeId && n.id === selectedNodeId ? { ...n, selected: true } : n;
         return { ...withSelection, data: nextData };
       }),
-    [positioned, selectedNodeId, hoveredNodeId, hoverActive, highlight],
+    [positioned, selectedNodeId, hoveredNodeId, hoverActive, highlight, detailLevel],
   );
 
   const showMiniMap = miniMap ?? nodes.length > 10;
@@ -1142,6 +1367,12 @@ export function FlowGraph({
         isHovered,
         highlighted: isHighlighted,
         dimmed: isDimmed,
+        // Mirror the node-side detailLevel onto every edge so FsmEdge
+        // can shrink (or hide) its label pill when the graph is
+        // rendering compact cards. Predicate labels at compact zoom
+        // overflow node footprints and undo the layout's slack
+        // reservation, so the compact path drops to a small icon.
+        detailLevel,
       };
       // Boost the SVG stroke when the edge is the hover target or a
       // 1-hop neighbour. FsmEdge owns label pill opacity / colour via
@@ -1167,7 +1398,7 @@ export function FlowGraph({
       };
       return { ...e, data: nextData, style: nextStyle };
     });
-  }, [edges, edgeLabelPositions, elkEdgeRouting, hoveredEdgeId, hoverActive, highlight]);
+  }, [edges, edgeLabelPositions, elkEdgeRouting, hoveredEdgeId, hoverActive, highlight, detailLevel]);
 
   // React Flow's onNodeMouseEnter / Leave fire with (event, node);
   // collapse to just the id and clear any active edge hover so the two
@@ -1185,6 +1416,13 @@ export function FlowGraph({
   }, []);
   const onEdgeMouseLeave = useCallback(() => {
     setHoveredEdgeId(null);
+  }, []);
+
+  // Stable callback so ZoomDetailWatcher's useEffect doesn't re-fire on
+  // every parent render. setState skips a render when the next value is
+  // identical, so we don't have to guard here.
+  const handleDetailLevelChange = useCallback((next: DetailLevel) => {
+    setDetailLevel(next);
   }, []);
 
   if (nodes.length === 0) {
@@ -1272,6 +1510,15 @@ export function FlowGraph({
         onEdgeMouseEnter={onEdgeMouseEnter}
         onEdgeMouseLeave={onEdgeMouseLeave}
       >
+        {/* W23e: lives inside ReactFlow so useStore has a real store
+            context. Renders nothing — its only job is to subscribe to
+            the live viewport zoom and lift a detailLevel up to the
+            orchestrator when the value crosses the threshold. */}
+        <ZoomDetailWatcher onChange={handleDetailLevelChange} />
+        <RefitOnDetailChange
+          detailLevel={detailLevel}
+          enabled={viewport.defaultViewport === undefined}
+        />
         {background ? (
           <Background
             gap={16}

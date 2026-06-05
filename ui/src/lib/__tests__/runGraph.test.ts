@@ -465,15 +465,18 @@ describe('PR 5: loop iteration entries', () => {
     expect(data.iterationEntries?.map((e) => e.iteration_n)).toEqual([1, 2]);
   });
 
-  test('overlayRunOnSpecGraph re-stamps loop node width when iterations exceed spec ceiling', () => {
+  test('clean-slate: overlayRunOnSpecGraph leaves loop node width untouched (uniform cards)', () => {
+    // Clean-slate rebuild: the loop chip strip moved to the inspector
+    // Sheet, so a loop card is the same dimensions as every other node
+    // regardless of iteration count. overlayRunOnSpecGraph must NOT
+    // mutate width — FlowGraph fills in the uniform NODE_WIDTH/HEIGHT
+    // defaults during the layout pass.
     const specNode = (id: string): Node<FlowNodeData> => ({
       id,
       position: { x: 0, y: 0 },
-      width: 270 + 2 * 40, // spec said max 2
       data: { kind: 'loop', label: id, isLoop: true, loopMaxIterations: 2 } as FlowNodeData,
     });
     const base = { nodes: [specNode('tick')], edges: [] as Edge[] };
-    // The run actually ran 5 iterations (engine bumped past declared max).
     let chain: StateNode | null = null;
     for (let i = 5; i >= 1; i -= 1) {
       const opts: Partial<StateNode> = {
@@ -488,8 +491,12 @@ describe('PR 5: loop iteration entries', () => {
     }
     const overlay = buildRunOverlay(manifest('tick'), chain, noEvents);
     const out = overlayRunOnSpecGraph(base, overlay);
-    // Width should expand to fit the OBSERVED 5 iterations: 270 + 5*40.
-    expect(out.nodes[0].width).toBe(270 + 5 * 40);
+    // Width is not stamped — FlowGraph will apply NODE_WIDTH at layout.
+    expect(out.nodes[0].width).toBeUndefined();
+    // But iteration metadata still flows through so the badge + the
+    // inspector Sheet can render the chip strip.
+    const data = out.nodes[0].data as FlowNodeData & { iterationCount?: number };
+    expect(data.iterationCount).toBe(5);
   });
 });
 

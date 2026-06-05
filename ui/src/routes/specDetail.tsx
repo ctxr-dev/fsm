@@ -231,7 +231,7 @@ function GraphPanel({ detail }: GraphPanelProps): JSX.Element {
         nodes={graph.nodes}
         edges={graph.edges}
         autoLayout={true}
-        direction="TB"
+        direction="LR"
         onNodeClick={handleNodeClick}
         onEdgeClick={handleEdgeClick}
         viewportKey={`specs:${detail.id}`}

@@ -114,12 +114,12 @@ describe('FsmEdge', () => {
     expect(baseEdgeCalls[0].path).toBe('M0,0 L1,1 SMOOTHSTEP');
   });
 
-  test('label is always anchored on the geometric cross-segment midpoint, ignoring layoutLabel', () => {
-    // Criterion 7: pill must sit ON the actual line xyflow renders.
-    // Neither dagre's nor ELK's reserved label position coincides with
-    // the orthogonal smooth-step polyline we draw — so the label
-    // anchors on the longest-segment midpoint regardless of any
-    // layoutLabel / dagreLabel value the layout pass left on the edge.
+  test('label prefers layout-engine anchor (layoutLabel) over geometric midpoint', () => {
+    // Clean-slate rebuild: the layout pass (ELK or dagre) reserves a
+    // label bounding box during routing, so its label centre is what
+    // keeps sibling labels from stacking on a fan-out. FsmEdge honours
+    // that anchor when present and only falls back to the geometric
+    // longest-segment midpoint when no layout pass ran.
     const sections: ElkEdgeSection[] = [
       {
         id: 's0',
@@ -141,18 +141,38 @@ describe('FsmEdge', () => {
           data: {
             fullLabel: 'predicate-here',
             elkSections: sections,
-            // Intentionally divergent layoutLabel — must be ignored.
+            // The layout pass reserved this centre — FsmEdge honours it.
             layoutLabel: { x: 42, y: 17 },
           },
         } as unknown as Parameters<typeof FsmEdge>[0])}
       />,
     );
-    // LR orientation, sy == ty, so longestSegmentMidpoint returns the
-    // x-midpoint (100) and the source y (0). The pill sits at
-    // translate(100px, 0px).
     const pill = getByText('predicate-here').closest('div');
     expect(pill).not.toBeNull();
     const style = (pill as HTMLElement).getAttribute('style') ?? '';
+    expect(style).toContain('translate(42px, 17px)');
+  });
+
+  test('label falls back to longest-segment midpoint when no layoutLabel is present', () => {
+    const { getByText } = render(
+      <FsmEdge
+        {...({
+          id: 'a-b',
+          sourceX: 0,
+          sourceY: 0,
+          targetX: 200,
+          targetY: 0,
+          sourcePosition: 'right',
+          targetPosition: 'left',
+          label: 'fallback-pred',
+          data: { fullLabel: 'fallback-pred' },
+        } as unknown as Parameters<typeof FsmEdge>[0])}
+      />,
+    );
+    const pill = getByText('fallback-pred').closest('div');
+    const style = (pill as HTMLElement).getAttribute('style') ?? '';
+    // LR orientation, sy == ty, so the longest-segment midpoint is
+    // the x-midpoint (100) with the source y (0).
     expect(style).toContain('translate(100px, 0px)');
   });
 });

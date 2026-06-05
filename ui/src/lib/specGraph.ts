@@ -26,7 +26,6 @@
 
 import type { Edge, Node } from '@xyflow/react';
 import type { FlowNodeData, FlowNodeKind } from '../components/FlowGraph';
-import { LOOP_NODE_HEIGHT, loopNodeExpandedWidth } from '../components/FlowGraph';
 
 interface SpecStateShape {
   id: string;
@@ -215,26 +214,15 @@ export function specToGraph(definition: unknown): SpecGraph {
       sublabel = purpose || structural || '';
     }
 
-    // PR 5: loop nodes get their EXPANDED width baked into the layout
-    // input synchronously. dagre lays out once on mount; if we left the
-    // node at the default 270px and the operator later expanded the
-    // chip strip, sibling nodes would suddenly overlap. By pre-sizing
-    // the loop node to its widest possible layout the operator's
-    // expand/collapse toggle only swaps the chip strip's visibility,
-    // never the surrounding topology. Non-loop nodes keep the dagre
-    // default (FlowGraph fills in NODE_WIDTH/NODE_HEIGHT).
-    const expandedWidth = isLoop ? loopNodeExpandedWidth(loopMaxIterations) : undefined;
-    const expandedHeight = isLoop ? LOOP_NODE_HEIGHT : undefined;
+    // Clean-slate rebuild: loop nodes get the SAME dimensions as every
+    // other node (the chip strip moved to the inspector Sheet, so the
+    // card no longer needs an iteration-count-dependent width). We
+    // therefore drop the per-node width/height stamp here; FlowGraph
+    // fills in the uniform NODE_WIDTH/NODE_HEIGHT defaults during the
+    // layout pass for both spec and run-overlay paths.
     return {
       id: s.id,
       position: { x: 0, y: 0 }, // dagre fills these in
-      // Per-node width/height drive both the dagre layout pass (so it
-      // routes around the wider loop card) AND the MiniMap thumbnail.
-      // Spread `undefined` so xyflow falls through to its defaults for
-      // non-loop nodes; conditionally adding the keys would mutate the
-      // node shape between renders and re-trigger memoisation.
-      ...(expandedWidth !== undefined ? { width: expandedWidth } : {}),
-      ...(expandedHeight !== undefined ? { height: expandedHeight } : {}),
       // W21: copy the FULL spec state object onto data.state so the
       // click handler can render a State Inspector Sheet without
       // re-walking the spec. fullLabel/fullSublabel mirror the
