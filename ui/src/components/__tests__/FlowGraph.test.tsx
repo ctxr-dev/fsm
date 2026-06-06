@@ -83,17 +83,21 @@ describe('FlowGraph', () => {
       { id: 'a-b', source: 'a', target: 'b' },
       { id: 'b-c', source: 'b', target: 'c' },
     ];
+    // Direction is now pinned to TB regardless of the prop value. The
+    // legacy LR prop is preserved for back-compat but ignored — the
+    // chain stacks vertically, so the y-coordinates differ.
     render(<FlowGraph nodes={nodes} edges={edges} autoLayout={true} direction="LR" />);
     const positioned = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
-    // Dagre lays out in a chain; positions must differ across all three nodes.
-    const xs = positioned.map((n) => n.position.x);
-    const uniqueX = new Set(xs);
-    expect(uniqueX.size).toBe(3);
+    // TB layout: dagre stacks ranks vertically, so y differs across
+    // all three nodes.
+    const ys = positioned.map((n) => n.position.y);
+    const uniqueY = new Set(ys);
+    expect(uniqueY.size).toBe(3);
     // All nodes should be tagged with our custom node type.
     expect(positioned.every((n) => n.type === 'fsmNode')).toBe(true);
   });
 
-  test('autoLayout=false preserves caller positions but stamps direction-aware handle sides', () => {
+  test('autoLayout=false preserves caller positions and stamps TB handle sides regardless of direction prop', () => {
     const nodes: Node<FlowNodeData>[] = [
       { id: 'a', position: { x: 100, y: 200 }, data: { kind: 'state', label: 'a' } },
     ];
@@ -107,13 +111,15 @@ describe('FlowGraph', () => {
     expect(passedTB[0].targetPosition).toBe('top');
     expect(passedTB[0].type).toBe('fsmNode');
 
-    // Same nodes but LR direction → handles flip to right/left.
+    // direction="LR" is now ignored — vertical orientation is the
+    // product-level invariant for both the spec graph and the run
+    // graph, so the handles still stamp bottom/top.
     render(<FlowGraph nodes={nodes} edges={[]} autoLayout={false} direction="LR" />);
     const passedLR = lastReactFlowProps!.nodes as Array<
       Node<FlowNodeData> & { sourcePosition?: string; targetPosition?: string }
     >;
-    expect(passedLR[0].sourcePosition).toBe('right');
-    expect(passedLR[0].targetPosition).toBe('left');
+    expect(passedLR[0].sourcePosition).toBe('bottom');
+    expect(passedLR[0].targetPosition).toBe('top');
   });
 
   test('selectedNodeId decorates the matching node with selected=true', () => {
@@ -813,7 +819,11 @@ describe('FlowGraph', () => {
 
     test('zoom above threshold renders detailLevel=full on every node', async () => {
       const { DETAIL_LEVEL_ZOOM_THRESHOLD } = await import('../FlowGraph');
-      expect(DETAIL_LEVEL_ZOOM_THRESHOLD).toBe(0.7);
+      // Threshold lowered to 0.4 to pair with the React Flow
+      // minZoom=0.45 floor — the equilibrium fit-view zoom (clamped to
+      // 0.45) now sits ABOVE the threshold so full detail stays on by
+      // default. Compact mode only activates below 0.4.
+      expect(DETAIL_LEVEL_ZOOM_THRESHOLD).toBe(0.4);
       mockReactFlowZoom = 0.9; // > threshold
       const nodes: Node<FlowNodeData>[] = [
         { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'worker', label: 'plan' } },
@@ -833,7 +843,7 @@ describe('FlowGraph', () => {
     });
 
     test('zoom at or below threshold renders detailLevel=compact on every node', async () => {
-      mockReactFlowZoom = 0.5; // < threshold
+      mockReactFlowZoom = 0.3; // < threshold (0.4)
       const nodes: Node<FlowNodeData>[] = [
         { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'worker', label: 'plan' } },
         { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'worker', label: 'execute' } },
@@ -849,7 +859,7 @@ describe('FlowGraph', () => {
     });
 
     test('threshold is exclusive on the upper side — exactly at threshold is compact', async () => {
-      mockReactFlowZoom = 0.7;
+      mockReactFlowZoom = 0.4;
       const nodes: Node<FlowNodeData>[] = [
         { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'worker', label: 'plan' } },
       ];
@@ -863,9 +873,10 @@ describe('FlowGraph', () => {
 
     test('compact mode shrinks the layout node dimensions (100x44 vs 160x60)', async () => {
       // The dagre branch picks up the smaller default dims when the
-      // detail level flips, so a 3-node chain packs tighter horizontally.
-      // We compare the bounding box width across the two levels on the
-      // same input to assert the compact layout is strictly smaller.
+      // detail level flips, so a 3-node chain packs tighter vertically
+      // (layout is pinned to TB). We compare the bounding-box HEIGHT
+      // across the two levels on the same input to assert the compact
+      // layout is strictly smaller.
       const nodes: Node<FlowNodeData>[] = [
         { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'worker', label: 'a' } },
         { id: 'b', position: { x: 0, y: 0 }, data: { kind: 'worker', label: 'b' } },
@@ -875,28 +886,31 @@ describe('FlowGraph', () => {
         { id: 'a-b', source: 'a', target: 'b' },
         { id: 'b-c', source: 'b', target: 'c' },
       ];
+      // Below DETAIL_LEVEL_ZOOM_THRESHOLD (0.4) the renderer flips to
+      // compact; above it stays full. Use values that straddle the
+      // threshold so the two renders genuinely pick different layouts.
       mockReactFlowZoom = 0.8;
       const { rerender, unmount } = render(
-        <FlowGraph nodes={nodes} edges={edges} autoLayout={true} direction="LR" />,
+        <FlowGraph nodes={nodes} edges={edges} autoLayout={true} />,
       );
       await act(async () => {
         await Promise.resolve();
       });
       const fullForwarded = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
-      const fullXs = fullForwarded.map((n) => n.position.x);
-      const fullSpan = Math.max(...fullXs) - Math.min(...fullXs);
+      const fullYs = fullForwarded.map((n) => n.position.y);
+      const fullSpan = Math.max(...fullYs) - Math.min(...fullYs);
       unmount();
 
       mockReactFlowZoom = 0.2;
-      render(<FlowGraph nodes={nodes} edges={edges} autoLayout={true} direction="LR" />);
+      render(<FlowGraph nodes={nodes} edges={edges} autoLayout={true} />);
       await act(async () => {
         await Promise.resolve();
       });
       const compactForwarded = lastReactFlowProps!.nodes as Node<FlowNodeData>[];
-      const compactXs = compactForwarded.map((n) => n.position.x);
-      const compactSpan = Math.max(...compactXs) - Math.min(...compactXs);
-      // dagre's LR span is dominated by node width * (n-1) + nodesep.
-      // Compact width (100) is smaller than full (160) so the span
+      const compactYs = compactForwarded.map((n) => n.position.y);
+      const compactSpan = Math.max(...compactYs) - Math.min(...compactYs);
+      // dagre's TB span is dominated by node height * (n-1) + ranksep.
+      // Compact height (44) is smaller than full (60) so the span
       // shrinks. We don't pin the exact pixel count (dagre tuning
       // could move it) but the relative ordering is load-bearing.
       expect(compactSpan).toBeLessThan(fullSpan);
@@ -905,6 +919,29 @@ describe('FlowGraph', () => {
       // Re-render to force unmount cleanup symmetry.
       rerender(<div />);
     });
+  });
+
+  test('ReactFlow receives minZoom=0.45 and maxZoom=2 so the equilibrium zoom never settles in compact mode', () => {
+    // The user reported "min zoom is too low" because the run graph's
+    // fit-view zoom landed in compact mode (labels collapsed to pips).
+    // The fix pins the React Flow minZoom floor ABOVE
+    // DETAIL_LEVEL_ZOOM_THRESHOLD so fit-view + compact mode never
+    // overlap by default. maxZoom is pinned at the React Flow default
+    // (2) so Cmd/Ctrl+wheel zoom-in stays useful.
+    const nodes: Node<FlowNodeData>[] = [
+      { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+    ];
+    render(<FlowGraph nodes={nodes} edges={[]} autoLayout={false} />);
+    expect(lastReactFlowProps!.minZoom).toBe(0.45);
+    expect(lastReactFlowProps!.maxZoom).toBe(2);
+    // fitViewOptions are clamped to the same floor so the initial
+    // frame can't undershoot the minZoom prop.
+    const fvo = lastReactFlowProps!.fitViewOptions as {
+      minZoom?: number;
+      maxZoom?: number;
+    };
+    expect(fvo.minZoom).toBe(0.45);
+    expect(fvo.maxZoom).toBe(1.5);
   });
 
   test('default direction is TB (top-to-bottom) when not specified', () => {

@@ -198,7 +198,15 @@ export async function applyElkLayout(
   opts: ApplyElkLayoutOptions = {},
 ): Promise<LayoutResult> {
   const labelDimensions = opts.labelDimensions ?? new Map();
-  const layoutOptions = { ...DEFAULT_LAYOUT_OPTIONS, ...(opts.layoutOptions ?? {}) };
+  // Direction is pinned to DOWN (top-to-bottom) regardless of caller
+  // overrides — vertical orientation is a product-level invariant for
+  // both the spec graph and the run graph. Callers can still override
+  // every OTHER ELK option, but 'elk.direction' is forced.
+  const layoutOptions: LayoutOptions = {
+    ...DEFAULT_LAYOUT_OPTIONS,
+    ...(opts.layoutOptions ?? {}),
+    'elk.direction': 'DOWN',
+  };
 
   // Build the ELK input graph. Each React Flow node becomes an ElkNode
   // child of the synthetic root; each edge becomes an ElkExtendedEdge

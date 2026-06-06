@@ -171,6 +171,29 @@ describe('applyElkLayout', () => {
     ).toBe(false);
   });
 
+  test('direction is pinned to DOWN — caller cannot override to RIGHT', async () => {
+    // Vertical orientation is a product-level invariant for both the
+    // spec graph and the run graph. Even if a caller passes
+    // 'elk.direction': 'RIGHT' in layoutOptions (back-compat surface
+    // pre-fix), the wrapper forces DOWN so the layout always renders
+    // top-to-bottom. Assertion strategy: lay out a tiny chain with a
+    // RIGHT override; the source must be ABOVE the target (positive
+    // y delta), not LEFT of it (positive x delta).
+    const nodes: Node[] = [makeNode('a', 200, 80), makeNode('b', 200, 80)];
+    const edges: Edge[] = [{ id: 'a-b', source: 'a', target: 'b' }];
+    const result = await applyElkLayout(nodes, edges, {
+      layoutOptions: { 'elk.direction': 'RIGHT' },
+    });
+    const aPos = result.nodePositions.get('a')!;
+    const bPos = result.nodePositions.get('b')!;
+    // DOWN: b is below a (yB > yA), x positions align.
+    expect(bPos.y).toBeGreaterThan(aPos.y);
+    // x alignment: the two cards stack vertically, so |xB - xA| is
+    // small (well under one card width) — much smaller than the
+    // y-delta which carries a full card + ranksep.
+    expect(Math.abs(bPos.x - aPos.x)).toBeLessThan(bPos.y - aPos.y);
+  });
+
   test('label dimensions round-trip: reserved space matches the request', async () => {
     // Single edge with a known label dimension. After layout, the
     // returned label centre should land inside the graph bounding

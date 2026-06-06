@@ -190,6 +190,53 @@ describe('RunProgressGraph — PR 4 additions', () => {
     expect(onEdgeClick).toHaveBeenCalledWith('plan', 'execute');
   });
 
+  test('the run graph inherits the minZoom=0.45 + maxZoom=2 floor from FlowGraph', async () => {
+    // The user's "can't zoom in / labels disappear" symptom was the
+    // run graph: fitView landed at a zoom in compact-mode territory,
+    // collapsing the per-edge predicate labels to a pip. Pinning the
+    // floor here makes the bug unreachable on the default mount.
+    render(
+      <RunProgressGraph
+        manifest={MANIFEST}
+        stateTree={STATE_TREE}
+        events={[]}
+      />,
+    );
+    await waitFor(() => {
+      expect(lastReactFlowProps).not.toBeNull();
+    });
+    expect(lastReactFlowProps!.minZoom).toBe(0.45);
+    expect(lastReactFlowProps!.maxZoom).toBe(2);
+  });
+
+  test('the run graph lays out vertically — source handles at the bottom, target handles at the top', async () => {
+    // Vertical-orientation invariant: the run graph (like the spec
+    // graph) must stack top-to-bottom regardless of which `direction`
+    // prop variant flows through FlowGraph. The handle anchors are
+    // the cheap, FlowGraph-internal observable: bottom = source, top
+    // = target on every node.
+    render(
+      <RunProgressGraph
+        manifest={MANIFEST}
+        stateTree={STATE_TREE}
+        events={[]}
+      />,
+    );
+    await waitFor(() => {
+      expect(lastReactFlowProps).not.toBeNull();
+      expect(
+        (lastReactFlowProps!.nodes as Array<{ id: string }>).length,
+      ).toBeGreaterThan(0);
+    });
+    const decorated = lastReactFlowProps!.nodes as Array<
+      { sourcePosition?: string; targetPosition?: string }
+    >;
+    for (const n of decorated) {
+      expect(n.sourcePosition).toBe('bottom');
+      expect(n.targetPosition).toBe('top');
+    }
+  });
+
   test('the current state node renders with the fsm-pulse-current animation class', async () => {
     const { container } = render(
       <RunProgressGraph
