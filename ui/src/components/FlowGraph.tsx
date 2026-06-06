@@ -114,14 +114,14 @@ export interface FlowNodeData extends Record<string, unknown> {
 /** Zoom threshold below which (≤) the graph switches to compact cards.
  *  Exported so tests + the LoopNode can share the same number.
  *
- *  Raised from 0.4 to 0.7 so the dense 14-layer chains (e.g.
- *  skill-code-review v4) stay in compact mode at their natural
- *  fit-view zoom (~0.55-0.65 with compact ELK spacing). The previous
- *  0.4 threshold left them oscillating: full layout fit at 0.27 →
- *  flip to compact → compact layout fit at 0.65 → flip back to full.
- *  With 0.7 the compact layout's fit-view zoom stays in compact mode,
- *  breaking the cycle without forcing every tiny graph into compact. */
-export const DETAIL_LEVEL_ZOOM_THRESHOLD = 0.7;
+ *  Lowered back to 0.4 to pair with the React Flow ``minZoom={0.45}``
+ *  floor introduced alongside the vertical-orientation fix: at the new
+ *  minimum zoom the graph never settles in compact mode, so labels +
+ *  full-detail cards stay readable at the equilibrium fit-view zoom.
+ *  Compact mode now only kicks in for genuinely tiny zooms (the user
+ *  has to Cmd/Ctrl-wheel BELOW the floor, which means they've
+ *  explicitly requested the bird's-eye view). */
+export const DETAIL_LEVEL_ZOOM_THRESHOLD = 0.4;
 
 /** Maximum visible characters for a state-name label in compact mode.
  *  Anything longer is truncated to this prefix plus an ellipsis. The
@@ -151,8 +151,12 @@ export interface FlowGraphProps {
    * per-node position. Pass `false` if the caller has already assigned
    * positions (e.g. a saved manual layout) and wants them preserved. */
   autoLayout?: boolean;
-  /** Layout direction. Default 'TB' (top to bottom) — natural reading for
-   * FSMs, and fits a viewport-bounded panel better than LR for long chains. */
+  /** Layout direction. Pinned to 'TB' (top to bottom) — vertical
+   *  orientation is a product-level invariant for both the spec graph
+   *  and the run graph. The prop is preserved for back-compat callers
+   *  but its value is ignored: every render lays out top-to-bottom and
+   *  stamps Top/Bottom handle anchors. Future re-introduction of
+   *  horizontal layout would resurrect this enum. */
   direction?: 'LR' | 'TB';
   /** Click handler on a node (e.g. open the state-details Sheet). */
   onNodeClick?: (id: string, data: FlowNodeData) => void;
@@ -672,7 +676,10 @@ function RefitOnDetailChange({
     // React state) has committed and the new node positions exist
     // before we measure their bbox.
     const handle = requestAnimationFrame(() => {
-      fitView({ padding: 0.05, includeHiddenNodes: false, minZoom: 0.2, maxZoom: 1.5 });
+      // minZoom mirrors the floor pinned on the ReactFlow root so a
+      // detail-level flip never refits us BELOW the threshold (which
+      // would re-trigger the compact transition and oscillate).
+      fitView({ padding: 0.05, includeHiddenNodes: false, minZoom: 0.45, maxZoom: 1.5 });
     });
     return () => cancelAnimationFrame(handle);
   }, [detailLevel, enabled, fitView]);
@@ -1102,14 +1109,18 @@ export function FlowGraph({
   // computes a zoom <= the threshold.
   const [detailLevel, setDetailLevel] = useState<DetailLevel>('full');
 
-  // Manual-layout branch: identical to before — preserve caller
-  // positions, stamp direction-aware handle sides, dispatch loop vs
-  // fsm node type. Defaults flip with the detail level so a manual
-  // layout's nodes still pick up the compact dims when active.
+  // Manual-layout branch: preserve caller positions, stamp Top/Bottom
+  // handle sides (TB layout is now pinned regardless of the `direction`
+  // prop — see prop doc above), dispatch loop vs fsm node type.
+  // Defaults flip with the detail level so a manual layout's nodes
+  // still pick up the compact dims when active.
   const manualPositioned = useMemo(() => {
     if (autoLayout) return null;
-    const sp = direction === 'LR' ? Position.Right : Position.Bottom;
-    const tp = direction === 'LR' ? Position.Left : Position.Top;
+    // Vertical orientation invariant: source handle anchors at the
+    // bottom of the card, target handle at the top.
+    void direction; // referenced for back-compat callers; value ignored.
+    const sp = Position.Bottom;
+    const tp = Position.Top;
     const dims = NODE_DIMS_BY_DETAIL[detailLevel];
     return nodes.map((n) => {
       const isLoop = (n.data as { isLoop?: boolean } | undefined)?.isLoop === true;
@@ -1127,12 +1138,15 @@ export function FlowGraph({
   // Dagre auto-layout branch: synchronous and cheap (the existing
   // implementation). W23e: we cache BOTH detail-level layouts and pick
   // the one matching the active `detailLevel` so toggling zoom doesn't
-  // re-pay the (sync, but visible) dagre cost.
+  // re-pay the (sync, but visible) dagre cost. Direction is pinned to
+  // 'TB' regardless of the prop so the dagre fallback matches the ELK
+  // vertical-orientation invariant.
   const dagreLayouts = useMemo(() => {
     if (!autoLayout) return null;
+    void direction; // back-compat only; layout is TB.
     return {
-      full: applyDagreLayout(nodes, edges, direction, NODE_DIMS_BY_DETAIL.full),
-      compact: applyDagreLayout(nodes, edges, direction, NODE_DIMS_BY_DETAIL.compact),
+      full: applyDagreLayout(nodes, edges, 'TB', NODE_DIMS_BY_DETAIL.full),
+      compact: applyDagreLayout(nodes, edges, 'TB', NODE_DIMS_BY_DETAIL.compact),
     };
   }, [nodes, edges, autoLayout, direction]);
   const dagreLayout = dagreLayouts?.[detailLevel] ?? null;
@@ -1191,9 +1205,11 @@ export function FlowGraph({
     };
     const fullPromise = applyElkLayout(buildInput('full'), edges, {
       labelDimensions,
-      layoutOptions: {
-        'elk.direction': direction === 'LR' ? 'RIGHT' : 'DOWN',
-      },
+      // Direction is pinned to DOWN inside the ELK wrapper itself;
+      // omit it from the per-call override block. The ``direction``
+      // prop only governs handle anchor sides (Top/Bottom) at the
+      // React Flow layer.
+      layoutOptions: {},
     });
     // Compact-mode layout: clamp the per-edge label box to a small
     // square (24x12) so ELK reserves enough slack to keep labels OFF
@@ -1214,7 +1230,7 @@ export function FlowGraph({
     const compactPromise = applyElkLayout(buildInput('compact'), edges, {
       labelDimensions: compactLabelDimensions,
       layoutOptions: {
-        'elk.direction': direction === 'LR' ? 'RIGHT' : 'DOWN',
+        // Direction pinned to DOWN inside the ELK wrapper; omit here.
         // Tight spacing — the compact pip + small card means we can
         // pack 14 layers into ~1500 px wide and clear fit-view 0.6+.
         // Tested with skill-code-review v4 (18 nodes / 14 layers LR):
@@ -1269,9 +1285,12 @@ export function FlowGraph({
     const usingElk =
       layoutEngine === 'elk' && !elkFailed && elkLayout !== null;
     if (usingElk) {
-      // Build positioned nodes from the ELK result.
-      const sp = direction === 'LR' ? Position.Right : Position.Bottom;
-      const tp = direction === 'LR' ? Position.Left : Position.Top;
+      // Build positioned nodes from the ELK result. Vertical
+      // orientation invariant: source handle at the bottom, target at
+      // the top, matching the pinned 'elk.direction'='DOWN'.
+      void direction;
+      const sp = Position.Bottom;
+      const tp = Position.Top;
       const dims = NODE_DIMS_BY_DETAIL[detailLevel];
       const elkNodes = nodes.map((n) => {
         const isLoop = (n.data as { isLoop?: boolean } | undefined)?.isLoop === true;
@@ -1470,8 +1489,18 @@ export function FlowGraph({
         // the operator has zoomed/panned and the viewport is saved,
         // restoring it on remount beats re-framing the whole graph.
         fitView={viewport.defaultViewport === undefined}
-        fitViewOptions={{ padding: 0.05, includeHiddenNodes: false, minZoom: 0.2, maxZoom: 1.5 }}
-        minZoom={0.15}
+        // Min-zoom floor is 0.45 so the equilibrium fit-view zoom sits
+        // ABOVE DETAIL_LEVEL_ZOOM_THRESHOLD (0.4). Without this floor a
+        // tall TB chain (e.g. 14-layer skill-code-review v4) framed by
+        // fitView lands at ~0.55-0.65 zoom, then ZoomDetailWatcher flips
+        // detailLevel='compact' and the labels collapse to pips —
+        // perceptually "min zoom is too low". With minZoom=0.45 the
+        // fitView is clamped above the compact threshold and the graph
+        // renders at full detail by default; the operator pans (drag or
+        // wheel) to navigate a long chain. Cmd/Ctrl+wheel still zooms
+        // in to maxZoom=2 if they want detail.
+        fitViewOptions={{ padding: 0.05, includeHiddenNodes: false, minZoom: 0.45, maxZoom: 1.5 }}
+        minZoom={0.45}
         maxZoom={2}
         defaultViewport={viewport.defaultViewport}
         onMove={viewportKey ? viewport.onMove : undefined}
