@@ -131,4 +131,54 @@ describe('useDebouncedRefetch', () => {
     vi.advanceTimersByTime(1);
     expect(fn).toHaveBeenCalledTimes(1);
   });
+
+  test('regression #3: the returned handle has stable referential identity across re-renders', () => {
+    // Pre-fix, the hook returned a fresh `{ trigger, flush, cancel }`
+    // object on every render. The run-detail route lists four
+    // refetchers in its SSE useEffect dependency array; under the old
+    // implementation, the effect tore down and re-opened the EventStream
+    // on every parent render (and every refetcher's inner `fn` arrow
+    // also churned the deps a second way). The fix memoises the handle
+    // so the SSE useEffect's deps only flip when something semantically
+    // changes — not when an unrelated render runs.
+    const fn = vi.fn();
+    const initialProps: { fnRef: () => void } = { fnRef: fn };
+    const { result, rerender } = renderHook(
+      ({ fnRef }: { fnRef: () => void }) => useDebouncedRefetch(fnRef),
+      { initialProps },
+    );
+    const handleAtMount = result.current;
+    // Render multiple times with a fresh `fn` arrow to mimic the
+    // run-detail consumer that passes a closure capturing the latest
+    // state on every render.
+    rerender({ fnRef: () => fn() });
+    rerender({ fnRef: () => fn() });
+    rerender({ fnRef: () => fn() });
+    const handleAfterRerenders = result.current;
+    // Identity equality: the SAME object survives across renders.
+    expect(handleAfterRerenders).toBe(handleAtMount);
+    expect(handleAfterRerenders.trigger).toBe(handleAtMount.trigger);
+    expect(handleAfterRerenders.flush).toBe(handleAtMount.flush);
+    expect(handleAfterRerenders.cancel).toBe(handleAtMount.cancel);
+  });
+
+  test('regression #3: a stale fn closure is never invoked — the latest fn always runs', () => {
+    // A consequence of memoising the handle: we must keep dispatching
+    // through `fnRef.current` so the LATEST `fn` arrow is called even
+    // though the closure that built `trigger` saw only the first one.
+    // Without the ref deref, memoisation would have introduced a fresh
+    // bug (always calling the mount-time fn).
+    const firstFn = vi.fn();
+    const secondFn = vi.fn();
+    const initialProps: { fnRef: () => void } = { fnRef: firstFn };
+    const { result, rerender } = renderHook(
+      ({ fnRef }: { fnRef: () => void }) => useDebouncedRefetch(fnRef),
+      { initialProps },
+    );
+    rerender({ fnRef: secondFn });
+    result.current.trigger();
+    vi.advanceTimersByTime(200);
+    expect(firstFn).not.toHaveBeenCalled();
+    expect(secondFn).toHaveBeenCalledTimes(1);
+  });
 });

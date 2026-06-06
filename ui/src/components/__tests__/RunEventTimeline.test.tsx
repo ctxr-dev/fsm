@@ -128,4 +128,56 @@ describe('RunEventTimeline (freshness flash)', () => {
     expect(rowsByEventId(container).size).toBe(0);
     expect(getByText(/No events yet/i)).toBeInTheDocument();
   });
+
+  test('regression #2: timeline exposes a polite log live region for SSE-driven additions', () => {
+    // Pre-fix, the <ol> carried only `aria-label="Run event timeline"`
+    // and SSE-prepended rows landed silently — screen readers gave the
+    // operator no audible cue that the tape grew. The fix surfaces a
+    // log live region (role="log" + aria-live="polite" +
+    // aria-relevant="additions") around the timeline so AT users hear
+    // each new event as it arrives. The region wraps the scroll
+    // container so the <ol> keeps its native list semantics (an aria
+    // role on the <ol> would strip the implicit list role and orphan
+    // every <li>).
+    const events = [
+      makeEvent({ id: 'a' }),
+      makeEvent({ id: 'b', created_at: '2025-01-01T00:00:01Z' }),
+    ];
+    const { container } = render(<RunEventTimeline events={events} />);
+    const liveRegion = container.querySelector('[role="log"]');
+    expect(liveRegion).not.toBeNull();
+    expect(liveRegion!.getAttribute('aria-live')).toBe('polite');
+    expect(liveRegion!.getAttribute('aria-relevant')).toBe('additions');
+    // The <ol> still renders inside the live region so list semantics
+    // survive for the row navigation shortcuts AT users rely on.
+    expect(liveRegion!.querySelector('ol')).not.toBeNull();
+  });
+
+  test('regression #2: each row carries a concise announceable summary (timestamp + kind + producer)', () => {
+    // The announceable summary is what the live region's polite poke
+    // reads aloud; we deliberately keep it short and skip the JsonViewer
+    // payload (a long unstructured blob would otherwise be read on every
+    // SSE prepend). The summary lives in a `.sr-only` span so sighted
+    // users see the existing visual row unchanged.
+    const events = [
+      makeEvent({
+        id: 'a',
+        kind: 'state_entered',
+        producer_id: 'engine',
+        created_at: '2025-01-01T00:00:00Z',
+      }),
+    ];
+    const { container } = render(<RunEventTimeline events={events} />);
+    const summary = container.querySelector(
+      'li[data-event-id="a"] [data-testid="event-announce-summary"]',
+    );
+    expect(summary).not.toBeNull();
+    const text = summary!.textContent ?? '';
+    expect(text).toContain('state_entered');
+    expect(text).toContain('engine');
+    // The JsonViewer payload markup MUST NOT be inside the summary so AT
+    // users don't hear the full payload on every prepend.
+    expect(summary!.querySelector('button')).toBeNull();
+    expect(summary!.querySelector('pre')).toBeNull();
+  });
 });

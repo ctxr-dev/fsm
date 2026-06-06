@@ -20,7 +20,7 @@
  * "live" vs. "lagging".
  */
 
-import { useEffect, useRef } from 'preact/hooks';
+import { useEffect, useMemo, useRef } from 'preact/hooks';
 
 export interface UseDebouncedRefetchOptions {
   /** Reset-on-trigger window in ms. Default 200. */
@@ -54,54 +54,74 @@ export function useDebouncedRefetch<T>(
   const fnRef = useRef(fn);
   fnRef.current = fn;
 
-  const clearTimers = (): void => {
-    if (waitTimer.current != null) {
-      clearTimeout(waitTimer.current);
-      waitTimer.current = null;
-    }
-    if (maxTimer.current != null) {
-      clearTimeout(maxTimer.current);
-      maxTimer.current = null;
-    }
-    firstQueuedAt.current = null;
-  };
+  // Memoize the returned handle so consumers can safely include it in
+  // an effect's dependency array without thrashing on every render. The
+  // previous implementation returned a fresh `{ trigger, flush, cancel }`
+  // object every call, which made every render churn the identity and
+  // forced any dependent useEffect (e.g. runDetail's single SSE
+  // subscription that depends on four refetchers) to tear down and
+  // re-open. The closures themselves are stable because they only touch
+  // refs (waitTimer / maxTimer / firstQueuedAt / fnRef) which carry
+  // mutable state without re-creating the function identity.
+  const handle = useMemo<UseDebouncedRefetchHandle>(() => {
+    const clearTimers = (): void => {
+      if (waitTimer.current != null) {
+        clearTimeout(waitTimer.current);
+        waitTimer.current = null;
+      }
+      if (maxTimer.current != null) {
+        clearTimeout(maxTimer.current);
+        maxTimer.current = null;
+      }
+      firstQueuedAt.current = null;
+    };
 
-  const fire = (): void => {
-    clearTimers();
-    void fnRef.current();
-  };
+    const fire = (): void => {
+      clearTimers();
+      void fnRef.current();
+    };
 
-  const trigger = (): void => {
-    if (firstQueuedAt.current == null) {
-      firstQueuedAt.current = Date.now();
-      // Arm the maxWait safety net only on the first queued trigger of
-      // a burst; subsequent triggers within the burst leave it alone.
-      maxTimer.current = setTimeout(fire, maxWait);
-    }
-    if (waitTimer.current != null) clearTimeout(waitTimer.current);
-    waitTimer.current = setTimeout(fire, wait);
-  };
+    const trigger = (): void => {
+      if (firstQueuedAt.current == null) {
+        firstQueuedAt.current = Date.now();
+        // Arm the maxWait safety net only on the first queued trigger of
+        // a burst; subsequent triggers within the burst leave it alone.
+        maxTimer.current = setTimeout(fire, maxWait);
+      }
+      if (waitTimer.current != null) clearTimeout(waitTimer.current);
+      waitTimer.current = setTimeout(fire, wait);
+    };
 
-  const flush = (): void => {
-    if (firstQueuedAt.current == null) {
-      // Nothing pending — flush is a no-op so callers can safely call
-      // it from cleanup paths without guarding.
-      return;
-    }
-    fire();
-  };
+    const flush = (): void => {
+      if (firstQueuedAt.current == null) {
+        // Nothing pending — flush is a no-op so callers can safely call
+        // it from cleanup paths without guarding.
+        return;
+      }
+      fire();
+    };
 
-  const cancel = (): void => {
-    clearTimers();
-  };
-
-  // Cleanup on unmount: drop any pending fire so the component cannot
-  // refetch into a torn-down tree.
-  useEffect(() => {
-    return () => {
+    const cancel = (): void => {
       clearTimers();
     };
+
+    return { trigger, flush, cancel };
+    // wait + maxWait are captured into the trigger closure; if a caller
+    // mutates them mid-life we want the new values to take effect on the
+    // next trigger. fnRef is mutable so the latest `fn` is always
+    // dispatched without a re-memo.
+  }, [wait, maxWait]);
+
+  // Cleanup on unmount: drop any pending fire so the component cannot
+  // refetch into a torn-down tree. The cancel closure is stable across
+  // re-renders (handle is memoised), so we deliberately exclude it from
+  // the deps array — this effect should run only on mount/unmount.
+  useEffect(() => {
+    return () => {
+      handle.cancel();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount/unmount only
   }, []);
 
-  return { trigger, flush, cancel };
+  return handle;
 }

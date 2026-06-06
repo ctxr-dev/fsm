@@ -209,12 +209,30 @@ export function RunEventTimeline({
 
   return (
     <div class={composed} data-testid="run-event-timeline">
-      <div class="flex-1 min-h-0 overflow-auto pr-1">
+      {/* role="log" + aria-live="polite" + aria-relevant="additions" so
+          screen readers announce SSE-prepended rows as they land without
+          re-reading the existing tape. The live region wraps the scroll
+          container rather than the <ol> itself so the list keeps its
+          native list semantics (an aria-role on the <ol> would strip the
+          implicit list role and orphan each <li>). Each <li> exposes a
+          visually-hidden announceable summary (timestamp + kind +
+          producer) so the announcement is concise and skips the
+          JsonViewer payload, which would otherwise be read aloud as a
+          long unstructured blob on every prepend. */}
+      <div
+        class="flex-1 min-h-0 overflow-auto pr-1"
+        role="log"
+        aria-live="polite"
+        aria-relevant="additions"
+        aria-label="Run event timeline"
+      >
         <ol class="relative" aria-label="Run event timeline">
           {filtered.map((event, index) => {
             const variant = variantForEventKind(event.kind);
             const isLast = index === filtered.length - 1;
             const isFresh = freshIds.has(event.id);
+            const announceSummary =
+              `${formatTimestamp(event.created_at)} ${event.kind} ${event.producer_id}`.trim();
             return (
               <li
                 key={event.id}
@@ -222,6 +240,9 @@ export function RunEventTimeline({
                 data-fresh={isFresh ? 'true' : 'false'}
                 class="relative flex gap-3 pb-4 last:pb-0 rounded-md"
               >
+                <span class="sr-only" data-testid="event-announce-summary">
+                  {announceSummary}
+                </span>
                 {!isLast ? (
                   <span
                     aria-hidden="true"

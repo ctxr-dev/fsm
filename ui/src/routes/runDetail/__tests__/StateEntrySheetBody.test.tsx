@@ -11,7 +11,7 @@
  *     references the entry id appears; an unrelated event does not).
  */
 
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { cleanup, fireEvent, render } from '@testing-library/preact';
 
 import { StateEntrySheetBody } from '../StateEntrySheetBody';
@@ -175,5 +175,126 @@ describe('StateEntrySheetBody', () => {
       />,
     );
     expect(getByText('Entry not in tree')).toBeInTheDocument();
+  });
+
+  test('regression #5: iteration-chip buttons keep their native button role', () => {
+    // Pre-fix, each iteration chip was rendered as
+    //   <button role="listitem">…</button>
+    // putting an ARIA role on a native interactive element replaces its
+    // implicit role. Screen readers announced each chip as "list item N"
+    // instead of "button N", and the chip lost the standard button
+    // semantics keyboard-and-AT users rely on (Enter / Space activation,
+    // role-based queries in tests).
+    //
+    // The fix wraps each chip in a <li> so the strip keeps list
+    // semantics for AT users without overriding the button's role.
+    const TREE: StateNode = {
+      entry_id: 'iter-1',
+      state_id: 'loop_phase',
+      entry_seq: 1,
+      entered_at: '2025-01-01T00:00:00Z',
+      exited_at: '2025-01-01T00:00:01Z',
+      status: 'exited',
+      inputs: {},
+      outputs: {},
+      iteration_n: 1,
+      children: [
+        {
+          entry_id: 'iter-2',
+          state_id: 'loop_phase',
+          entry_seq: 2,
+          entered_at: '2025-01-01T00:00:02Z',
+          exited_at: '2025-01-01T00:00:03Z',
+          status: 'exited',
+          inputs: {},
+          outputs: {},
+          iteration_n: 2,
+          children: [],
+        },
+      ],
+    };
+    const { getAllByRole, getByTestId } = render(
+      <StateEntrySheetBody
+        entryId="iter-1"
+        runId="R"
+        stateTree={TREE}
+        spec={null}
+        events={[]}
+      />,
+    );
+    // The chip strip itself is in the document — proves we're rendering
+    // the iterations path the regression covers.
+    expect(getByTestId('iterations-chip-strip')).toBeInTheDocument();
+    // Each chip is queryable BY ROLE='button'. Pre-fix this was
+    // impossible because the role had been overridden to 'listitem' and
+    // testing-library would not match it as a button.
+    const chipButtons = getAllByRole('button').filter(
+      (el) => el.getAttribute('data-testid') === 'iterations-chip',
+    );
+    expect(chipButtons.length).toBe(2);
+    // Each chip is a native <button> element — not a <div role="button">
+    // or any other surrogate.
+    for (const chip of chipButtons) {
+      expect(chip.tagName).toBe('BUTTON');
+      expect(chip.getAttribute('role')).toBeNull();
+    }
+    // The list semantics live on the wrapping <ul>/<li> so AT users
+    // still hear "list of N iterations".
+    const list = getByTestId('iterations-chip-strip');
+    expect(list.tagName).toBe('UL');
+    const listItems = list.querySelectorAll('li');
+    expect(listItems.length).toBe(2);
+  });
+
+  test('regression #5: clicking a sibling iteration chip fires onSelectIteration', () => {
+    // The native button keeps native click semantics; testing-library
+    // fireEvent.click on the chip should hit the onSelectIteration
+    // handler with the chip's entry_id.
+    const TREE: StateNode = {
+      entry_id: 'iter-1',
+      state_id: 'loop_phase',
+      entry_seq: 1,
+      entered_at: '2025-01-01T00:00:00Z',
+      exited_at: '2025-01-01T00:00:01Z',
+      status: 'exited',
+      inputs: {},
+      outputs: {},
+      iteration_n: 1,
+      children: [
+        {
+          entry_id: 'iter-2',
+          state_id: 'loop_phase',
+          entry_seq: 2,
+          entered_at: '2025-01-01T00:00:02Z',
+          exited_at: '2025-01-01T00:00:03Z',
+          status: 'exited',
+          inputs: {},
+          outputs: {},
+          iteration_n: 2,
+          children: [],
+        },
+      ],
+    };
+    const onSelect = vi.fn();
+    const { getAllByRole } = render(
+      <StateEntrySheetBody
+        entryId="iter-1"
+        runId="R"
+        stateTree={TREE}
+        spec={null}
+        events={[]}
+        onSelectIteration={onSelect}
+      />,
+    );
+    const chipButtons = getAllByRole('button').filter(
+      (el) => el.getAttribute('data-testid') === 'iterations-chip',
+    );
+    // Find the inactive chip (entry_id !== iter-1) and click it.
+    const inactive = chipButtons.find(
+      (b) => b.getAttribute('data-entry-id') === 'iter-2',
+    );
+    expect(inactive).toBeDefined();
+    fireEvent.click(inactive!);
+    expect(onSelect).toHaveBeenCalledWith('iter-2');
   });
 });

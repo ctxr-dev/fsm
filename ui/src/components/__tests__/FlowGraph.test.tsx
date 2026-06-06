@@ -748,6 +748,34 @@ describe('FlowGraph', () => {
       expect(wrapper.getAttribute('data-layout-engine')).toBe('elk');
     });
 
+    test('regression #1: mid-session ?layout toggle re-reads window.location.search on the next render', () => {
+      // Pre-fix, layoutEngine lived in `useMemo(..., [])` with no
+      // dependencies, so it captured `window.location.search` at mount
+      // and never updated. An operator could navigate to `?layout=dagre`
+      // via History API + a state-bump trigger (e.g. a prop change that
+      // forces a re-render), and FlowGraph still rendered with the
+      // mount-time engine. Reading the search string during render keeps
+      // the component honest about the latest URL.
+      clearSearch();
+      const nodes: Node<FlowNodeData>[] = [
+        { id: 'a', position: { x: 0, y: 0 }, data: { kind: 'state', label: 'a' } },
+      ];
+      const { rerender } = render(<FlowGraph nodes={nodes} edges={[]} />);
+      let wrapper = document.querySelector('.flow-graph') as HTMLElement;
+      expect(wrapper.getAttribute('data-layout-engine')).toBe('elk');
+
+      // Flip the URL search BETWEEN renders. A pre-fix component would
+      // still report 'elk' because the useMemo captured the empty string.
+      setSearch('?layout=dagre');
+      try {
+        rerender(<FlowGraph nodes={nodes} edges={[]} key="rerender-1" />);
+        wrapper = document.querySelector('.flow-graph') as HTMLElement;
+        expect(wrapper.getAttribute('data-layout-engine')).toBe('dagre');
+      } finally {
+        clearSearch();
+      }
+    });
+
     test('shows spinner overlay while ELK promise is pending; removes it when resolved', async () => {
       clearSearch();
       const elkMod = await import('../../lib/elkLayout');
