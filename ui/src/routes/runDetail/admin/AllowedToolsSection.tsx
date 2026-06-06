@@ -31,16 +31,32 @@ import { CollapsibleSection } from './CollapsibleSection';
 
 const KEYS = ['allowed_tools', 'allowedTools', 'tools', 'tool_allowlist'];
 
-function extractAllowedToolsForState(
-  spec: SpecDetail | null,
-  stateId: string | null,
+/**
+ * Shape of a single state inside ``SpecDetail.definition.states``.
+ *
+ * We type ONLY the keys this section probes (``id`` for the lookup,
+ * plus the four allow-list aliases) and accept extra keys via the index
+ * signature so the type stays robust as new fields land on FsmSpec.
+ * Typed against the real wire shape (an array of ``{ id, ... }``
+ * objects emitted by ``FsmSpec.model_dump``) instead of the previous
+ * ``as Record<string, unknown>`` cast that hid the array-vs-keyed-dict
+ * mismatch — that cast pretended ``states`` was a keyed dict and
+ * silently returned ``null`` on every real spec because indexing the
+ * array with a state id never resolved.
+ */
+interface SpecStateForAllowedTools {
+  id?: string;
+  [key: string]: unknown;
+}
+
+interface SpecDefinitionForAllowedTools {
+  states?: SpecStateForAllowedTools[] | Record<string, SpecStateForAllowedTools>;
+}
+
+/** Pick the first allow-list-shaped string array off a state node. */
+function pickAllowedToolsFromNode(
+  node: SpecStateForAllowedTools | null,
 ): string[] | null {
-  if (!spec || !stateId) return null;
-  const def = spec.definition as Record<string, unknown> | undefined;
-  if (!def) return null;
-  const states = def.states as Record<string, unknown> | undefined;
-  if (!states) return null;
-  const node = states[stateId] as Record<string, unknown> | undefined;
   if (!node) return null;
   for (const key of KEYS) {
     const value = node[key];
@@ -49,6 +65,31 @@ function extractAllowedToolsForState(
     }
   }
   return null;
+}
+
+function extractAllowedToolsForState(
+  spec: SpecDetail | null,
+  stateId: string | null,
+): string[] | null {
+  if (!spec || !stateId) return null;
+  const def = spec.definition as SpecDefinitionForAllowedTools | undefined;
+  const states = def?.states;
+  if (!states) return null;
+  // Canonical wire shape: ``states`` is an array of ``{ id, ... }``
+  // objects (matches ``FsmSpec.model_dump`` and ``SpecStateShape`` in
+  // ``specGraph.ts``). Use ``.find`` against the state's ``id`` field —
+  // indexing by ``stateId`` like the previous code did would return
+  // ``undefined`` on every real spec because arrays do not index by
+  // string keys.
+  if (Array.isArray(states)) {
+    const node = states.find((s) => s && typeof s === 'object' && s.id === stateId);
+    return pickAllowedToolsFromNode(node ?? null);
+  }
+  // Defensive runtime guard: tolerate a keyed-dict form too. Some
+  // future spec serializer (or a hand-written test fixture) might emit
+  // ``{ states: { plan_phase: {...} } }`` instead of an array; honour
+  // that without losing the array path.
+  return pickAllowedToolsFromNode(states[stateId] ?? null);
 }
 
 export interface AllowedToolsSectionProps {

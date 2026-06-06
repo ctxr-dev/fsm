@@ -564,9 +564,31 @@ export function RunDetailRoute(): JSX.Element {
   // re-uses ``openIteration`` via the ``onSelectIteration`` prop so
   // clicking a sibling iteration replaces the current sheet with a
   // fresh one pointed at the picked entry_id.
+  //
+  // Important: the sheet content is composed lazily INSIDE the click
+  // handler, not captured at the time the operator first opens the
+  // sheet. The previous version listed `events / spec / stateTree /
+  // nodeIndex` in the useCallback deps and re-baked the content on
+  // every redrender of those values — but the sheet content was a
+  // ReactNode literal whose closure had ALREADY been snapshotted by
+  // SheetHost. By the time the operator clicked a sibling iteration
+  // chip, the StateEntrySheetBody it re-rendered was reading from the
+  // closure's stale `events` / `stateTree`. Holding the latest values
+  // in a ref and dereferencing them at click time lets every iteration
+  // jump see the freshest SSE-prepended events without forcing the
+  // sheet opener to depend on them.
+  const latestSheetDeps = useRef({
+    stateTree,
+    spec,
+    events,
+    nodeIndex,
+  });
+  latestSheetDeps.current = { stateTree, spec, events, nodeIndex };
+
   const openIteration = useCallback(
     (entryId: string) => {
-      const entry = nodeIndex.get(entryId);
+      const { nodeIndex: latestNodeIndex } = latestSheetDeps.current;
+      const entry = latestNodeIndex.get(entryId);
       const stateLabel = entry?.state_id ?? entryId;
       const iterLabel =
         entry?.iteration_n != null ? ` · iter ${entry.iteration_n}` : '';
@@ -578,15 +600,19 @@ export function RunDetailRoute(): JSX.Element {
           <StateEntrySheetBody
             entryId={entryId}
             runId={runId}
-            stateTree={stateTree}
-            spec={spec}
-            events={events}
+            stateTree={latestSheetDeps.current.stateTree}
+            spec={latestSheetDeps.current.spec}
+            events={latestSheetDeps.current.events}
             onSelectIteration={(next) => openIteration(next)}
           />
         ),
       });
     },
-    [nodeIndex, runId, stateTree, spec, events],
+    // Deliberately depend on `runId` only — every other sheet input is
+    // resolved through `latestSheetDeps.current` at click time so the
+    // body sees the freshest SSE-driven values without re-baking this
+    // callback's identity on every event.
+    [runId],
   );
 
   // W18d: subscribe to the cross-pane filter set so the timeline

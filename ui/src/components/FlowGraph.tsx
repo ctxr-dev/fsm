@@ -1091,14 +1091,21 @@ export function FlowGraph({
   // Detect the active layout engine from the URL. ?layout=dagre keeps
   // the legacy dagre path alive for A/B comparison + emergency rollback.
   // Any other value (or no query param) selects ELK, the new default.
-  // This lookup is deliberately synchronous + cheap; no useEffect, so
-  // it survives SSR (returns 'elk') and reads the latest search string
-  // every render.
-  const layoutEngine: 'elk' | 'dagre' = useMemo(() => {
+  //
+  // This lookup is intentionally read on EVERY render rather than wrapped
+  // in `useMemo([])`. A memo with an empty dep array would capture
+  // `window.location.search` once at mount and never see a mid-session
+  // toggle (e.g. an operator navigating to `?layout=dagre` via the
+  // History API without a full remount). React's docs are explicit:
+  // useMemo is a perf hint, not a correctness mechanism; values that
+  // depend on mutable globals must be derived during render so the
+  // component stays consistent with the latest external state.
+  // See https://react.dev/reference/react/useMemo#caveats.
+  const layoutEngine: 'elk' | 'dagre' = (() => {
     if (typeof window === 'undefined') return 'elk';
     const params = new URLSearchParams(window.location.search);
     return params.get('layout') === 'dagre' ? 'dagre' : 'elk';
-  }, []);
+  })();
 
   // W23e: viewport-zoom-aware detail toggle. The card render path + the
   // layout pass both flip when the active zoom crosses

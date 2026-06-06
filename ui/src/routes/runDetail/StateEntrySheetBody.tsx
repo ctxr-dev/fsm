@@ -295,41 +295,48 @@ export function StateEntrySheetBody({
           <h4 class="text-[11px] font-mono text-slate-500 dark:text-slate-400 mb-1">
             iterations ({siblingIterations.length})
           </h4>
-          <div
-            class="flex items-center gap-1 overflow-x-auto py-1"
-            role="list"
+          {/* Native <ul>/<li> wraps each chip <button> so the chip strip
+              keeps list semantics for AT users without overriding the
+              button's native role. The previous markup put role="listitem"
+              directly on the <button>, which strips its button role (an
+              explicit ARIA role replaces the native one) — screen readers
+              announced each iteration as "list item N" instead of
+              "button N", and keyboard users lost the expected Enter /
+              Space activation semantics. */}
+          <ul
+            class="flex items-center gap-1 overflow-x-auto py-1 list-none m-0 p-0"
             data-testid="iterations-chip-strip"
             aria-label={`Iterations for ${entry.state_id}`}
           >
             {siblingIterations.map((it) => {
               const isActive = it.entry_id === entryId;
               return (
-                <button
-                  key={it.entry_id}
-                  type="button"
-                  role="listitem"
-                  data-testid="iterations-chip"
-                  data-entry-id={it.entry_id}
-                  data-active={isActive ? 'true' : 'false'}
-                  title={`Iteration ${it.iteration_n ?? '?'} (${it.status})`}
-                  onClick={() => {
-                    if (!isActive) onSelectIteration?.(it.entry_id);
-                  }}
-                  class={[
-                    'shrink-0 inline-flex items-center justify-center',
-                    'rounded border text-[10px] font-mono leading-none',
-                    'h-6 min-w-[36px] px-1',
-                    'focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400',
-                    'hover:brightness-110',
-                    isActive ? 'ring-2 ring-amber-400' : '',
-                    loopChipClass(it.status),
-                  ].join(' ')}
-                >
-                  {it.iteration_n ?? '·'}
-                </button>
+                <li key={it.entry_id} class="shrink-0">
+                  <button
+                    type="button"
+                    data-testid="iterations-chip"
+                    data-entry-id={it.entry_id}
+                    data-active={isActive ? 'true' : 'false'}
+                    title={`Iteration ${it.iteration_n ?? '?'} (${it.status})`}
+                    onClick={() => {
+                      if (!isActive) onSelectIteration?.(it.entry_id);
+                    }}
+                    class={[
+                      'shrink-0 inline-flex items-center justify-center',
+                      'rounded border text-[10px] font-mono leading-none',
+                      'h-6 min-w-[36px] px-1',
+                      'focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400',
+                      'hover:brightness-110',
+                      isActive ? 'ring-2 ring-amber-400' : '',
+                      loopChipClass(it.status),
+                    ].join(' ')}
+                  >
+                    {it.iteration_n ?? '·'}
+                  </button>
+                </li>
               );
             })}
-          </div>
+          </ul>
         </section>
       ) : null}
       <KeyValueTable rows={runRows} caption="Run-recorded entry metadata" />
