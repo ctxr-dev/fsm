@@ -302,20 +302,32 @@ def test_validate_attaches_state_id_on_failure() -> None:
 
 
 def test_render_caches_parsed_template_but_renders_per_context() -> None:
-    # The renderer caches the PARSED template keyed on template text, so a
-    # second render of the same template reuses the compiled object rather
-    # than re-parsing. The rendered OUTPUT, however, must always reflect
-    # the live context: the same template renders different text for
-    # different args.
+    # The renderer parses (compiles) a template only on the FIRST render of
+    # that template text and reuses the compiled object afterwards. The
+    # rendered OUTPUT, however, must always reflect the live context: the
+    # same template renders different text for different args.
+    #
+    # We assert the caching behavior by counting compile calls (the parse
+    # step is the single from_string entry point) rather than reaching into
+    # the private cache structure, so the test survives a cache refactor
+    # (e.g. switching to an LRU) as long as the public behavior holds.
     renderer = PromptRenderer()
     template = "Iteration {{ iteration_n }} for {{ args.who }}."
+
+    real_from_string = renderer._env.from_string
+    compile_calls = 0
+
+    def counting_from_string(source: str, *args: object, **kwargs: object) -> object:
+        nonlocal compile_calls
+        compile_calls += 1
+        return real_from_string(source, *args, **kwargs)
+
+    renderer._env.from_string = counting_from_string  # type: ignore[method-assign]
 
     first = renderer.render(
         template,
         PromptContext(iteration_n=1, args={"who": "alpha"}),
     )
-    cached_template = renderer._template_cache[template]
-
     second = renderer.render(
         template,
         PromptContext(iteration_n=2, args={"who": "bravo"}),
@@ -323,5 +335,6 @@ def test_render_caches_parsed_template_but_renders_per_context() -> None:
 
     assert first == "Iteration 1 for alpha."
     assert second == "Iteration 2 for bravo."
-    # Same compiled template object reused across both renders (no re-parse).
-    assert renderer._template_cache[template] is cached_template
+    # Compiled exactly once across both renders: the second render reused the
+    # cached template instead of re-parsing.
+    assert compile_calls == 1
