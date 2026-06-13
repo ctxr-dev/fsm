@@ -41,11 +41,22 @@ For each unit-of-work scoped to a ``run_id``:
    c. ``JournalRepo.finalise()`` runs in a *separate* short txn so the
       finalise marker survives even if step (b) is observed atomically.
 
-6. **On exception:** ``session.rollback()`` is called and the JournalTxn
-   row is *left* in ``pending`` (or whatever interim status it had
-   reached). The W3 CLI / W12 recovery path is responsible for resolving
-   it later — we deliberately do NOT auto-discard here because doing so
-   would erase the audit trail of the failed attempt.
+6. **On exception (caller body):** ``session.rollback()`` is called and
+   the JournalTxn row is *left* in ``pending`` (or whatever interim
+   status it had reached). The W3 CLI / W12 recovery path is responsible
+   for resolving it later — we deliberately do NOT auto-discard here
+   because doing so would erase the audit trail of the failed attempt.
+
+7. **On exception (acquisition):** if ``BEGIN IMMEDIATE`` (step 3) fails
+   to take the write-lock (typically a transient ``database is locked``
+   while another writer holds it), no work could ever have been staged
+   against the journal row from step 2, so the row is *discarded* (in its
+   own short txn) before the error propagates. This is the one place we
+   auto-discard: a lock that was never acquired represents no attempted
+   work, so keeping the pending row would only wedge the run (the next
+   ``@atomic`` call would raise :class:`JournalRefusedError`) for what is
+   a retryable condition. Contrast with step 6, where the lock *was* held
+   and the body genuinely attempted work worth preserving for recovery.
 
 Why journal-open is in its own short txn
 ----------------------------------------
@@ -240,6 +251,45 @@ def _finalise_journal_row(engine: Engine, txn_id: str) -> JournalTxn:
     return txn
 
 
+def _discard_journal_row(engine: Engine, txn_id: str) -> None:
+    """Delete a just-opened ``pending`` journal row in its own short txn.
+
+    Used only on the *acquisition-failure* path: the journal row was
+    opened (step 2) but ``BEGIN IMMEDIATE`` (step 3) never acquired the
+    write-lock, so no work was ever staged against it. Unlike the normal
+    abort path (which deliberately *keeps* the pending row as an audit
+    trail of attempted work for W3 recovery to resolve), a row whose
+    write-lock was never even acquired represents *no* attempted work.
+    Leaving it behind would wedge the run in ``pending`` (the next
+    ``@atomic`` call would hit :class:`JournalRefusedError`) for what is
+    typically a transient ``database is locked`` condition that should be
+    retryable, so we clean it up here to keep transient lock failures
+    retryable rather than wedging.
+
+    Runs in its own short txn (matching :func:`_open_journal_row`) so the
+    deletion is durable and independent of any caller session lifecycle.
+    The caller invokes this from inside an ``except`` block and then
+    re-raises the original acquisition error; :meth:`JournalRepo.discard`
+    is idempotent.
+
+    Strictly best-effort: the cleanup itself may hit the very
+    ``database is locked`` condition that triggered this path (the rival
+    writer still holds the lock), and we must never let that secondary
+    failure mask the original acquisition error or escape the caller's
+    bare ``raise``. So we swallow any exception here. If the discard
+    cannot run, the worst case is the pre-fix behaviour (the pending row
+    lingers for W3 recovery to resolve), which is no regression.
+    """
+    repo = JournalRepo()
+    try:
+        with _make_journal_session(engine) as cleaner, cleaner.begin():
+            repo.discard(cleaner, txn_id=txn_id)
+    except Exception:
+        # Best-effort cleanup: never let a cleanup failure mask the
+        # original acquisition error the caller is about to re-raise.
+        pass
+
+
 def _resolve_engine_and_factory(
     engine: Engine | None,
 ) -> tuple[Engine, sessionmaker[Session]]:
@@ -337,7 +387,14 @@ class TransactionContext:
         try:
             _begin_immediate(session)
         except Exception:
+            # The write-lock was never acquired, so no work could have
+            # been staged against the pending journal row we opened in
+            # step 2. Discard it so a transient ``database is locked``
+            # failure is retryable instead of wedging the run in
+            # ``pending`` until a manual resume.
             session.close()
+            _discard_journal_row(self._engine, self._journal_txn.id)
+            self._journal_txn = None
             raise
         self._session = session
         return self
@@ -454,7 +511,13 @@ def atomic[**P, T](fn: Callable[P, T]) -> Callable[P, T]:
         try:
             _begin_immediate(session)
         except Exception:
+            # The write-lock was never acquired, so no work could have
+            # been staged against the pending journal row opened in
+            # step 2. Discard it so a transient ``database is locked``
+            # failure is retryable instead of wedging the run in
+            # ``pending`` until a manual resume.
             session.close()
+            _discard_journal_row(bound_engine, journal_txn.id)
             raise
 
         try:
