@@ -35,6 +35,7 @@ from ctxr.fsm.sqlite import (
     Project,
     StateRecord,
     StatesRepo,
+    StateTransitionError,
     TransitionRecord,
     TransitionsRepo,
 )
@@ -166,6 +167,135 @@ def test_states_repo_mark_exited_raises_when_row_missing(project: Project) -> No
     repo = StatesRepo()
     with project.session_factory() as session, pytest.raises(LookupError), session.begin():
         repo.mark_exited(session, "no-such-id", outputs={})
+
+
+# ---------------------------------------------------------------------------
+# Terminal-write compare-and-swap (issue #97)
+# ---------------------------------------------------------------------------
+
+
+def _open_entry(project: Project, run_id: str, state_id: str = "draft") -> str:
+    """Create one ``entered`` state-entry and return its PK.
+
+    A tiny helper so each CAS test starts from the same well-defined
+    precondition: exactly one open row in ``status='entered'``.
+    """
+    repo = StatesRepo()
+    with project.session_factory() as session, session.begin():
+        entry = repo.create(
+            session,
+            run_id=run_id,
+            state_id=state_id,
+            inputs={},
+            entry_seq=1,
+        )
+    return entry.id
+
+
+def test_mark_exited_second_write_is_rejected_and_preserves_first(
+    project: Project, run_id: str
+) -> None:
+    """A second ``mark_exited`` on an already-exited row raises and is a no-op.
+
+    The compare-and-swap requires the prior status to be ``entered``; once
+    the row is ``exited`` the guard misses, so the repeated terminal write is
+    rejected with :class:`StateTransitionError` instead of stomping the
+    already-persisted outputs.
+    """
+    repo = StatesRepo()
+    pk = _open_entry(project, run_id)
+
+    with project.session_factory() as session, session.begin():
+        repo.mark_exited(session, pk, outputs={"verdict": "first"})
+
+    # Second exit attempt: the guard no longer matches ``entered``.
+    with (
+        project.session_factory() as session,
+        pytest.raises(StateTransitionError) as excinfo,
+        session.begin(),
+    ):
+        repo.mark_exited(session, pk, outputs={"verdict": "second"})
+    assert excinfo.value.expected == "entered"
+    assert excinfo.value.actual == "exited"
+
+    # The first outcome survived untouched: no silent overwrite.
+    with project.session_factory() as session:
+        fetched = repo.get(session, pk)
+    assert fetched is not None
+    assert fetched.status == "exited"
+    assert fetched.outputs == {"verdict": "first"}
+
+
+def test_mark_exited_rejects_invalid_faulted_to_exited_transition(
+    project: Project, run_id: str
+) -> None:
+    """An invalid ``faulted -> exited`` transition is rejected, not accepted.
+
+    This is the exact audit-history loss the issue called out: a faulted row
+    must not be quietly flipped to ``exited`` (which would erase the fault).
+    The CAS guard rejects it because the prior status is ``faulted``, not
+    ``entered``.
+    """
+    repo = StatesRepo()
+    pk = _open_entry(project, run_id)
+
+    with project.session_factory() as session, session.begin():
+        repo.mark_faulted(session, pk, reason="boom")
+
+    with (
+        project.session_factory() as session,
+        pytest.raises(StateTransitionError) as excinfo,
+        session.begin(),
+    ):
+        repo.mark_exited(session, pk, outputs={"verdict": "ok"})
+    assert excinfo.value.actual == "faulted"
+
+    # The fault narrative is intact: nothing was overwritten.
+    with project.session_factory() as session:
+        fetched = repo.get(session, pk)
+    assert fetched is not None
+    assert fetched.status == "faulted"
+    assert fetched.outputs == {"error": "boom"}
+
+
+def test_mark_faulted_round_trips_and_second_fault_is_rejected(
+    project: Project, run_id: str
+) -> None:
+    """``mark_faulted`` stashes the reason; a repeated fault is rejected.
+
+    The happy path stamps ``faulted`` + ``exited_at`` and stows the reason
+    under ``outputs.error``. A second fault (or a fault after exit) misses the
+    ``entered`` guard and raises, so the original failure narrative cannot be
+    clobbered by a late duplicate.
+    """
+    repo = StatesRepo()
+    pk = _open_entry(project, run_id)
+
+    with project.session_factory() as session, session.begin():
+        faulted = repo.mark_faulted(session, pk, reason="first failure")
+    assert faulted.status == "faulted"
+    assert faulted.exited_at is not None
+    assert faulted.outputs == {"error": "first failure"}
+
+    with (
+        project.session_factory() as session,
+        pytest.raises(StateTransitionError) as excinfo,
+        session.begin(),
+    ):
+        repo.mark_faulted(session, pk, reason="second failure")
+    assert excinfo.value.actual == "faulted"
+
+    with project.session_factory() as session:
+        fetched = repo.get(session, pk)
+    assert fetched is not None
+    assert fetched.outputs == {"error": "first failure"}
+
+
+def test_mark_faulted_raises_when_row_missing(project: Project) -> None:
+    """``mark_faulted`` on an unknown PK raises ``LookupError`` (not CAS)."""
+    repo = StatesRepo()
+    with project.session_factory() as session, pytest.raises(LookupError), session.begin():
+        repo.mark_faulted(session, "no-such-id", reason="boom")
 
 
 # ---------------------------------------------------------------------------

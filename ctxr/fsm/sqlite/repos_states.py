@@ -53,15 +53,41 @@ from typing import Any
 
 import uuid_utils
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
+from ctxr.fsm.core.models import StateStatus
 from ctxr.fsm.sqlite.models_core import (
     AggregateTable,
     StateTable,
     TransitionTable,
     WorkerArtifactTable,
 )
+
+
+class StateTransitionError(RuntimeError):
+    """A terminal state write was rejected because the prior status was wrong.
+
+    Raised by :meth:`StatesRepo.mark_exited` / :meth:`StatesRepo.mark_faulted`
+    when the row's current ``status`` is not the one the compare-and-swap
+    guard requires (``entered``). This is the loud failure that protects the
+    audit trail: a repeated terminal write, two racing writers, or an invalid
+    ``faulted -> exited`` transition all surface here instead of silently
+    stomping the row's status and outputs.
+
+    ``state_pk``, ``expected``, and ``actual`` are attached so callers (and
+    operators reading a fault) can see exactly which row refused the write
+    and why.
+    """
+
+    def __init__(self, state_pk: str, *, expected: str, actual: str | None) -> None:
+        self.state_pk = state_pk
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"state row {state_pk!r} is in status {actual!r}, "
+            f"refusing terminal write that requires prior status {expected!r}"
+        )
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -303,19 +329,24 @@ class StatesRepo:
     ) -> State:
         """Mark a state-entry as cleanly exited and persist its outputs.
 
+        Guarded by a compare-and-swap: the write only lands when the row is
+        still ``entered``. Any other prior status (already ``exited``, already
+        ``faulted``) raises :class:`StateTransitionError` instead of stomping
+        the row. A repeated exit, a racing writer, or an invalid
+        ``faulted -> exited`` transition is rejected loudly so the audit trail
+        is never silently overwritten.
+
         Raises ``LookupError`` when the row does not exist — repositories
         translate "row not found on a write" into an exception rather than
         silently no-op'ing because the caller is always mid-transaction.
         """
-        row = session.get(StateTable, state_pk)
-        if row is None:
-            raise LookupError(f"state row not found: {state_pk!r}")
-        row.status = "exited"
-        row.exited_at = _now_iso_ms()
-        row.outputs_json = _canonical_json(outputs)
-        session.add(row)
-        session.flush()
-        return self._to_value(row)
+        self._cas_terminal(
+            session,
+            state_pk,
+            new_status=StateStatus.exited.value,
+            outputs_json=_canonical_json(outputs),
+        )
+        return self._reload(session, state_pk)
 
     def mark_faulted(
         self,
@@ -329,6 +360,14 @@ class StatesRepo:
         the failure narrative in the outputs bag under the well-known
         ``error`` key. The engine reads it back when surfacing fault details
         to operators.
+
+        Guarded by the same compare-and-swap as :meth:`mark_exited`: the
+        write only lands when the row is still ``entered``. Faulting a row
+        that already reached a terminal status (``exited`` or ``faulted``)
+        raises :class:`StateTransitionError` rather than rewriting it, so a
+        late or duplicate fault cannot erase the original outcome.
+
+        Raises ``LookupError`` when the row does not exist.
         """
         row = session.get(StateTable, state_pk)
         if row is None:
@@ -337,12 +376,83 @@ class StatesRepo:
         if not isinstance(existing, dict):
             existing = {}
         existing["error"] = reason
-        row.status = "faulted"
-        row.exited_at = _now_iso_ms()
-        row.outputs_json = _canonical_json(existing)
-        session.add(row)
-        session.flush()
-        return self._to_value(row)
+        self._cas_terminal(
+            session,
+            state_pk,
+            new_status=StateStatus.faulted.value,
+            outputs_json=_canonical_json(existing),
+        )
+        return self._reload(session, state_pk)
+
+    @staticmethod
+    def _cas_terminal(
+        session: Session,
+        state_pk: str,
+        *,
+        new_status: str,
+        outputs_json: str,
+    ) -> None:
+        """Compare-and-swap a state-entry into a terminal status.
+
+        Issues a single guarded ``UPDATE ... WHERE id = :pk AND status =
+        'entered'`` and inspects ``rowcount`` to decide what happened:
+
+        * ``1``: the swap landed; the row moved from ``entered`` to
+          ``new_status`` with ``exited_at`` stamped and ``outputs`` persisted.
+          The follow-up :meth:`_reload` re-reads with ``populate_existing`` so
+          any ORM copy this Core UPDATE bypassed is refreshed from disk.
+        * ``0``: nobody matched the guard. Either the row is gone
+          (``LookupError``) or it is no longer ``entered``
+          (:class:`StateTransitionError`). We re-read the row to tell the two
+          apart and to report the actual status in the error.
+
+        The expected prior status is always ``entered``: a state can only
+        reach a terminal status once, straight from the open entry the engine
+        created. That single rule rejects repeated terminal writes, concurrent
+        racing writers, and the invalid ``faulted -> exited`` transition the
+        issue called out, without a dedicated status-pair allow-list.
+        """
+        expected = StateStatus.entered.value
+        result = session.execute(
+            update(StateTable)
+            .where(StateTable.id == state_pk, StateTable.status == expected)
+            .values(
+                status=new_status,
+                exited_at=_now_iso_ms(),
+                outputs_json=outputs_json,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount == 1:
+            return
+        # Guard missed. Distinguish "no such row" from "wrong prior status".
+        actual = session.execute(
+            select(StateTable.status).where(StateTable.id == state_pk)
+        ).scalar_one_or_none()
+        if actual is None:
+            raise LookupError(f"state row not found: {state_pk!r}")
+        raise StateTransitionError(state_pk, expected=expected, actual=actual)
+
+    @staticmethod
+    def _reload(session: Session, state_pk: str) -> State:
+        """Re-read a state-entry after a CAS write and return it as a VO.
+
+        Passes ``populate_existing=True`` so the read overwrites any ORM copy
+        already in the identity map (e.g. the row :meth:`mark_faulted` loaded
+        to merge ``outputs.error`` before the Core UPDATE) with the
+        bytes-on-disk the guarded UPDATE just wrote. This refresh is scoped to
+        the single row, never the whole session, so unrelated objects the
+        caller loaded in the same unit of work are left untouched.
+
+        The compare-and-swap guarantees the row exists by the time we reach
+        here, so a missing row would be a real invariant breach. Surface it
+        as ``LookupError`` rather than returning ``None`` to a caller that
+        the type signature promises a :class:`State`.
+        """
+        row = session.get(StateTable, state_pk, populate_existing=True)
+        if row is None:  # pragma: no cover - CAS already proved existence
+            raise LookupError(f"state row not found: {state_pk!r}")
+        return StatesRepo._to_value(row)
 
     def list_by_run(self, session: Session, run_id: str) -> list[State]:
         """Return every state-entry for ``run_id`` ordered by ``entry_seq``.
@@ -744,6 +854,7 @@ __all__ = [
     "AggregatesRepo",
     "State",
     "StateNode",
+    "StateTransitionError",
     "StatesRepo",
     "Transition",
     "TransitionsRepo",
