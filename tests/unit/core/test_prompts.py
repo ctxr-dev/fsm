@@ -294,3 +294,34 @@ def test_validate_attaches_state_id_on_failure() -> None:
     envelope = info.value.as_envelope()
     assert envelope["error"] == "prompt_template_invalid"
     assert envelope["state_id"] == "qa"
+
+
+# ---------------------------------------------------------------------------
+# Parsed-template cache: reuse the compiled template, render per context (#93)
+# ---------------------------------------------------------------------------
+
+
+def test_render_caches_parsed_template_but_renders_per_context() -> None:
+    # The renderer caches the PARSED template keyed on template text, so a
+    # second render of the same template reuses the compiled object rather
+    # than re-parsing. The rendered OUTPUT, however, must always reflect
+    # the live context: the same template renders different text for
+    # different args.
+    renderer = PromptRenderer()
+    template = "Iteration {{ iteration_n }} for {{ args.who }}."
+
+    first = renderer.render(
+        template,
+        PromptContext(iteration_n=1, args={"who": "alpha"}),
+    )
+    cached_template = renderer._template_cache[template]
+
+    second = renderer.render(
+        template,
+        PromptContext(iteration_n=2, args={"who": "bravo"}),
+    )
+
+    assert first == "Iteration 1 for alpha."
+    assert second == "Iteration 2 for bravo."
+    # Same compiled template object reused across both renders (no re-parse).
+    assert renderer._template_cache[template] is cached_template

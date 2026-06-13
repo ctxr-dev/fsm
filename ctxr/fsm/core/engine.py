@@ -104,19 +104,16 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-# Cache of rendered prompt strings keyed by (spec.id, state.id, iteration?).
-# The cache exists so re-entering a state (or iterating a loop) does not
-# re-parse the same template. We key on the raw template text under the
-# (spec, state) tuple so a spec mutation that swaps the template body
-# automatically invalidates the cached entry. Loop bodies share their
-# loop state's id, so per-iteration env differences are reflected by
-# always recomputing the runtime context but only re-using the parsed
-# Jinja template; the renderer itself owns Jinja parsing reuse via its
-# SandboxedEnvironment cache, so this dict is a lightweight per-state
-# guard against re-walking the needs_rendering precheck or re-allocating
-# the PromptRenderer.
+# The shared, lazily-constructed prompt renderer. Template *parsing*
+# (the expensive part) is cached inside the renderer, keyed on the raw
+# template text, so re-entering a state or iterating a loop re-uses the
+# compiled Jinja template. The renderer is deliberately NOT a rendered-
+# string cache: the same template renders to different text for
+# different args / iteration_n, so every build_brief call renders afresh
+# against its own runtime context. Caching the rendered string here
+# would bleed one run's args into a later run's prompt and reuse
+# iteration 1's text for later iterations.
 _PROMPT_RENDERER: PromptRenderer | None = None
-_RENDER_CACHE: dict[tuple[str, str, str], str] = {}
 
 
 def _get_prompt_renderer() -> PromptRenderer:
@@ -147,34 +144,34 @@ def _maybe_render_prompt(
     if not needs_rendering(template):
         return worker
 
-    cache_key = (spec.id, state.id, template)
-    cached = _RENDER_CACHE.get(cache_key)
-    if cached is None:
-        renderer = _get_prompt_renderer()
-        context = PromptContext(
-            spec_slug=spec.id,
-            spec_version=spec.version,
-            state_id=state.id,
-            state_kind=state.kind.value,
-            response_schema=(
-                worker.response_schema.schema_
-                if worker.response_schema is not None
-                else None
-            ),
-            inputs_schema=(
-                worker.inputs_schema.schema_
-                if worker.inputs_schema is not None
-                else None
-            ),
-            allowed_tools=list(state.allowed_tools),
-            iteration_n=iteration_n,
-            args=dict(env),
-            metadata={},
-        )
-        cached = renderer.render(template, context)
-        _RENDER_CACHE[cache_key] = cached
+    # Render afresh on every call. The renderer caches the *parsed*
+    # template internally (keyed on the template text), so re-parsing is
+    # cheap, but the rendered output must reflect THIS call's env / args
+    # / iteration_n rather than a stale cached string.
+    renderer = _get_prompt_renderer()
+    context = PromptContext(
+        spec_slug=spec.id,
+        spec_version=spec.version,
+        state_id=state.id,
+        state_kind=state.kind.value,
+        response_schema=(
+            worker.response_schema.schema_
+            if worker.response_schema is not None
+            else None
+        ),
+        inputs_schema=(
+            worker.inputs_schema.schema_
+            if worker.inputs_schema is not None
+            else None
+        ),
+        allowed_tools=list(state.allowed_tools),
+        iteration_n=iteration_n,
+        args=dict(env),
+        metadata={},
+    )
+    rendered = renderer.render(template, context)
 
-    return worker.model_copy(update={"prompt_template": cached})
+    return worker.model_copy(update={"prompt_template": rendered})
 
 
 def _new_brief_id() -> uuid.UUID:

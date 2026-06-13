@@ -38,7 +38,7 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from jinja2 import StrictUndefined, TemplateSyntaxError
+from jinja2 import StrictUndefined, Template, TemplateSyntaxError
 from jinja2.exceptions import UndefinedError
 from jinja2.sandbox import SandboxedEnvironment
 from pydantic import BaseModel, ConfigDict, Field
@@ -289,6 +289,14 @@ class PromptRenderer:
         self._env.filters["fields_table"] = _filter_fields_table
         self._model_allowlist = tuple(model_allowlist)
         self._allow_model_import = allow_model_import
+        # Cache of PARSED templates keyed on the raw template text. We
+        # cache the compiled :class:`jinja2.Template` (the expensive part:
+        # lexing + parsing + bytecode compilation) and re-render it per
+        # call against the live context. Caching the *rendered string*
+        # would be a correctness bug: the same template renders to
+        # different text for different args / iteration_n, so a string
+        # cache would bleed one call's values into a later call.
+        self._template_cache: dict[str, Template] = {}
 
     # ------------------------------------------------------------------
     # Context construction
@@ -370,18 +378,27 @@ class PromptRenderer:
     def render(self, template: str, context: PromptContext) -> str:
         """Render ``template`` against ``context`` inside the sandbox.
 
+        The parsed :class:`jinja2.Template` is cached per raw template
+        text so re-entering a state (or iterating a loop) re-uses the
+        compiled template instead of re-parsing it. The *render* itself
+        always runs against the live ``context``, so distinct args /
+        iteration_n produce distinct output.
+
         Raises :class:`PromptRenderError` for Jinja syntax errors,
         unknown tokens (StrictUndefined), unsafe attribute access
         (sandbox), or model-resolution failures.
         """
 
-        try:
-            tmpl = self._env.from_string(template)
-        except TemplateSyntaxError as exc:
-            raise PromptRenderError(
-                f"prompt template has a Jinja syntax error: {exc.message}",
-                line=exc.lineno,
-            ) from exc
+        tmpl = self._template_cache.get(template)
+        if tmpl is None:
+            try:
+                tmpl = self._env.from_string(template)
+            except TemplateSyntaxError as exc:
+                raise PromptRenderError(
+                    f"prompt template has a Jinja syntax error: {exc.message}",
+                    line=exc.lineno,
+                ) from exc
+            self._template_cache[template] = tmpl
 
         jinja_context = self._build_jinja_context(context)
         try:
