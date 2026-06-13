@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from collections import OrderedDict
 from collections.abc import Mapping
 from typing import Any
 
@@ -262,6 +263,12 @@ def _filter_fields_table(value: Any) -> str:
 # Renderer
 # ---------------------------------------------------------------------------
 
+#: Default upper bound on the parsed-template LRU. A single spec has a
+#: handful of templates; this caps a long-lived renderer (e.g. the MCP
+#: server reusing one instance across every spec/run) so the cache cannot
+#: grow without bound as new unique templates are rendered over time.
+DEFAULT_TEMPLATE_CACHE_SIZE = 512
+
 
 class PromptRenderer:
     """Sandboxed renderer for FSM worker prompt templates.
@@ -278,6 +285,7 @@ class PromptRenderer:
         *,
         model_allowlist: tuple[str, ...] = (),
         allow_model_import: bool = True,
+        template_cache_size: int = DEFAULT_TEMPLATE_CACHE_SIZE,
     ) -> None:
         self._env = SandboxedEnvironment(
             undefined=StrictUndefined,
@@ -296,7 +304,14 @@ class PromptRenderer:
         # would be a correctness bug: the same template renders to
         # different text for different args / iteration_n, so a string
         # cache would bleed one call's values into a later call.
-        self._template_cache: dict[str, Template] = {}
+        #
+        # The cache is a bounded LRU (OrderedDict ordered by last use): a
+        # long-lived renderer that sees an unbounded stream of unique
+        # templates evicts its least-recently-used entry instead of growing
+        # memory without end. A size <= 0 disables the bound (unbounded),
+        # which suits short-lived per-render instances.
+        self._template_cache: OrderedDict[str, Template] = OrderedDict()
+        self._template_cache_size = template_cache_size
 
     # ------------------------------------------------------------------
     # Context construction
@@ -399,6 +414,14 @@ class PromptRenderer:
                     line=exc.lineno,
                 ) from exc
             self._template_cache[template] = tmpl
+            if self._template_cache_size > 0:
+                # Evict the least-recently-used entry (front of the
+                # OrderedDict) while the cache exceeds its bound.
+                while len(self._template_cache) > self._template_cache_size:
+                    self._template_cache.popitem(last=False)
+        else:
+            # Cache hit: refresh recency so this entry is evicted last.
+            self._template_cache.move_to_end(template)
 
         jinja_context = self._build_jinja_context(context)
         try:

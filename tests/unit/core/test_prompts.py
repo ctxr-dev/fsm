@@ -338,3 +338,35 @@ def test_render_caches_parsed_template_but_renders_per_context() -> None:
     # Compiled exactly once across both renders: the second render reused the
     # cached template instead of re-parsing.
     assert compile_calls == 1
+
+
+def test_template_cache_is_bounded_and_evicts_lru() -> None:
+    # A long-lived renderer that renders an unbounded stream of unique
+    # templates must not grow memory without end: the parsed-template cache
+    # is a bounded LRU that evicts its least-recently-used entry once full.
+    ctx = PromptContext()
+    renderer = PromptRenderer(template_cache_size=2)
+
+    renderer.render("a {{ iteration_n }}", ctx)  # cache: [a]
+    renderer.render("b {{ iteration_n }}", ctx)  # cache: [a, b]
+    # Touch "a" so "b" becomes the least-recently-used entry.
+    renderer.render("a {{ iteration_n }}", ctx)  # cache: [b, a]
+    # A third distinct template overflows the bound and evicts "b" (LRU),
+    # keeping the most-recently-used "a" and the new "c".
+    renderer.render("c {{ iteration_n }}", ctx)  # cache: [a, c]
+
+    cached = list(renderer._template_cache.keys())
+    assert len(cached) == 2
+    assert "b {{ iteration_n }}" not in cached
+    assert "a {{ iteration_n }}" in cached
+    assert "c {{ iteration_n }}" in cached
+
+
+def test_template_cache_size_zero_is_unbounded() -> None:
+    # A non-positive size disables the bound (suits short-lived per-render
+    # instances that never accumulate templates).
+    ctx = PromptContext()
+    renderer = PromptRenderer(template_cache_size=0)
+    for i in range(50):
+        renderer.render(f"t{i} {{{{ iteration_n }}}}", ctx)
+    assert len(renderer._template_cache) == 50
