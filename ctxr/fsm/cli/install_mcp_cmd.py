@@ -1005,11 +1005,16 @@ def install_mcp(
     json_or_pretty(summary, json_mode)
 
     # In --check mode: exit non-zero if any client is missing /
-    # out-of-date so CI scripts can detect drift.
+    # out-of-date so CI scripts can detect drift. Compare against the
+    # enum's wire values (the same source the renderer used to build the
+    # ``status`` field) rather than hardcoded literals. The W14i rename
+    # of ``out-of-date`` to ``out_of_date`` silently broke a literal
+    # comparison once already.
     if check:
+        drifted = {McpConfigStatus.missing.value, McpConfigStatus.out_of_date.value}
         bad = [
             r for r in summary.get("results", [])
-            if r.get("status") in ("missing", "out-of-date")
+            if r.get("status") in drifted
         ]
         if bad:
             raise typer.Exit(1)
