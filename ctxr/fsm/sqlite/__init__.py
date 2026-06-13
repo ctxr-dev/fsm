@@ -96,6 +96,7 @@ from ctxr.fsm.sqlite.repos_states import (
     AggregatesRepo,
     StateNode,
     StatesRepo,
+    StateTransitionError,
     TransitionsRepo,
     WorkerArtifact,
     WorkerArtifactsRepo,
@@ -159,6 +160,8 @@ __all__ = [
     "StateNode",
     # ── State-tree value objects ─────────────────────────────────────
     "StateRecord",
+    # ── State-tree errors ────────────────────────────────────────────
+    "StateTransitionError",
     # ── State-tree repositories ──────────────────────────────────────
     "StatesRepo",
     # ── Enforcement value objects ────────────────────────────────────
