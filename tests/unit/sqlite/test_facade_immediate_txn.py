@@ -11,7 +11,7 @@ writer guarantee the ``@atomic`` envelope provides via ``BEGIN
 IMMEDIATE``.
 
 The fix routes every facade write through ``Project._write_txn``, which
-calls the same ``_begin_immediate`` primitive ``@atomic`` relies on.
+calls the same ``begin_immediate`` primitive ``@atomic`` relies on.
 These tests pin that behaviour:
 
 1. ``test_register_spec_issues_begin_immediate``: the literal ``BEGIN

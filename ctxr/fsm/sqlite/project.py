@@ -102,7 +102,7 @@ from ctxr.fsm.sqlite.repos_states import (
 )
 from ctxr.fsm.sqlite.transactions import (
     TransactionContext,
-    _begin_immediate,
+    begin_immediate,
     set_active_session_factory,
 )
 
@@ -424,7 +424,7 @@ class Project:
         serialised-writer guarantee the ``@atomic`` envelope provides.
 
         This helper instead takes the write-lock immediately via
-        :func:`ctxr.fsm.sqlite.transactions._begin_immediate` (the exact
+        :func:`ctxr.fsm.sqlite.transactions.begin_immediate` (the exact
         primitive ``@atomic`` relies on) so a second concurrent writer
         fails fast and the caller serialises cleanly behind the first.
         The transaction is committed on a clean exit and rolled back on
@@ -433,7 +433,7 @@ class Project:
         """
         session = self._session_factory()
         try:
-            _begin_immediate(session)
+            begin_immediate(session)
             yield session
             session.commit()
         except BaseException:
