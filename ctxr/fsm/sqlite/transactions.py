@@ -88,6 +88,7 @@ __all__ = [
     "JournalRefusedError",
     "TransactionContext",
     "atomic",
+    "begin_immediate",
     "get_active_session_factory",
     "set_active_session_factory",
 ]
@@ -181,11 +182,11 @@ def get_active_session_factory() -> sessionmaker[Session]:
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Public helpers
 # ---------------------------------------------------------------------------
 
 
-def _begin_immediate(session: Session) -> None:
+def begin_immediate(session: Session) -> None:
     """Promote the session's implicit txn to ``BEGIN IMMEDIATE``.
 
     SQLite's default transaction is a "deferred" one that takes the
@@ -199,11 +200,25 @@ def _begin_immediate(session: Session) -> None:
     ``session.begin()`` machinery has already started an implicit txn by
     the time we get here; we have to roll that back first and then issue
     our own ``BEGIN IMMEDIATE``.
+
+    Public so the :class:`~ctxr.fsm.sqlite.project.Project` facade can
+    open its write transactions with the SAME primitive ``@atomic`` uses,
+    instead of reaching into a private helper across module boundaries.
     """
     # Close any implicit transaction SQLAlchemy may have opened so we can
     # start our own under our own terms.
     session.rollback()
     session.execute(text("BEGIN IMMEDIATE"))
+
+
+# Backward-compatible private alias for the in-module call sites that
+# predate the public name. New cross-module callers use ``begin_immediate``.
+_begin_immediate = begin_immediate
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 
 def _make_journal_session(engine: Engine) -> Session:
