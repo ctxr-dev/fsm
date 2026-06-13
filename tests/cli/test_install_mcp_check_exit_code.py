@@ -101,6 +101,39 @@ def test_check_exits_nonzero_on_missing_client(tmp_path: Path) -> None:
     assert claude_row["status"] == "missing", claude_row
 
 
+def test_check_exits_nonzero_on_failed_probe(tmp_path: Path) -> None:
+    """A malformed existing config makes the probe ``failed`` and exits 1.
+
+    When ``--check`` cannot even evaluate drift (here the existing
+    ``.mcp.json`` is not valid JSON, so the merger raises and the result
+    carries ``action == "failed"`` with no ``status``), the exit gate
+    must still be non-zero. Otherwise a broken config would slip through
+    a CI gate as exit 0 despite drift being indeterminate.
+    """
+    _seed_workspace_marker(tmp_path)
+    mcp_json = tmp_path / ".mcp.json"
+    mcp_json.write_text("{ this is not valid json", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "install-mcp",
+            "--target",
+            str(tmp_path),
+            "--client",
+            "claude",
+            "--check",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.stdout)
+    claude_row = payload["results"][0]
+    assert claude_row["action"] == "failed", claude_row
+    assert "status" not in claude_row, claude_row
+
+
 def test_check_exits_zero_when_installed(tmp_path: Path) -> None:
     """After a real apply, ``--check`` reports ``installed`` and exits 0."""
     _seed_workspace_marker(tmp_path)

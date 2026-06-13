@@ -1014,7 +1014,7 @@ def install_mcp(
         drifted = {McpConfigStatus.missing.value, McpConfigStatus.out_of_date.value}
         bad = [
             r for r in summary.get("results", [])
-            if r.get("status") in drifted
+            if r.get("status") in drifted or r.get("action") == "failed"
         ]
         if bad:
             raise typer.Exit(1)
