@@ -597,11 +597,14 @@ class Project:
         We register / refresh the consumer once (so re-running
         ``subscribe`` with the same ``consumer_name`` rebinds the
         filter, which is also the bus contract). On each poll cycle we
-        pull every pending delivery for the consumer, yield the
-        underlying events one at a time, and ack each as it is yielded
-        — this is at-least-once semantics: if the caller crashes
-        mid-iteration, the un-acked rows will be redelivered on the
-        next ``subscribe`` call with the same consumer_name.
+        pull every pending delivery for the consumer, mark each
+        delivered (status stays ``pending``), yield the underlying
+        events one at a time, and ack each only AFTER it has been
+        yielded to the caller. That ordering is what gives us at-least-
+        once semantics: if the caller crashes after a delivery is
+        marked but before its ack, the row is still ``pending`` and the
+        event is redelivered on the next ``subscribe`` call with the
+        same consumer_name.
         """
         # Register the consumer up front so the bus knows our filters
         # before the first event arrives. Re-registering is idempotent
@@ -636,18 +639,17 @@ class Project:
                 )
             if pending:
                 # We have work: escalate to an immediate write-lock so
-                # the mark-delivered + ack + touch sequence serialises
-                # against concurrent writers. The crash-safety contract
-                # is unchanged: a crash between yield and ack leaves the
-                # rows un-acked for redelivery on the next poll.
+                # the mark-delivered + touch sequence serialises against
+                # concurrent writers. We stamp ``delivered_at`` / bump
+                # ``attempts`` here but DO NOT ack: the row stays
+                # ``pending`` until the consumer has actually received
+                # the event, which is what preserves at-least-once. The
+                # ack happens after the yield below, in its own short
+                # write transaction, so we never hold the write-lock
+                # across caller work.
                 with self._write_txn() as session:
                     for ewd in pending:
                         self.event_deliveries.mark_delivered(
-                            session,
-                            event_id=ewd.event.id,
-                            consumer_id=consumer_id,
-                        )
-                        self.event_deliveries.ack(
                             session,
                             event_id=ewd.event.id,
                             consumer_id=consumer_id,
@@ -659,15 +661,31 @@ class Project:
                 # repo ``Event`` so consumers see one type regardless
                 # of which repo produced it. The two share a column
                 # layout so the projection is mechanical.
-                yield Event(
-                    id=ewd.event.id,
-                    run_id=ewd.event.run_id,
-                    kind=ewd.event.kind,
-                    producer_id=ewd.event.producer_id,
-                    payload=ewd.event.payload,
-                    created_at=ewd.event.created_at,
-                    seq=ewd.event.seq,
-                )
+                #
+                # Ack AFTER the yield in a ``try/finally`` so the row is
+                # only retired once the consumer has the event in hand;
+                # a crash between mark-delivered and ack leaves the row
+                # ``pending`` for redelivery on the next poll (at-least-
+                # once). The ``finally`` also acks if the generator is
+                # closed early (e.g. the caller ``break``s or is GC'd),
+                # so a cleanly-consumed event is not redelivered.
+                try:
+                    yield Event(
+                        id=ewd.event.id,
+                        run_id=ewd.event.run_id,
+                        kind=ewd.event.kind,
+                        producer_id=ewd.event.producer_id,
+                        payload=ewd.event.payload,
+                        created_at=ewd.event.created_at,
+                        seq=ewd.event.seq,
+                    )
+                finally:
+                    with self._write_txn() as session:
+                        self.event_deliveries.ack(
+                            session,
+                            event_id=ewd.event.id,
+                            consumer_id=consumer_id,
+                        )
 
             if deadline is not None and time.monotonic() >= deadline:
                 return
