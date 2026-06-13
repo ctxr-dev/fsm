@@ -294,3 +294,79 @@ def test_validate_attaches_state_id_on_failure() -> None:
     envelope = info.value.as_envelope()
     assert envelope["error"] == "prompt_template_invalid"
     assert envelope["state_id"] == "qa"
+
+
+# ---------------------------------------------------------------------------
+# Parsed-template cache: reuse the compiled template, render per context (#93)
+# ---------------------------------------------------------------------------
+
+
+def test_render_caches_parsed_template_but_renders_per_context() -> None:
+    # The renderer parses (compiles) a template only on the FIRST render of
+    # that template text and reuses the compiled object afterwards. The
+    # rendered OUTPUT, however, must always reflect the live context: the
+    # same template renders different text for different args.
+    #
+    # We assert the caching behavior by counting compile calls (the parse
+    # step is the single from_string entry point) rather than reaching into
+    # the private cache structure, so the test survives a cache refactor
+    # (e.g. switching to an LRU) as long as the public behavior holds.
+    renderer = PromptRenderer()
+    template = "Iteration {{ iteration_n }} for {{ args.who }}."
+
+    real_from_string = renderer._env.from_string
+    compile_calls = 0
+
+    def counting_from_string(source: str, *args: object, **kwargs: object) -> object:
+        nonlocal compile_calls
+        compile_calls += 1
+        return real_from_string(source, *args, **kwargs)
+
+    renderer._env.from_string = counting_from_string  # type: ignore[method-assign]
+
+    first = renderer.render(
+        template,
+        PromptContext(iteration_n=1, args={"who": "alpha"}),
+    )
+    second = renderer.render(
+        template,
+        PromptContext(iteration_n=2, args={"who": "bravo"}),
+    )
+
+    assert first == "Iteration 1 for alpha."
+    assert second == "Iteration 2 for bravo."
+    # Compiled exactly once across both renders: the second render reused the
+    # cached template instead of re-parsing.
+    assert compile_calls == 1
+
+
+def test_template_cache_is_bounded_and_evicts_lru() -> None:
+    # A long-lived renderer that renders an unbounded stream of unique
+    # templates must not grow memory without end: the parsed-template cache
+    # is a bounded LRU that evicts its least-recently-used entry once full.
+    ctx = PromptContext()
+    renderer = PromptRenderer(template_cache_size=2)
+
+    renderer.render("a {{ iteration_n }}", ctx)  # cache: [a]
+    renderer.render("b {{ iteration_n }}", ctx)  # cache: [a, b]
+    # Touch "a" so "b" becomes the least-recently-used entry.
+    renderer.render("a {{ iteration_n }}", ctx)  # cache: [b, a]
+    # A third distinct template overflows the bound and evicts "b" (LRU),
+    # keeping the most-recently-used "a" and the new "c".
+    renderer.render("c {{ iteration_n }}", ctx)  # cache: [a, c]
+
+    cached = list(renderer._template_cache.keys())
+    assert len(cached) == 2
+    assert "b {{ iteration_n }}" not in cached
+    assert "a {{ iteration_n }}" in cached
+    assert "c {{ iteration_n }}" in cached
+
+
+def test_template_cache_size_zero_is_unbounded() -> None:
+    # A non-positive size disables the bound (suits short-lived per-render
+    # instances that never accumulate templates).
+    ctx = PromptContext()
+    renderer = PromptRenderer(template_cache_size=0)
+    for i in range(50):
+        renderer.render(f"t{i} {{{{ iteration_n }}}}", ctx)
+    assert len(renderer._template_cache) == 50

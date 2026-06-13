@@ -96,14 +96,15 @@ def _spec_with_state(state: State) -> FsmSpec:
 
 
 @pytest.fixture(autouse=True)
-def _reset_render_cache() -> None:
-    """Clear the engine's module-level render cache between tests.
+def _reset_prompt_renderer() -> None:
+    """Reset the engine's module-level prompt renderer between tests.
 
-    The cache is keyed on (spec_id, state_id, template_text) so test
-    isolation is robust, but reusing identical (id, state, template)
-    triples across tests would otherwise leak rendered strings.
+    The renderer caches PARSED templates (keyed on template text), which
+    is correctness-neutral, but resetting the shared instance keeps each
+    test fully isolated and lets ``monkeypatch`` swaps of
+    ``PromptRenderer.render`` take effect on a fresh renderer.
     """
-    engine_mod._RENDER_CACHE.clear()
+    engine_mod._PROMPT_RENDERER = None
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +316,79 @@ def test_loop_worker_prompt_template_is_rendered() -> None:
 
     assert "Loop iteration 2 of state looping." in brief.loop.worker.prompt_template
     assert "{{" not in brief.loop.worker.prompt_template
+
+
+# ---------------------------------------------------------------------------
+# Render cache must NOT bleed args / iteration_n across calls (#93)
+# ---------------------------------------------------------------------------
+
+
+def test_args_from_run_a_do_not_appear_in_run_b_prompt() -> None:
+    # Regression for #93: the engine previously cached the *rendered*
+    # string keyed only on (spec.id, state.id, template), so the first
+    # run's args bled into every later run that re-entered the same state
+    # with the same template. Render afresh per call: run B's prompt must
+    # carry run B's arg, never run A's.
+    template = "Diff against {{ args.base_ref }}."
+    worker = Worker(
+        role="reviewer",
+        prompt_template=template,
+        inputs=["base_ref"],
+        response_schema=_response_schema(),
+    )
+    state = State(
+        id="qa",
+        worker=worker,
+        outputs=["verdict"],
+        transitions=[Transition(to="qa", when="always")],
+    )
+    spec = _spec_with_state(state)
+
+    brief_a = build_brief(spec, state, env={"base_ref": "alpha"}, run_id=uuid4())
+    brief_b = build_brief(spec, state, env={"base_ref": "bravo"}, run_id=uuid4())
+
+    assert brief_a.worker is not None
+    assert brief_b.worker is not None
+    assert brief_a.worker.prompt_template == "Diff against alpha."
+    # The bug would make this "Diff against alpha." (run A's arg reused).
+    assert brief_b.worker.prompt_template == "Diff against bravo."
+    assert "alpha" not in brief_b.worker.prompt_template
+
+
+def test_distinct_iteration_n_yields_distinct_text() -> None:
+    # Regression for #93: a loop body re-entered for iteration 2 must not
+    # reuse iteration 1's rendered text. The cache keyed on the loop
+    # state's id (shared across iterations) made every iteration reuse
+    # the first iteration's prompt.
+    template = "Loop iteration {{ iteration_n }} of state {{ state.id }}."
+    loop_worker = Worker(
+        role="iterator",
+        prompt_template=template,
+        inputs=["seed"],
+        response_schema=_loop_response_schema(),
+    )
+    loop = Loop(worker=loop_worker, max_iterations=5, done_field="done")
+    state = State(
+        id="looping",
+        loop=loop,
+        outputs=["done"],
+        transitions=[Transition(to="looping", when="always")],
+    )
+    spec = _spec_with_state(state)
+
+    brief_iter1 = build_brief(
+        spec, state, env={"seed": "x"}, run_id=uuid4(), iteration_n=1
+    )
+    brief_iter2 = build_brief(
+        spec, state, env={"seed": "x"}, run_id=uuid4(), iteration_n=2
+    )
+
+    assert brief_iter1.worker is not None
+    assert brief_iter2.worker is not None
+    assert brief_iter1.worker.prompt_template == "Loop iteration 1 of state looping."
+    # The bug would make this "Loop iteration 1 ..." (iter 1 text reused).
+    assert brief_iter2.worker.prompt_template == "Loop iteration 2 of state looping."
+    assert brief_iter1.worker.prompt_template != brief_iter2.worker.prompt_template
 
 
 # ---------------------------------------------------------------------------

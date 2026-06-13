@@ -35,10 +35,11 @@ from __future__ import annotations
 
 import importlib
 import json
+from collections import OrderedDict
 from collections.abc import Mapping
 from typing import Any
 
-from jinja2 import StrictUndefined, TemplateSyntaxError
+from jinja2 import StrictUndefined, Template, TemplateSyntaxError
 from jinja2.exceptions import UndefinedError
 from jinja2.sandbox import SandboxedEnvironment
 from pydantic import BaseModel, ConfigDict, Field
@@ -262,6 +263,12 @@ def _filter_fields_table(value: Any) -> str:
 # Renderer
 # ---------------------------------------------------------------------------
 
+#: Default upper bound on the parsed-template LRU. A single spec has a
+#: handful of templates; this caps a long-lived renderer (e.g. the MCP
+#: server reusing one instance across every spec/run) so the cache cannot
+#: grow without bound as new unique templates are rendered over time.
+DEFAULT_TEMPLATE_CACHE_SIZE = 512
+
 
 class PromptRenderer:
     """Sandboxed renderer for FSM worker prompt templates.
@@ -278,6 +285,7 @@ class PromptRenderer:
         *,
         model_allowlist: tuple[str, ...] = (),
         allow_model_import: bool = True,
+        template_cache_size: int = DEFAULT_TEMPLATE_CACHE_SIZE,
     ) -> None:
         self._env = SandboxedEnvironment(
             undefined=StrictUndefined,
@@ -289,6 +297,21 @@ class PromptRenderer:
         self._env.filters["fields_table"] = _filter_fields_table
         self._model_allowlist = tuple(model_allowlist)
         self._allow_model_import = allow_model_import
+        # Cache of PARSED templates keyed on the raw template text. We
+        # cache the compiled :class:`jinja2.Template` (the expensive part:
+        # lexing + parsing + bytecode compilation) and re-render it per
+        # call against the live context. Caching the *rendered string*
+        # would be a correctness bug: the same template renders to
+        # different text for different args / iteration_n, so a string
+        # cache would bleed one call's values into a later call.
+        #
+        # The cache is a bounded LRU (OrderedDict ordered by last use): a
+        # long-lived renderer that sees an unbounded stream of unique
+        # templates evicts its least-recently-used entry instead of growing
+        # memory without end. A size <= 0 disables the bound (unbounded),
+        # which suits short-lived per-render instances.
+        self._template_cache: OrderedDict[str, Template] = OrderedDict()
+        self._template_cache_size = template_cache_size
 
     # ------------------------------------------------------------------
     # Context construction
@@ -370,18 +393,35 @@ class PromptRenderer:
     def render(self, template: str, context: PromptContext) -> str:
         """Render ``template`` against ``context`` inside the sandbox.
 
+        The parsed :class:`jinja2.Template` is cached per raw template
+        text so re-entering a state (or iterating a loop) re-uses the
+        compiled template instead of re-parsing it. The *render* itself
+        always runs against the live ``context``, so distinct args /
+        iteration_n produce distinct output.
+
         Raises :class:`PromptRenderError` for Jinja syntax errors,
         unknown tokens (StrictUndefined), unsafe attribute access
         (sandbox), or model-resolution failures.
         """
 
-        try:
-            tmpl = self._env.from_string(template)
-        except TemplateSyntaxError as exc:
-            raise PromptRenderError(
-                f"prompt template has a Jinja syntax error: {exc.message}",
-                line=exc.lineno,
-            ) from exc
+        tmpl = self._template_cache.get(template)
+        if tmpl is None:
+            try:
+                tmpl = self._env.from_string(template)
+            except TemplateSyntaxError as exc:
+                raise PromptRenderError(
+                    f"prompt template has a Jinja syntax error: {exc.message}",
+                    line=exc.lineno,
+                ) from exc
+            self._template_cache[template] = tmpl
+            if self._template_cache_size > 0:
+                # Evict the least-recently-used entry (front of the
+                # OrderedDict) while the cache exceeds its bound.
+                while len(self._template_cache) > self._template_cache_size:
+                    self._template_cache.popitem(last=False)
+        else:
+            # Cache hit: refresh recency so this entry is evicted last.
+            self._template_cache.move_to_end(template)
 
         jinja_context = self._build_jinja_context(context)
         try:
