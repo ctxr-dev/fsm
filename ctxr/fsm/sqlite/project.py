@@ -102,6 +102,7 @@ from ctxr.fsm.sqlite.repos_states import (
 )
 from ctxr.fsm.sqlite.transactions import (
     TransactionContext,
+    _begin_immediate,
     set_active_session_factory,
 )
 
@@ -406,6 +407,42 @@ class Project:
         return self._session_factory
 
     # ------------------------------------------------------------------
+    # Write-transaction helper
+    # ------------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _write_txn(self) -> Iterator[Session]:
+        """Open a session whose write-lock is taken up front (BEGIN IMMEDIATE).
+
+        Every facade write path used to open its unit-of-work with
+        ``with self._session_factory() as session, session.begin():``.
+        SQLAlchemy's ``Session.begin()`` starts SQLite's *deferred*
+        transaction, which only acquires the write-lock lazily on the
+        first write. Under concurrency that lets two writers race for
+        the lock at first-write time and surface a spurious
+        ``SQLITE_BUSY`` ("database is locked"), defeating the
+        serialised-writer guarantee the ``@atomic`` envelope provides.
+
+        This helper instead takes the write-lock immediately via
+        :func:`ctxr.fsm.sqlite.transactions._begin_immediate` (the exact
+        primitive ``@atomic`` relies on) so a second concurrent writer
+        fails fast and the caller serialises cleanly behind the first.
+        The transaction is committed on a clean exit and rolled back on
+        any exception, matching the semantics ``session.begin()``
+        provided before.
+        """
+        session = self._session_factory()
+        try:
+            _begin_immediate(session)
+            yield session
+            session.commit()
+        except BaseException:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    # ------------------------------------------------------------------
     # Convenience operations
     # ------------------------------------------------------------------
 
@@ -429,7 +466,7 @@ class Project:
         repository — callers can inspect ``.created`` to tell whether
         a new version was minted or an existing one was matched.
         """
-        with self._session_factory() as session, session.begin():
+        with self._write_txn() as session:
             project = self.projects.get_by_slug(session, project_slug)
             if project is None:
                 project = self.projects.create(session, slug=project_slug)
@@ -459,7 +496,7 @@ class Project:
         registered spec — we refuse to create a run with no associated
         FSM definition because the engine would have nothing to load.
         """
-        with self._session_factory() as session, session.begin():
+        with self._write_txn() as session:
             spec = self.specs.get(session, spec_id)
             if spec is None:
                 raise LookupError(
@@ -572,7 +609,7 @@ class Project:
         kind_strings: list[str] | None = (
             [k.value for k in kinds] if kinds is not None else None
         )
-        with self._session_factory() as session, session.begin():
+        with self._write_txn() as session:
             consumer = self.consumers.register(
                 session,
                 kind="subscriber",
@@ -588,15 +625,22 @@ class Project:
             # Pull a batch of pending deliveries for this consumer.
             # ``pending_for`` returns ``EventWithDelivery`` rows ordered
             # by ``EventTable.created_at ASC`` so the consumer sees
-            # events in producer-emit order.
-            with self._session_factory() as session, session.begin():
+            # events in producer-emit order. This read runs in a plain
+            # (lock-free) session: the idle poll path must NOT take a
+            # write-lock, otherwise every subscribed consumer would
+            # serialise against real writers four times a second and
+            # reintroduce the very ``SQLITE_BUSY`` contention #95 fixes.
+            with self._session_factory() as session:
                 pending = self.event_deliveries.pending_for(
                     session, consumer_id=consumer_id
                 )
-                if pending:
-                    # Mark delivered + ack inside the same txn so a
-                    # crash between yield and ack still re-delivers
-                    # the row on the next poll (at-least-once).
+            if pending:
+                # We have work: escalate to an immediate write-lock so
+                # the mark-delivered + ack + touch sequence serialises
+                # against concurrent writers. The crash-safety contract
+                # is unchanged: a crash between yield and ack leaves the
+                # rows un-acked for redelivery on the next poll.
+                with self._write_txn() as session:
                     for ewd in pending:
                         self.event_deliveries.mark_delivered(
                             session,
@@ -809,7 +853,7 @@ class Project:
         # state's entry row + emit transition_taken + state_entered.
         # The transaction shape mirrors what MCP confirm_commit does.
         if from_state_pk is not None:
-            with self.session_factory() as session, session.begin():
+            with self._write_txn() as session:
                 self.states.mark_exited(session, from_state_pk, outputs)
                 self.events.emit(
                     session,
@@ -826,7 +870,7 @@ class Project:
             verdict_val = (
                 {**(run.args or {}), **outputs}.get("verdict")
             )
-            with self.session_factory() as session, session.begin():
+            with self._write_txn() as session:
                 run_row = session.get(RunTable, run_id)
                 if run_row is not None:
                     run_row.status = "completed"
@@ -870,7 +914,7 @@ class Project:
             env_after = {**(run.args or {}), **outputs}
             next_inputs = {name: env_after.get(name) for name in worker.inputs}
 
-        with self.session_factory() as session, session.begin():
+        with self._write_txn() as session:
             transition_eval = next(
                 iter(advance_result.evaluations or []), None
             )
@@ -952,7 +996,7 @@ class Project:
         )
         if landed_is_terminal:
             verdict_val = env_for_chain.get("verdict")
-            with self.session_factory() as session, session.begin():
+            with self._write_txn() as session:
                 run_row = session.get(RunTable, run_id)
                 if run_row is not None:
                     run_row.status = "completed"
